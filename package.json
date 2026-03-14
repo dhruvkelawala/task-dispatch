@@ -1,0 +1,8 @@
+{
+  "name": "task-dispatch",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "better-sqlite3": "^12.0.0"
+  }
+}

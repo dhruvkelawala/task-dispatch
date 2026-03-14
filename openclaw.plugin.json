@@ -1,0 +1,14 @@
+{
+  "id": "task-dispatch",
+  "name": "Task Dispatch",
+  "version": "0.1.0",
+  "description": "Local task store with automated ACP/subagent dispatch",
+  "entryPoint": "index.mjs",
+  "configSchema": {
+    "type": "object",
+    "properties": {
+      "dbPath": { "type": "string" },
+      "maxConcurrentSessions": { "type": "number" }
+    }
+  }
+}
