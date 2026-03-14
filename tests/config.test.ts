@@ -2,15 +2,18 @@ import { describe, expect, test } from "bun:test";
 import { resolveChannel, resolveCwd } from "../src/plugin/config";
 
 describe("config", () => {
-  test("resolveChannel returns project channel then agent fallback", () => {
+  test("resolveChannel returns project channel", () => {
     const channel = resolveChannel(
       { projectId: "mission-control", agent: "zeus" },
       { "mission-control": "chan-1" },
     );
     expect(channel).toBe("chan-1");
+  });
 
-    const fallback = resolveChannel({ agent: "zeus" }, {});
-    expect(fallback).toBe("1475499310417182810");
+  test("resolveChannel throws when no projectId/channelId", () => {
+    expect(() => resolveChannel({ title: "Missing route", id: "task-123456" }, {})).toThrow(
+      "has no projectId or channelId",
+    );
   });
 
   test("resolveCwd returns task.cwd then project cwd then null", () => {

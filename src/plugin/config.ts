@@ -56,7 +56,7 @@ export function buildConfigMaps(config: PluginConfig): {
 export function resolveChannel(
   task: Partial<Task>,
   projectChannels: Record<string, string>,
-) : string {
+): string {
   if (task.channelId) return task.channelId;
   if (task.projectId && projectChannels[task.projectId]) {
     return projectChannels[task.projectId] as string;

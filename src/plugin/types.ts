@@ -87,6 +87,22 @@ export interface PluginConfig {
   };
 }
 
+export interface PluginHttpRequest {
+  method?: string;
+  url?: string;
+  headers?: Record<string, string | string[] | undefined>;
+  body?: unknown;
+  on: (event: string, listener: (...args: unknown[]) => void) => void;
+}
+
+export interface PluginHttpResponse {
+  setHeader?: (name: string, value: string) => void;
+  writeHead: (statusCode: number, headers?: Record<string, string>) => void;
+  write?: (chunk: string) => void;
+  end: (chunk?: string) => void;
+  on?: (event: string, listener: (...args: unknown[]) => void) => void;
+}
+
 export interface SubagentRuntime {
   run?: (args: {
     sessionKey: string;
@@ -140,7 +156,10 @@ export interface PluginApi {
     path: string;
     auth?: string;
     match?: "prefix";
-    handler: (req: any, res: any) => boolean | Promise<boolean>;
+    handler: (req: PluginHttpRequest, res: PluginHttpResponse) => boolean | Promise<boolean>;
   }) => void;
-  on: (event: string, listener: (payload: any) => void) => void;
+  on: (
+    event: "subagent_ended",
+    listener: (payload: { sessionKey?: string; status?: string; error?: string }) => void,
+  ) => void;
 }

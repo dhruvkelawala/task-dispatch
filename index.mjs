@@ -472,14 +472,7 @@ if (CONFIG.projects) {
   }
 }
 
-const AGENT_FALLBACK_CHANNELS = {
-  zeus: "1475499310417182810",
-  atum: "1475499340574494740",
-  ibis: "1475499396169990276",
-  athena: "1475499360031739944",
-  hathor: "1475499468051976367",
-  sphinx: "1475499433373470823",
-};
+// AGENT_FALLBACK_CHANNELS removed — tasks must specify projectId or channelId explicitly.
 
 const AGENT_RUNTIME = {};
 if (CONFIG.agents) {
@@ -515,9 +508,12 @@ function resolveChannel(task) {
   if (task.channelId) return task.channelId;
   if (task.projectId && PROJECT_CHANNELS[task.projectId])
     return PROJECT_CHANNELS[task.projectId];
-  if (task.agent && AGENT_FALLBACK_CHANNELS[task.agent])
-    return AGENT_FALLBACK_CHANNELS[task.agent];
-  return null;
+  // No fallback — require explicit projectId or channelId
+  throw new Error(
+    `Task "${task.title}" (${task.id.slice(0, 8)}) has no projectId or channelId. ` +
+    `Set projectId to one of: ${Object.keys(PROJECT_CHANNELS).join(", ")} ` +
+    `or provide an explicit channelId.`
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -597,15 +593,14 @@ export default function setup(api) {
 
   // ---- Discord Thread Creation ----
   async function createDiscordThread(task) {
-    if (!task.projectId && !AGENT_FALLBACK_CHANNELS[task.agent]) {
+    if (!task.channelId && !PROJECT_CHANNELS[task.projectId]) {
       process.stderr.write(
         `[DISCORD] No channel for task ${task.id}, skipping thread\n`,
       );
       return null;
     }
 
-    const channelId =
-      PROJECT_CHANNELS[task.projectId] || AGENT_FALLBACK_CHANNELS[task.agent];
+    const channelId = task.channelId || PROJECT_CHANNELS[task.projectId];
     const shortId = task.id.slice(0, 8);
     const threadName = `${task.title.slice(0, 70)} — #${shortId}`;
 

@@ -31,6 +31,7 @@ const projectCwd: Record<string, string> = {
   mc: "/Users/sumo-deus/.openclaw/workspace/mission-control-v3",
   "mission-control": "/Users/sumo-deus/.openclaw/workspace/mission-control-v3",
   forayy: "/Users/sumo-deus/.openclaw/workspace/forayy",
+  "task-dispatch": "/Users/sumo-deus/.openclaw/extensions/task-dispatch",
 };
 
 const projectId: Record<string, string> = {
@@ -38,6 +39,7 @@ const projectId: Record<string, string> = {
   mc: "mission-control",
   "mission-control": "mission-control",
   forayy: "forayy",
+  "task-dispatch": "task-dispatch",
 };
 
 function fail(message: string): never {
@@ -182,7 +184,11 @@ async function cmdCreate(args: string[]): Promise<void> {
       case "-f":
       case "--file":
         i += 1;
-        desc = readFileSync(args[i] || "", "utf8");
+        try {
+          desc = readFileSync(args[i] || "", "utf8");
+        } catch (err) {
+          fail(`Error reading file: ${(err as Error).message}`);
+        }
         break;
       default:
         if (!title) title = arg;
@@ -241,6 +247,7 @@ async function cmdList(): Promise<void> {
 }
 
 async function cmdGet(id: string): Promise<void> {
+  if (!id) fail("Usage: dispatch get <task-id>");
   const { data, status } = await doReq("GET", `/api/tasks/${id}`, null);
   if (status >= 400) fail(`HTTP ${status}: ${data}`);
   prettyPrint(data);
@@ -253,7 +260,11 @@ async function cmdPrompt(args: string[]): Promise<void> {
   }
   let message = "";
   if (args[1] === "-f" && args[2]) {
-    message = readFileSync(args[2], "utf8");
+    try {
+      message = readFileSync(args[2], "utf8");
+    } catch (err) {
+      fail(`Error reading file: ${(err as Error).message}`);
+    }
   } else {
     message = args.slice(1).join(" ");
   }
@@ -387,6 +398,7 @@ async function main(): Promise<void> {
       await cmdStats();
       break;
     case "health":
+    case "h":
       await cmdHealth();
       break;
     case "help":
@@ -395,7 +407,9 @@ async function main(): Promise<void> {
       printUsage();
       break;
     default:
-      fail(`Unknown command: ${cmd}\n`);
+      process.stderr.write(`Unknown command: ${cmd}\n\n`);
+      printUsage();
+      process.exit(1);
   }
 }
 
