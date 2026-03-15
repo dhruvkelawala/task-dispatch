@@ -5,6 +5,49 @@ import type { Comment, Schedule, Task, TaskStatus } from "./types";
 
 const require = createRequire(import.meta.url);
 
+export const PROJECT_SEED_ROWS = [
+  {
+    id: "visaroy",
+    name: "Visaroy",
+    repo: "dhruvkelawala/visaroy",
+    priority: 1,
+    status: "shipping",
+    description: "Schengen visa prep assistant",
+    cwd: "~/.openclaw/workspace/visaroy/visaroy-app",
+    tags: '["ship", "personal"]',
+  },
+  {
+    id: "forayy",
+    name: "Forayy",
+    repo: null,
+    priority: 2,
+    status: "active",
+    description: "AI street-view missions app",
+    cwd: "~/.openclaw/workspace/forayy",
+    tags: '["side"]',
+  },
+  {
+    id: "beryl",
+    name: "BERYL",
+    repo: "argentlabs/poc-friendly-pancake",
+    priority: 4,
+    status: "exploring",
+    description: "Secure embedded wallet with delegated agent access",
+    cwd: null,
+    tags: '["work", "career"]',
+  },
+  {
+    id: "mc3",
+    name: "Mission Control v3",
+    repo: null,
+    priority: 3,
+    status: "active",
+    description: "Agent operations console",
+    cwd: "~/.openclaw/workspace/mission-control-v3",
+    tags: '["infra"]',
+  },
+];
+
 export const VALID_TRANSITIONS: Record<TaskStatus, TaskStatus[]> = {
   pending: ["ready", "cancelled"],
   ready: ["dispatched", "cancelled"],
@@ -27,10 +70,16 @@ function createInMemoryDb(): any {
     tasks: Array<Record<string, any>>;
     schedules: Array<Record<string, any>>;
     comments: Array<Record<string, any>>;
+    projects: Array<Record<string, any>>;
+    project_commits: Array<Record<string, any>>;
+    project_snapshots: Array<Record<string, any>>;
   } = {
     tasks: [],
     schedules: [],
     comments: [],
+    projects: [],
+    project_commits: [],
+    project_snapshots: [],
   };
 
   function selectById(
@@ -113,6 +162,9 @@ function createInMemoryDb(): any {
               { name: "tasks" },
               { name: "schedules" },
               { name: "comments" },
+              { name: "projects" },
+              { name: "project_commits" },
+              { name: "project_snapshots" },
             ];
           }
           if (sql.startsWith("SELECT * FROM tasks")) {
@@ -208,6 +260,41 @@ export function initDb(dbPath: string): any {
 
     CREATE INDEX IF NOT EXISTS idx_comments_task_created
       ON comments(task_id, created_at);
+
+    CREATE TABLE IF NOT EXISTS projects (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      repo TEXT,
+      branch TEXT DEFAULT 'main',
+      priority INTEGER DEFAULT 0,
+      status TEXT DEFAULT 'active',
+      description TEXT,
+      cwd TEXT,
+      tags TEXT,
+      created_at TEXT DEFAULT (datetime('now')),
+      updated_at TEXT DEFAULT (datetime('now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS project_commits (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      project_id TEXT NOT NULL REFERENCES projects(id),
+      sha TEXT NOT NULL,
+      message TEXT,
+      author TEXT,
+      date TEXT,
+      branch TEXT,
+      UNIQUE(project_id, sha)
+    );
+
+    CREATE TABLE IF NOT EXISTS project_snapshots (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      project_id TEXT NOT NULL REFERENCES projects(id),
+      summary TEXT,
+      progress_pct INTEGER,
+      blockers TEXT,
+      generated_at TEXT DEFAULT (datetime('now')),
+      model TEXT
+    );
   `);
 
   try {
@@ -223,7 +310,34 @@ export function initDb(dbPath: string): any {
     db.exec("ALTER TABLE tasks ADD COLUMN qa_required INTEGER DEFAULT 1");
   } catch {}
 
+  seedProjectsIfEmpty(db);
+
   return db;
+}
+
+export function seedProjectsIfEmpty(db: any): void {
+  const row = db.prepare("SELECT COUNT(*) AS count FROM projects").get();
+  const count = Number(row?.count || 0);
+  if (count > 0) return;
+
+  const insertProject = db.prepare(`
+    INSERT INTO projects (id, name, repo, priority, status, description, cwd, tags)
+    VALUES (@id, @name, @repo, @priority, @status, @description, @cwd, @tags)
+  `);
+
+  if (typeof db.transaction === "function") {
+    const insertMany = db.transaction((rows: any[]) => {
+      for (const project of rows) {
+        insertProject.run(project);
+      }
+    });
+    insertMany(PROJECT_SEED_ROWS);
+    return;
+  }
+
+  for (const project of PROJECT_SEED_ROWS) {
+    insertProject.run(project);
+  }
 }
 
 type DbRow = Record<string, any> | null | undefined;
