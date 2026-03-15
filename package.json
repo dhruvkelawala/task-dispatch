@@ -2,6 +2,23 @@
   "name": "task-dispatch",
   "private": true,
   "type": "module",
+  "scripts": {
+    "build:plugin": "bun build src/plugin/index.ts --target=node --format=esm --outfile=build/plugin.mjs --external better-sqlite3",
+    "build:cli": "bun build src/cli/index.ts --compile --outfile=build/dispatch",
+    "build": "bun run build:plugin && bun run build:cli",
+    "typecheck": "tsc --noEmit",
+    "lint": "oxlint src/",
+    "format": "oxfmt src/",
+    "test": "bun test tests/",
+    "install:cli": "cp build/dispatch ~/.local/bin/dispatch"
+  },
+  "devDependencies": {
+    "typescript": "^5",
+    "oxlint": "latest",
+    "oxfmt": "latest",
+    "bun-types": "latest",
+    "@types/better-sqlite3": "latest"
+  },
   "dependencies": {
     "better-sqlite3": "^12.0.0"
   }
