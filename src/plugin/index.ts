@@ -1418,11 +1418,15 @@ export default function setup(api) {
               ? "⚠️"
               : "ℹ️";
       const text = [
+        `[Task Completion — RELAY TO DHRUV ON TELEGRAM]`,
+        ``,
         `${icon} Task ${status}: "${task.title}"`,
         `ID: ${task.id.slice(0, 8)}`,
         commitHash ? `Commit: ${commitHash}` : null,
         task.error ? `Error: ${task.error.slice(0, 200)}` : null,
         threadLink ? `Thread: ${threadLink}` : null,
+        ``,
+        `ACTION REQUIRED: Use the message tool (action=send, channel=telegram) to notify Dhruv about this task completion. Summarize what was done and include the thread link if available. Do NOT just reply in the session — Dhruv won't see it unless you use the message tool.`,
       ]
         .filter(Boolean)
         .join("\n");
