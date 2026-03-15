@@ -362,8 +362,11 @@ async function cmdHeartbeat(argv: string[]): Promise<void> {
     const flags: Record<string, string> = {};
     for (let i = 1; i < argv.length; i++) {
       const arg = argv[i];
-      if (arg.startsWith("--") && i + 1 < argv.length) {
-        flags[arg.slice(2)] = argv[++i];
+      if (typeof arg === "string" && arg.startsWith("--") && i + 1 < argv.length) {
+        const next = argv[++i];
+        if (typeof next === "string") {
+          flags[arg.slice(2)] = next;
+        }
       }
     }
     const body = {
@@ -380,9 +383,11 @@ async function cmdHeartbeat(argv: string[]): Promise<void> {
     prettyPrint(data);
   } else if (sub === "list" || sub === "ls" || !sub) {
     const agent = argv[1] === "--agent" ? argv[2] : undefined;
-    const limit = argv.includes("--limit") ? argv[argv.indexOf("--limit") + 1] : "20";
+    const limitIdx = argv.indexOf("--limit");
+    const limitArg = limitIdx !== -1 ? argv[limitIdx + 1] : undefined;
+    const limit = typeof limitArg === "string" ? limitArg : "20";
     const qs = new URLSearchParams();
-    if (agent) qs.set("agent", agent);
+    if (typeof agent === "string") qs.set("agent", agent);
     qs.set("limit", limit);
     const { data, status } = await doReq("GET", `/api/heartbeats?${qs}`, null);
     if (status >= 400) fail(`Heartbeat list failed (${status}): ${data}`);
