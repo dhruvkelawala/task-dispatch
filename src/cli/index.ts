@@ -356,6 +356,51 @@ EXAMPLES:
 `);
 }
 
+async function cmdHeartbeat(argv: string[]): Promise<void> {
+  const sub = argv[0];
+  if (sub === "log") {
+    const flags: Record<string, string> = {};
+    for (let i = 1; i < argv.length; i++) {
+      const arg = argv[i];
+      if (arg.startsWith("--") && i + 1 < argv.length) {
+        flags[arg.slice(2)] = argv[++i];
+      }
+    }
+    const body = {
+      agentId: flags.agent || process.env.HEARTBEAT_AGENT_ID || "unknown",
+      agentName: flags.name || process.env.HEARTBEAT_AGENT_NAME || "unknown",
+      status: flags.status || process.env.HEARTBEAT_STATUS || "no_work",
+      action: flags.action || process.env.HEARTBEAT_ACTION || "HEARTBEAT_OK",
+      detail: flags.detail || process.env.HEARTBEAT_DETAIL || "",
+      error: flags.error || process.env.HEARTBEAT_ERROR || undefined,
+    };
+    const { data, status } = await doReq("POST", "/api/heartbeats", body);
+    if (status >= 400) fail(`Heartbeat log failed (${status}): ${data}`);
+    process.stdout.write(`✅ Heartbeat logged\n`);
+    prettyPrint(data);
+  } else if (sub === "list" || sub === "ls" || !sub) {
+    const agent = argv[1] === "--agent" ? argv[2] : undefined;
+    const limit = argv.includes("--limit") ? argv[argv.indexOf("--limit") + 1] : "20";
+    const qs = new URLSearchParams();
+    if (agent) qs.set("agent", agent);
+    qs.set("limit", limit);
+    const { data, status } = await doReq("GET", `/api/heartbeats?${qs}`, null);
+    if (status >= 400) fail(`Heartbeat list failed (${status}): ${data}`);
+    prettyPrint(data);
+  } else if (sub === "health") {
+    const { data, status } = await doReq("GET", "/api/heartbeats/health", null);
+    if (status >= 400) fail(`Heartbeat health failed (${status}): ${data}`);
+    prettyPrint(data);
+  } else {
+    process.stderr.write(`Unknown heartbeat subcommand: ${sub}\n`);
+    process.stderr.write(`Usage: dispatch heartbeat [log|list|health]\n`);
+    process.stderr.write(`  log   --agent ID --name NAME --status STATUS --action ACTION --detail TEXT --error TEXT\n`);
+    process.stderr.write(`  list  [--agent ID] [--limit N]\n`);
+    process.stderr.write(`  health\n`);
+    process.exit(1);
+  }
+}
+
 async function main(): Promise<void> {
   const argv = process.argv.slice(2);
   if (argv.length < 1) {
@@ -400,6 +445,10 @@ async function main(): Promise<void> {
     case "health":
     case "h":
       await cmdHealth();
+      break;
+    case "heartbeat":
+    case "hb":
+      await cmdHeartbeat(argv.slice(1));
       break;
     case "help":
     case "--help":
