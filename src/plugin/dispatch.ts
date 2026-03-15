@@ -2,23 +2,24 @@ import type { Task } from "./types";
 
 export function taskNeedsAthena(task: Pick<Task, "title" | "description">): boolean {
   const text = `${task.title} ${task.description || ""}`.toLowerCase();
+
+  // Skip Athena for test/infra/docs tasks — even if they mention UI keywords
+  const skipKeywords = ["test", "maestro", "e2e", "ci", "infra", "docs", "refactor", "migration", "stabilize"];
+  if (skipKeywords.some((kw) => text.includes(kw))) return false;
+
   const uiKeywords = [
-    "ui",
-    "ux",
+    "screen",
+    "tab",
     "design",
     "layout",
-    "component",
     "style",
     "css",
     "tailwind",
     "animation",
     "responsive",
-    "landing",
-    "page",
-    "visual",
+    "landing page",
+    "visual redesign",
     "typography",
-    "font",
-    "color",
     "theme",
   ];
   return uiKeywords.some((kw) => text.includes(kw));

@@ -1,9 +1,55 @@
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { createRequire } from "node:module";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import crypto from "node:crypto";
 
 const require = createRequire(import.meta.url);
+const execFileAsync = promisify(execFile);
+
+const PROJECT_SEED_ROWS = [
+  {
+    id: "visaroy",
+    name: "Visaroy",
+    repo: "dhruvkelawala/visaroy",
+    priority: 1,
+    status: "shipping",
+    description: "Schengen visa prep assistant",
+    cwd: "~/.openclaw/workspace/visaroy/visaroy-app",
+    tags: '["ship", "personal"]',
+  },
+  {
+    id: "forayy",
+    name: "Forayy",
+    repo: null,
+    priority: 2,
+    status: "active",
+    description: "AI street-view missions app",
+    cwd: "~/.openclaw/workspace/forayy",
+    tags: '["side"]',
+  },
+  {
+    id: "beryl",
+    name: "BERYL",
+    repo: "argentlabs/poc-friendly-pancake",
+    priority: 4,
+    status: "exploring",
+    description: "Secure embedded wallet with delegated agent access",
+    cwd: null,
+    tags: '["work", "career"]',
+  },
+  {
+    id: "mc3",
+    name: "Mission Control v3",
+    repo: null,
+    priority: 3,
+    status: "active",
+    description: "Agent operations console",
+    cwd: "~/.openclaw/workspace/mission-control-v3",
+    tags: '["infra"]',
+  },
+];
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -246,6 +292,56 @@ function truncateForPrompt(text, maxChars) {
   return `${text.slice(0, maxChars)}\n\n[truncated]`;
 }
 
+function safeJsonParse(text) {
+  if (typeof text !== "string") {
+    return null;
+  }
+  try {
+    return JSON.parse(text);
+  } catch {
+    return null;
+  }
+}
+
+function extractJsonObject(text) {
+  if (typeof text !== "string") {
+    return null;
+  }
+
+  const direct = safeJsonParse(text.trim());
+  if (direct && typeof direct === "object" && !Array.isArray(direct)) {
+    return direct;
+  }
+
+  const fencedMatch = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  if (fencedMatch?.[1]) {
+    const parsed = safeJsonParse(fencedMatch[1].trim());
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      return parsed;
+    }
+  }
+
+  const start = text.indexOf("{");
+  const end = text.lastIndexOf("}");
+  if (start !== -1 && end !== -1 && end > start) {
+    const parsed = safeJsonParse(text.slice(start, end + 1).trim());
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      return parsed;
+    }
+  }
+
+  return null;
+}
+
+async function fetchRepoCommits(repo, perPage = 10) {
+  const { stdout } = await execFileAsync("gh", [
+    "api",
+    `repos/${repo}/commits?per_page=${perPage}`,
+  ]);
+  const parsed = JSON.parse(stdout);
+  return Array.isArray(parsed) ? parsed : [];
+}
+
 // ---------------------------------------------------------------------------
 // Status Machine
 // ---------------------------------------------------------------------------
@@ -347,6 +443,41 @@ function initDb(dbPath) {
 
     CREATE INDEX IF NOT EXISTS idx_comments_task_created
       ON comments(task_id, created_at);
+
+    CREATE TABLE IF NOT EXISTS projects (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      repo TEXT,
+      branch TEXT DEFAULT 'main',
+      priority INTEGER DEFAULT 0,
+      status TEXT DEFAULT 'active',
+      description TEXT,
+      cwd TEXT,
+      tags TEXT,
+      created_at TEXT DEFAULT (datetime('now')),
+      updated_at TEXT DEFAULT (datetime('now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS project_commits (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      project_id TEXT NOT NULL REFERENCES projects(id),
+      sha TEXT NOT NULL,
+      message TEXT,
+      author TEXT,
+      date TEXT,
+      branch TEXT,
+      UNIQUE(project_id, sha)
+    );
+
+    CREATE TABLE IF NOT EXISTS project_snapshots (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      project_id TEXT NOT NULL REFERENCES projects(id),
+      summary TEXT,
+      progress_pct INTEGER,
+      blockers TEXT,
+      generated_at TEXT DEFAULT (datetime('now')),
+      model TEXT
+    );
   `);
 
   try {
@@ -371,6 +502,27 @@ function initDb(dbPath) {
   }
 
   return db;
+}
+
+function seedProjectsIfEmpty(db) {
+  const row = db.prepare("SELECT COUNT(*) AS count FROM projects").get();
+  const count = Number(row?.count || 0);
+  if (count > 0) {
+    return;
+  }
+
+  const insertProject = db.prepare(`
+    INSERT INTO projects (id, name, repo, priority, status, description, cwd, tags)
+    VALUES (@id, @name, @repo, @priority, @status, @description, @cwd, @tags)
+  `);
+
+  const insertMany = db.transaction((rows) => {
+    for (const project of rows) {
+      insertProject.run(project);
+    }
+  });
+
+  insertMany(PROJECT_SEED_ROWS);
 }
 
 // ---------------------------------------------------------------------------
@@ -439,6 +591,84 @@ function rowToComment(row) {
     author: row.author,
     body: row.body,
     createdAt: row.created_at,
+  };
+}
+
+function rowToProjectCommit(row) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    projectId: row.project_id,
+    sha: row.sha,
+    message: row.message,
+    author: row.author,
+    date: row.date,
+    branch: row.branch,
+  };
+}
+
+function rowToProjectSnapshot(row) {
+  if (!row || row.snapshot_id == null) {
+    return null;
+  }
+  let blockers = [];
+  if (typeof row.snapshot_blockers === "string" && row.snapshot_blockers) {
+    try {
+      blockers = JSON.parse(row.snapshot_blockers);
+    } catch {
+      blockers = [];
+    }
+  }
+
+  return {
+    id: row.snapshot_id,
+    projectId: row.id,
+    summary: row.snapshot_summary,
+    progressPct: row.snapshot_progress_pct,
+    blockers,
+    generatedAt: row.snapshot_generated_at,
+    model: row.snapshot_model,
+  };
+}
+
+function parseJsonArray(value) {
+  if (typeof value !== "string" || !value.trim()) {
+    return [];
+  }
+  try {
+    const parsed = JSON.parse(value);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+function rowToProject(row) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    name: row.name,
+    repo: row.repo,
+    branch: row.branch,
+    priority: row.priority,
+    status: row.status,
+    description: row.description,
+    cwd: row.cwd,
+    tags: parseJsonArray(row.tags),
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    linkedTasksCount: Number(row.linked_tasks_count || 0),
+    latestSnapshot: rowToProjectSnapshot(row),
+    lastCommit:
+      row.commit_sha != null
+        ? {
+            sha: row.commit_sha,
+            message: row.commit_message,
+            author: row.commit_author,
+            date: row.commit_date,
+            branch: row.commit_branch,
+          }
+        : null,
   };
 }
 
@@ -530,6 +760,7 @@ export default function setup(api) {
     config.dbPath || `${process.env.HOME}/.openclaw/data/task-dispatch.db`;
 
   const db = initDb(dbPath);
+  seedProjectsIfEmpty(db);
 
   // ---- Phase 5: Restart resilience — recover stuck tasks ----
   const stuckTasks = db
@@ -576,6 +807,32 @@ export default function setup(api) {
       try {
         for (const payload of payloads) {
           client.write(payload);
+        }
+      } catch {
+        sseClients.delete(client);
+      }
+    }
+  }
+
+  function broadcastSseEvent(type, payload = {}) {
+    if (sseClients.size === 0) {
+      return;
+    }
+
+    const eventPayload = JSON.stringify({
+      type,
+      timestamp: Date.now(),
+      ...payload,
+    });
+    const packets = [
+      `data: ${eventPayload}\n\n`,
+      `event: ${type}\ndata: ${eventPayload}\n\n`,
+    ];
+
+    for (const client of sseClients) {
+      try {
+        for (const packet of packets) {
+          client.write(packet);
         }
       } catch {
         sseClients.delete(client);
@@ -718,24 +975,24 @@ export default function setup(api) {
 
   // Detect if a task involves UI/UX work
   function taskNeedsAthena(task) {
+    // Skip Athena for test/infra/docs tasks — even if they mention UI keywords
+    const skipKeywords = ["test", "maestro", "e2e", "ci", "infra", "docs", "refactor", "migration", "stabilize"];
     const text = `${task.title} ${task.description || ""}`.toLowerCase();
+    if (skipKeywords.some((kw) => text.includes(kw))) return false;
+
     const uiKeywords = [
-      "ui",
-      "ux",
+      "screen",
+      "tab",
       "design",
       "layout",
-      "component",
       "style",
       "css",
       "tailwind",
       "animation",
       "responsive",
-      "landing",
-      "page",
-      "visual",
+      "landing page",
+      "visual redesign",
       "typography",
-      "font",
-      "color",
       "theme",
     ];
     return uiKeywords.some((kw) => text.includes(kw));
@@ -1983,6 +2240,164 @@ export default function setup(api) {
     sendJson(res, { ok: true });
   }
 
+  async function summarizeProject(projectRow) {
+    const project = db
+      .prepare("SELECT id, name, repo, description FROM projects WHERE id = ?")
+      .get(projectRow.id || projectRow);
+
+    if (!project) {
+      throw new Error("Project not found");
+    }
+    if (!project.repo) {
+      throw new Error("Project does not have a linked repository");
+    }
+
+    const commits = db
+      .prepare(
+        `SELECT sha, message, author, date
+         FROM project_commits
+         WHERE project_id = ?
+         ORDER BY date DESC, id DESC
+         LIMIT 10`,
+      )
+      .all(project.id);
+
+    const completedSince = Date.now() - 7 * 24 * 60 * 60 * 1000;
+    const completedTasks = db
+      .prepare(
+        `SELECT title, status
+         FROM tasks
+         WHERE project_id = ?
+           AND status = 'done'
+           AND completed_at IS NOT NULL
+           AND completed_at >= ?
+         ORDER BY completed_at DESC`,
+      )
+      .all(project.id, completedSince);
+
+    const commitBullets =
+      commits.length > 0
+        ? commits
+            .map(
+              (c) =>
+                `- ${c.sha} - ${c.message || "(no message)"} (${c.author || "unknown"}, ${c.date || "unknown date"})`,
+            )
+            .join("\n")
+        : "- None";
+
+    const taskBullets =
+      completedTasks.length > 0
+        ? completedTasks
+            .map((t) => `- ${t.title || "(untitled)"} - ${t.status || "done"}`)
+            .join("\n")
+        : "- None";
+
+    const prompt = `You are a project tracker. Given the recent commits and completed tasks for "${project.name}" (${project.description || "No description"}), generate a JSON response:
+
+{
+  "summary": "2-3 sentence progress summary referencing actual commit messages",
+  "progress_pct": 0-100,
+  "blockers": ["list of blockers if any, empty array if none"]
+}
+
+Recent commits:
+${commitBullets}
+
+Completed tasks (last 7 days):
+${taskBullets}
+
+Be specific — reference actual commit messages and features. Don't be vague.`;
+
+    const llmResponse = await fetch("http://127.0.0.1:18789/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "lite",
+        messages: [{ role: "user", content: prompt }],
+        temperature: 0.2,
+      }),
+    });
+
+    if (!llmResponse.ok) {
+      const errText = await llmResponse.text();
+      throw new Error(`LLM request failed: ${llmResponse.status} ${errText.slice(0, 300)}`);
+    }
+
+    const llmData = await llmResponse.json();
+    const content = llmData?.choices?.[0]?.message?.content;
+    const parsed = extractJsonObject(content);
+    if (!parsed) {
+      throw new Error("LLM response was not valid JSON");
+    }
+
+    const summary = typeof parsed.summary === "string" ? parsed.summary.trim() : "";
+    if (!summary) {
+      throw new Error("LLM response missing summary");
+    }
+
+    const rawProgress = Number(parsed.progress_pct);
+    const progressPct = Number.isFinite(rawProgress)
+      ? Math.max(0, Math.min(100, Math.round(rawProgress)))
+      : 0;
+
+    const blockers = Array.isArray(parsed.blockers)
+      ? parsed.blockers
+          .filter((item) => typeof item === "string")
+          .map((item) => item.trim())
+          .filter(Boolean)
+      : [];
+
+    const insertResult = db
+      .prepare(
+        `INSERT INTO project_snapshots (project_id, summary, progress_pct, blockers, model)
+         VALUES (?, ?, ?, ?, 'lite')`,
+      )
+      .run(project.id, summary, progressPct, JSON.stringify(blockers));
+
+    const snapshotRow = db
+      .prepare(
+        `SELECT id, project_id, summary, progress_pct, blockers, generated_at, model
+         FROM project_snapshots
+         WHERE id = ?`,
+      )
+      .get(insertResult.lastInsertRowid);
+
+    const snapshot = {
+      id: snapshotRow.id,
+      projectId: snapshotRow.project_id,
+      summary: snapshotRow.summary,
+      progressPct: snapshotRow.progress_pct,
+      blockers: parseJsonArray(snapshotRow.blockers),
+      generatedAt: snapshotRow.generated_at,
+      model: snapshotRow.model,
+    };
+
+    broadcastSseEvent("project:snapshot", {
+      projectId: project.id,
+      snapshot,
+    });
+
+    return snapshot;
+  }
+
+  async function runProjectSummaryTick() {
+    const projects = db
+      .prepare("SELECT id FROM projects WHERE repo IS NOT NULL AND trim(repo) != ''")
+      .all();
+
+    for (const project of projects) {
+      try {
+        await summarizeProject(project);
+      } catch (error) {
+        process.stderr.write(
+          `[PROJECT_SUMMARY] Failed for ${project.id}: ${error.message}\n`,
+        );
+      }
+    }
+  }
+
   function runScheduleTick() {
     const now = Date.now();
     const dueSchedules = stmts.listDueSchedules.all(now);
@@ -2007,6 +2422,11 @@ export default function setup(api) {
 
   runScheduleTick();
   setInterval(runScheduleTick, 60_000);
+  setInterval(() => {
+    runProjectSummaryTick().catch((error) => {
+      process.stderr.write(`[PROJECT_SUMMARY] Tick failed: ${error.message}\n`);
+    });
+  }, 6 * 60 * 60 * 1000);
 
   // ---- Route handlers ----
 
@@ -2296,6 +2716,246 @@ export default function setup(api) {
     });
   }
 
+  function listProjectsWithDetails() {
+    const sql = `
+      SELECT
+        p.*,
+        COALESCE(tc.task_count, 0) AS linked_tasks_count,
+        s.id AS snapshot_id,
+        s.summary AS snapshot_summary,
+        s.progress_pct AS snapshot_progress_pct,
+        s.blockers AS snapshot_blockers,
+        s.generated_at AS snapshot_generated_at,
+        s.model AS snapshot_model,
+        c.sha AS commit_sha,
+        c.message AS commit_message,
+        c.author AS commit_author,
+        c.date AS commit_date,
+        c.branch AS commit_branch
+      FROM projects p
+      LEFT JOIN (
+        SELECT project_id, COUNT(*) AS task_count
+        FROM tasks
+        GROUP BY project_id
+      ) tc ON tc.project_id = p.id
+      LEFT JOIN project_snapshots s ON s.id = (
+        SELECT ps.id
+        FROM project_snapshots ps
+        WHERE ps.project_id = p.id
+        ORDER BY ps.generated_at DESC, ps.id DESC
+        LIMIT 1
+      )
+      LEFT JOIN project_commits c ON c.id = (
+        SELECT pc.id
+        FROM project_commits pc
+        WHERE pc.project_id = p.id
+        ORDER BY pc.date DESC, pc.id DESC
+        LIMIT 1
+      )
+      ORDER BY p.priority ASC, p.updated_at DESC
+    `;
+
+    return db.prepare(sql).all();
+  }
+
+  function getProjectWithDetails(id) {
+    const sql = `
+      SELECT
+        p.*,
+        COALESCE(tc.task_count, 0) AS linked_tasks_count,
+        s.id AS snapshot_id,
+        s.summary AS snapshot_summary,
+        s.progress_pct AS snapshot_progress_pct,
+        s.blockers AS snapshot_blockers,
+        s.generated_at AS snapshot_generated_at,
+        s.model AS snapshot_model,
+        c.sha AS commit_sha,
+        c.message AS commit_message,
+        c.author AS commit_author,
+        c.date AS commit_date,
+        c.branch AS commit_branch
+      FROM projects p
+      LEFT JOIN (
+        SELECT project_id, COUNT(*) AS task_count
+        FROM tasks
+        GROUP BY project_id
+      ) tc ON tc.project_id = p.id
+      LEFT JOIN project_snapshots s ON s.id = (
+        SELECT ps.id
+        FROM project_snapshots ps
+        WHERE ps.project_id = p.id
+        ORDER BY ps.generated_at DESC, ps.id DESC
+        LIMIT 1
+      )
+      LEFT JOIN project_commits c ON c.id = (
+        SELECT pc.id
+        FROM project_commits pc
+        WHERE pc.project_id = p.id
+        ORDER BY pc.date DESC, pc.id DESC
+        LIMIT 1
+      )
+      WHERE p.id = ?
+    `;
+
+    return db.prepare(sql).get(id);
+  }
+
+  function handleListProjects(res) {
+    const rows = listProjectsWithDetails();
+    sendJson(res, rows.map(rowToProject));
+  }
+
+  function handleGetProject(res, id) {
+    const row = getProjectWithDetails(id);
+    if (!row) {
+      sendError(res, 404, "Project not found");
+      return;
+    }
+
+    const tasks = db
+      .prepare(
+        "SELECT * FROM tasks WHERE project_id = ? ORDER BY created_at DESC",
+      )
+      .all(id)
+      .map(rowToTask);
+
+    sendJson(res, {
+      ...rowToProject(row),
+      tasks,
+    });
+  }
+
+  function handleGetProjectCommits(res, id) {
+    const project = db.prepare("SELECT id FROM projects WHERE id = ?").get(id);
+    if (!project) {
+      sendError(res, 404, "Project not found");
+      return;
+    }
+
+    const rows = db
+      .prepare(
+        "SELECT * FROM project_commits WHERE project_id = ? ORDER BY date DESC, id DESC LIMIT 20",
+      )
+      .all(id);
+    sendJson(res, rows.map(rowToProjectCommit));
+  }
+
+  async function handleUpdateProject(req, res, id) {
+    const existing = db.prepare("SELECT * FROM projects WHERE id = ?").get(id);
+    if (!existing) {
+      sendError(res, 404, "Project not found");
+      return;
+    }
+
+    const body = await parseBody(req);
+    const allowedFields = {
+      priority: "priority",
+      status: "status",
+      description: "description",
+      tags: "tags",
+    };
+
+    const setClauses = ["updated_at = datetime('now')"];
+    const params = { id };
+
+    for (const [apiField, dbField] of Object.entries(allowedFields)) {
+      if (body[apiField] === undefined) {
+        continue;
+      }
+
+      let value = body[apiField];
+      if (apiField === "tags") {
+        value =
+          typeof value === "string"
+            ? value
+            : Array.isArray(value)
+              ? JSON.stringify(value)
+              : "[]";
+      }
+
+      setClauses.push(`${dbField} = @${dbField}`);
+      params[dbField] = value;
+    }
+
+    if (setClauses.length === 1) {
+      sendJson(res, rowToProject(getProjectWithDetails(id)));
+      return;
+    }
+
+    db.prepare(
+      `UPDATE projects SET ${setClauses.join(", ")} WHERE id = @id`,
+    ).run(params);
+
+    const updated = rowToProject(getProjectWithDetails(id));
+    sendJson(res, updated);
+    broadcastSseEvent("project:updated", { projectId: id, project: updated });
+  }
+
+  async function handleRefreshProjectCommits(res, id) {
+    const project = db
+      .prepare("SELECT id, repo, branch FROM projects WHERE id = ?")
+      .get(id);
+
+    if (!project) {
+      sendError(res, 404, "Project not found");
+      return;
+    }
+
+    if (!project.repo) {
+      sendError(res, 400, "Project does not have a linked repository");
+      return;
+    }
+
+    let commits;
+    try {
+      commits = await fetchRepoCommits(project.repo, 10);
+    } catch (error) {
+      sendError(res, 502, `GitHub refresh failed: ${error.message}`);
+      return;
+    }
+
+    const insertCommit = db.prepare(`
+      INSERT OR IGNORE INTO project_commits (project_id, sha, message, author, date, branch)
+      VALUES (@project_id, @sha, @message, @author, @date, @branch)
+    `);
+
+    const newlyInserted = [];
+    const insertMany = db.transaction((rows) => {
+      for (const entry of rows) {
+        const normalized = {
+          project_id: id,
+          sha: entry.sha,
+          message: entry.commit?.message ?? null,
+          author: entry.commit?.author?.name ?? entry.author?.login ?? null,
+          date: entry.commit?.author?.date ?? null,
+          branch: project.branch || "main",
+        };
+
+        const result = insertCommit.run(normalized);
+        if (result.changes > 0) {
+          newlyInserted.push({
+            projectId: id,
+            sha: normalized.sha,
+            message: normalized.message,
+            author: normalized.author,
+            date: normalized.date,
+            branch: normalized.branch,
+          });
+        }
+      }
+    });
+
+    insertMany(commits);
+
+    sendJson(res, { projectId: id, commits: newlyInserted });
+    if (newlyInserted.length > 0) {
+      broadcastSseEvent("project:commits", {
+        projectId: id,
+        commits: newlyInserted,
+      });
+    }
+  }
+
   // ---- Dispatch runner endpoint (manual trigger / CLI use) ----
 
   api.registerHttpRoute({
@@ -2343,6 +3003,115 @@ export default function setup(api) {
         return true;
       } catch (e) {
         sendError(res, 500, e.message);
+        return true;
+      }
+    },
+  });
+
+  api.registerHttpRoute({
+    path: "/api/projects",
+    match: "prefix",
+    auth: "plugin",
+    handler: async (req, res) => {
+      try {
+        const pathname = req.url.split("?")[0];
+        const parts = pathname.split("/").filter(Boolean);
+        const segments = parts.slice(2);
+        const method = req.method?.toUpperCase() || "GET";
+
+        if (segments.length === 0) {
+          if (method === "GET") {
+            handleListProjects(res);
+            return true;
+          }
+          sendError(res, 405, `Method ${method} not allowed on /api/projects`);
+          return true;
+        }
+
+        if (segments.length === 1) {
+          const id = segments[0];
+          if (method === "GET") {
+            handleGetProject(res, id);
+            return true;
+          }
+          if (method === "PATCH") {
+            if (!requireApiKey(req, res)) return true;
+            await handleUpdateProject(req, res, id);
+            return true;
+          }
+          sendError(
+            res,
+            405,
+            `Method ${method} not allowed on /api/projects/:id`,
+          );
+          return true;
+        }
+
+        if (segments.length === 2 && segments[1] === "commits") {
+          const id = segments[0];
+          if (method === "GET") {
+            handleGetProjectCommits(res, id);
+            return true;
+          }
+          sendError(
+            res,
+            405,
+            `Method ${method} not allowed on /api/projects/:id/commits`,
+          );
+          return true;
+        }
+
+        if (segments.length === 2 && segments[1] === "refresh") {
+          const id = segments[0];
+          if (method === "POST") {
+            if (!requireApiKey(req, res)) return true;
+            await handleRefreshProjectCommits(res, id);
+            return true;
+          }
+          sendError(
+            res,
+            405,
+            `Method ${method} not allowed on /api/projects/:id/refresh`,
+          );
+          return true;
+        }
+
+        if (segments.length === 2 && segments[1] === "summarize") {
+          const id = segments[0];
+          if (method === "POST") {
+            if (!requireApiKey(req, res)) return true;
+            const project = db
+              .prepare("SELECT id, repo FROM projects WHERE id = ?")
+              .get(id);
+            if (!project) {
+              sendError(res, 404, "Project not found");
+              return true;
+            }
+            if (!project.repo) {
+              sendError(res, 400, "Project does not have a linked repository");
+              return true;
+            }
+
+            try {
+              const snapshot = await summarizeProject({ id });
+              sendJson(res, { projectId: id, snapshot });
+            } catch (error) {
+              sendError(res, 500, `Project summarize failed: ${error.message}`);
+            }
+            return true;
+          }
+          sendError(
+            res,
+            405,
+            `Method ${method} not allowed on /api/projects/:id/summarize`,
+          );
+          return true;
+        }
+
+        sendError(res, 404, "Not found");
+        return true;
+      } catch (e) {
+        sendError(res, 500, e.message || String(e));
         return true;
       }
     },

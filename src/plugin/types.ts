@@ -163,3 +163,38 @@ export interface PluginApi {
     listener: (payload: { sessionKey?: string; status?: string; error?: string }) => void,
   ) => void;
 }
+
+// Project-related interfaces
+export interface Project {
+  id: string;
+  name: string;
+  repo: string | null;
+  branch: string;
+  priority: number;
+  status: string;
+  description: string | null;
+  cwd: string | null;
+  tags: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ProjectCommit {
+  id: number;
+  project_id: string;
+  sha: string;
+  message: string | null;
+  author: string | null;
+  date: string | null;
+  branch: string | null;
+}
+
+export interface ProjectSnapshot {
+  id: number;
+  project_id: string;
+  summary: string | null;
+  progress_pct: number;
+  blockers: string | null;
+  generated_at: string;
+  model: string | null;
+}
