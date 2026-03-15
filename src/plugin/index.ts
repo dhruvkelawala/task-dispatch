@@ -1788,6 +1788,7 @@ export default function setup(api) {
         "UPDATE tasks SET status = 'done', completed_at = @completed_at, updated_at = @updated_at WHERE id = @id",
       ).run({ id: task.id, completed_at: now, updated_at: now });
       notifyMainSession(freshTask || task, "done");
+      await notifyTelegram(freshTask || task, "done");
       onTaskChanged(task.id);
       triggerDependents(task.id);
       process.stderr.write(
