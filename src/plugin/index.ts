@@ -1588,7 +1588,7 @@ export default function setup(api) {
       const result = await api.runtime.acp.spawn(
         {
           task: prompt,
-          label: `${task.title.slice(0, 55)}-${task.id.slice(0, 8)}`,
+          label: `${task.title.slice(0, 45)}-${task.id.slice(0, 8)}-${Date.now()}`,
           agentId: "opencode",
           cwd: resolvedCwd,
           thread: true,
@@ -3779,7 +3779,7 @@ Be specific — reference actual commit messages and features. Don't be vague.`;
               const result = await api.runtime.acp.spawn(
                 {
                   task: "Continue where you left off. Your previous session was interrupted. Check git log and git status to see your progress, then complete the remaining work.",
-                  label: `resume-${task.id.slice(0, 8)}`,
+                  label: `resume-${task.id.slice(0, 8)}-${Date.now()}`,
                   agentId: "opencode",
                   cwd: resolvedCwd,
                   resumeSessionId: task.sessionKey,
@@ -4058,7 +4058,7 @@ Be specific — reference actual commit messages and features. Don't be vague.`;
           const result = await api.runtime.acp.spawn(
             {
               task: "Continue where you left off. Your previous session was interrupted by a gateway restart. Check git log and git status to see your progress, then complete the remaining work.",
-              label: `auto-resume-${task.id.slice(0, 8)}`,
+              label: `auto-resume-${task.id.slice(0, 8)}-${Date.now()}`,
               agentId: "opencode",
               cwd: resolvedCwd,
               resumeSessionId: task.sessionKey,
