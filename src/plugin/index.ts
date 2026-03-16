@@ -4018,11 +4018,14 @@ Be specific — reference actual commit messages and features. Don't be vague.`;
       // Wait for gateway + ACP runtime to fully settle
       await new Promise((r) => setTimeout(r, 8000));
 
+      // Only resume tasks that were marked as errored in the last 60 seconds
+      // (i.e. by THIS startup's stuck-task cleanup, not old stale errors)
+      const cutoff = Date.now() - 60_000;
       const restartErrored = db
         .prepare(
-          "SELECT * FROM tasks WHERE status = 'error' AND error = 'Gateway restart during execution' AND session_key IS NOT NULL",
+          "SELECT * FROM tasks WHERE status = 'error' AND error = 'Gateway restart during execution' AND session_key IS NOT NULL AND updated_at > ?",
         )
-        .all();
+        .all(cutoff);
 
       if (restartErrored.length === 0) return;
 
