@@ -1150,8 +1150,9 @@ export default function setup(api) {
       throw new Error("api.runtime.subagent.getSessionMessages not available");
     }
 
-    // Post "QA in progress" to thread
+    // Post "QA in progress" to thread (delay to let Zeus's completion message arrive first)
     if (task.threadId) {
+      await new Promise((r) => setTimeout(r, 3000));
       await postToThread(task.threadId, "🔍 **QA in progress** — Nemesis is reviewing...", "nemesis").catch(() => {});
     }
 
@@ -4018,9 +4019,9 @@ Be specific — reference actual commit messages and features. Don't be vague.`;
       // Wait for gateway + ACP runtime to fully settle
       await new Promise((r) => setTimeout(r, 8000));
 
-      // Only resume tasks that were marked as errored in the last 60 seconds
+      // Only resume tasks that were marked as errored in the last 5 minutes
       // (i.e. by THIS startup's stuck-task cleanup, not old stale errors)
-      const cutoff = Date.now() - 60_000;
+      const cutoff = Date.now() - 5 * 60_000;
       const restartErrored = db
         .prepare(
           "SELECT * FROM tasks WHERE status = 'error' AND error = 'Gateway restart during execution' AND session_key IS NOT NULL AND updated_at > ?",
