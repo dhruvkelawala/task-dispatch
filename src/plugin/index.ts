@@ -4012,6 +4012,142 @@ Be specific — reference actual commit messages and features. Don't be vague.`;
     }
   })();
 
+  // ---- Auto-resume tasks killed by gateway restart ----
+  (async () => {
+    try {
+      // Wait for gateway + ACP runtime to fully settle
+      await new Promise((r) => setTimeout(r, 8000));
+
+      const restartErrored = db
+        .prepare(
+          "SELECT * FROM tasks WHERE status = 'error' AND error = 'Gateway restart during execution' AND session_key IS NOT NULL",
+        )
+        .all();
+
+      if (restartErrored.length === 0) return;
+
+      process.stderr.write(
+        `[AUTO-RESUME] Found ${restartErrored.length} task(s) interrupted by gateway restart\n`,
+      );
+
+      for (const row of restartErrored) {
+        const task = rowToTask(row);
+        process.stderr.write(
+          `[AUTO-RESUME] Resuming task ${task.id} (${task.title})\n`,
+        );
+
+        try {
+          const resolvedCwd = task.cwd || resolveCwd(task);
+          const accountId = resolveAccountId(task.agent);
+          const channelId = resolveChannel(task);
+
+          // Mark as in_progress
+          db.prepare(
+            "UPDATE tasks SET status = 'in_progress', error = NULL, updated_at = @updated_at WHERE id = @id",
+          ).run({ id: task.id, updated_at: Date.now() });
+          onTaskChanged(task.id);
+
+          if (task.threadId) {
+            await postToThread(task.threadId, "🔄 **Auto-resuming** — gateway restarted, picking up where we left off...", "sumodeus").catch(() => {});
+          }
+
+          const result = await api.runtime.acp.spawn(
+            {
+              task: "Continue where you left off. Your previous session was interrupted by a gateway restart. Check git log and git status to see your progress, then complete the remaining work.",
+              label: `auto-resume-${task.id.slice(0, 8)}`,
+              agentId: "opencode",
+              cwd: resolvedCwd,
+              resumeSessionId: task.sessionKey,
+              thread: false,
+            },
+            {
+              agentChannel: "discord",
+              agentAccountId: accountId,
+              agentTo: channelId ? `channel:${channelId}` : undefined,
+            },
+          );
+
+          if (result?.status !== "accepted") {
+            throw new Error(result?.error || `resume spawn failed: ${result?.status || "unknown"}`);
+          }
+
+          const childRunId = typeof result?.runId === "string" ? result.runId.trim() : "";
+          const childSessionKey = result?.childSessionKey || task.sessionKey;
+          if (!childRunId) throw new Error("resume spawn did not return runId");
+
+          process.stderr.write(
+            `[AUTO-RESUME] spawn accepted for ${task.id}, runId=${childRunId}\n`,
+          );
+
+          db.prepare(
+            "UPDATE tasks SET session_key = @sessionKey, run_id = @runId, updated_at = @updated_at WHERE id = @id",
+          ).run({ id: task.id, sessionKey: childSessionKey, runId: childRunId, updated_at: Date.now() });
+
+          // Wait for completion
+          const wait = await api.runtime.subagent.waitForRun({
+            runId: childRunId,
+            timeoutMs: resolveTaskTimeoutMs(task),
+          });
+          const waitStatus = wait?.status || "timeout";
+          if (waitStatus !== "ok") {
+            const waitError = wait?.error ? `: ${wait.error}` : "";
+            throw new Error(`resumed run failed (${waitStatus})${waitError}`);
+          }
+
+          // Get output
+          let text = "";
+          if (api.runtime?.subagent?.getSessionMessages) {
+            const msgs = await api.runtime.subagent.getSessionMessages({
+              sessionKey: childSessionKey,
+              limit: 200,
+            });
+            text = extractOutputFromMessages(msgs?.messages || []);
+          }
+
+          // Mark review
+          db.prepare(
+            "UPDATE tasks SET status = 'review', output = @output, completed_at = NULL, updated_at = @updated_at WHERE id = @id",
+          ).run({ id: task.id, output: text.slice(0, 10000), updated_at: Date.now() });
+
+          if (task.threadId) {
+            await postToThread(task.threadId, `✅ **Resume completed**\n\n${text.slice(0, 1500)}${text.length > 1500 ? "..." : ""}`);
+          }
+          onTaskChanged(task.id);
+
+          // Run QA if required
+          const freshTask = rowToTask(getTask(task.id));
+          if (resolveQaRequired(freshTask || task)) {
+            await runMaatReviewLoop(task.id);
+          } else {
+            const doneNow = Date.now();
+            db.prepare(
+              "UPDATE tasks SET status = 'done', completed_at = @completed_at, updated_at = @updated_at WHERE id = @id",
+            ).run({ id: task.id, completed_at: doneNow, updated_at: doneNow });
+            notifyMainSession(freshTask || task, "done");
+            onTaskChanged(task.id);
+            triggerDependents(task.id);
+          }
+
+          process.stderr.write(
+            `[AUTO-RESUME] Task ${task.id} successfully resumed and completed\n`,
+          );
+        } catch (e) {
+          process.stderr.write(
+            `[AUTO-RESUME] Failed for task ${task.id}: ${e.message}\n`,
+          );
+          db.prepare(
+            "UPDATE tasks SET status = 'error', error = @error, retries = retries + 1, updated_at = @updated_at WHERE id = @id",
+          ).run({ id: task.id, error: `Auto-resume failed: ${e.message}`, updated_at: Date.now() });
+          onTaskChanged(task.id);
+        }
+      }
+    } catch (e) {
+      process.stderr.write(
+        `[AUTO-RESUME] Startup error: ${e.message}\n`,
+      );
+    }
+  })();
+
   // ---- Completion hook (Phase 3 dispatch will populate session_key) ----
 
   api.on("subagent_ended", (event) => {
