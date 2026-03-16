@@ -1110,6 +1110,15 @@ export default function setup(api) {
         : "# no commit hash available — check git log",
       "npx tsc --noEmit 2>&1 | tail -20",
       "pnpm build 2>&1 | tail -20",
+      ...(project === "forayy"
+        ? [
+            "# Maestro E2E tests (Forayy only)",
+            "xcrun simctl privacy 12671090-B3C0-4268-8F87-4D88F4EA18B6 grant location com.forayy.app",
+            "xcrun simctl privacy 12671090-B3C0-4268-8F87-4D88F4EA18B6 grant photos com.forayy.app",
+            "xcrun simctl location 12671090-B3C0-4268-8F87-4D88F4EA18B6 set 51.5074,-0.1278",
+            'PATH="$HOME/.maestro/bin:$PATH" maestro test apps/mobile/.maestro/flows/ 2>&1 | tail -30',
+          ]
+        : []),
       "```",
       "",
       "## Decision Criteria",
@@ -1139,6 +1148,11 @@ export default function setup(api) {
     }
     if (!api.runtime?.subagent?.getSessionMessages) {
       throw new Error("api.runtime.subagent.getSessionMessages not available");
+    }
+
+    // Post "QA in progress" to thread
+    if (task.threadId) {
+      await postToThread(task.threadId, "🔍 **QA in progress** — Nemesis is reviewing...", "nemesis").catch(() => {});
     }
 
     const maatSessionKey = `agent:nemesis:subagent:review:${crypto.randomUUID()}`;
@@ -1277,7 +1291,7 @@ export default function setup(api) {
           updated_at: now,
         });
         notifyMainSession(task, "done");
-        await notifyTelegram(rowToTask(getTask(task.id)) || task, "done");
+        // notifyTelegram(rowToTask(getTask(task.id)) || task, "done");
         onTaskChanged(task.id);
         triggerDependents(task.id);
         return;
@@ -1305,7 +1319,7 @@ export default function setup(api) {
           );
         }
         notifyMainSession(blockedTask || task, "blocked");
-        await notifyTelegram(blockedTask || task, "blocked");
+        // notifyTelegram(blockedTask || task, "blocked");
         return;
       }
 
@@ -1722,7 +1736,7 @@ export default function setup(api) {
       ).run({ id: task.id, error, updated_at: now });
       onTaskChanged(task.id);
       notifyMainSession({ ...task, error }, "error");
-      notifyTelegram({ ...task, error }, "error");
+      // notifyTelegram({ ...task, error }, "error");
       return;
     }
 
@@ -1783,7 +1797,7 @@ export default function setup(api) {
           updated_at: now,
         });
         onTaskChanged(task.id);
-        await notifyTelegram(rowToTask(getTask(task.id)) || task, "error");
+        // notifyTelegram(rowToTask(getTask(task.id)) || task, "error");
       }
     } else {
       // QA disabled — auto-approve
@@ -1910,7 +1924,7 @@ export default function setup(api) {
           updated_at: now,
         });
         onTaskChanged(task.id);
-        await notifyTelegram(rowToTask(getTask(task.id)) || task, "error");
+        // notifyTelegram(rowToTask(getTask(task.id)) || task, "error");
         return;
       }
     }
@@ -1962,7 +1976,7 @@ export default function setup(api) {
           updated_at: now,
         });
         onTaskChanged(task.id);
-        await notifyTelegram(rowToTask(getTask(task.id)) || task, "error");
+        // notifyTelegram(rowToTask(getTask(task.id)) || task, "error");
       }
     } else {
       const now = Date.now();
@@ -3709,6 +3723,193 @@ Be specific — reference actual commit messages and features. Don't be vague.`;
             405,
             `Method ${method} not allowed on /api/tasks/:id/comments`,
           );
+          return true;
+        }
+
+        // /api/tasks/:id/resume — resume a failed ACP session
+        if (
+          segments.length === 2 &&
+          segments[1] === "resume" &&
+          method === "POST"
+        ) {
+          if (!requireApiKey(req, res)) return true;
+          const id = segments[0];
+          const row = getTask(id);
+          if (!row) {
+            sendError(res, 404, "Task not found");
+            return true;
+          }
+          const task = rowToTask(row);
+          if (task.status !== "error") {
+            sendError(res, 400, `Cannot resume task in status '${task.status}'. Must be in error state.`);
+            return true;
+          }
+          if (!task.sessionKey) {
+            sendError(res, 400, "Task has no session to resume");
+            return true;
+          }
+          if (!api.runtime?.acp?.spawn) {
+            sendError(res, 500, "acp.spawn not available");
+            return true;
+          }
+
+          // Respond immediately, resume in background
+          res.writeHead(202, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: true, message: "Resume triggered", taskId: task.id, sessionKey: task.sessionKey }));
+
+          // Background: spawn with resumeSessionId
+          (async () => {
+            try {
+              const resolvedCwd = task.cwd || resolveCwd(task);
+              const accountId = resolveAccountId(task.agent);
+              const channelId = resolveChannel(task);
+
+              // Mark as in_progress
+              const now = Date.now();
+              db.prepare(
+                "UPDATE tasks SET status = 'in_progress', error = NULL, updated_at = @updated_at WHERE id = @id",
+              ).run({ id: task.id, updated_at: now });
+              onTaskChanged(task.id);
+
+              if (task.threadId) {
+                await postToThread(task.threadId, "🔄 **Resuming session** — picking up where we left off...", "sumodeus").catch(() => {});
+              }
+
+              const result = await api.runtime.acp.spawn(
+                {
+                  task: "Continue where you left off. Your previous session was interrupted. Check git log and git status to see your progress, then complete the remaining work.",
+                  label: `resume-${task.id.slice(0, 8)}`,
+                  agentId: "opencode",
+                  cwd: resolvedCwd,
+                  resumeSessionId: task.sessionKey,
+                  thread: false, // reuse existing thread
+                },
+                {
+                  agentChannel: "discord",
+                  agentAccountId: accountId,
+                  agentTo: channelId ? `channel:${channelId}` : undefined,
+                },
+              );
+
+              if (result?.status !== "accepted") {
+                throw new Error(result?.error || `resume spawn failed with status=${result?.status || "unknown"}`);
+              }
+
+              const childRunId = typeof result?.runId === "string" ? result.runId.trim() : "";
+              const childSessionKey = result?.childSessionKey || task.sessionKey;
+              if (!childRunId) {
+                throw new Error("resume spawn did not return runId");
+              }
+
+              process.stderr.write(
+                `[RESUME] spawn accepted for ${task.id}, runId=${childRunId}, session=${childSessionKey}\n`,
+              );
+
+              db.prepare(
+                "UPDATE tasks SET session_key = @sessionKey, run_id = @runId, updated_at = @updated_at WHERE id = @id",
+              ).run({ id: task.id, sessionKey: childSessionKey, runId: childRunId, updated_at: Date.now() });
+
+              // Wait for completion
+              const wait = await api.runtime.subagent.waitForRun({
+                runId: childRunId,
+                timeoutMs: resolveTaskTimeoutMs(task),
+              });
+              const waitStatus = wait?.status || "timeout";
+              if (waitStatus !== "ok") {
+                const waitError = wait?.error ? `: ${wait.error}` : "";
+                throw new Error(`resumed run failed (${waitStatus})${waitError}`);
+              }
+
+              // Get output
+              let text = "";
+              if (api.runtime?.subagent?.getSessionMessages) {
+                const msgs = await api.runtime.subagent.getSessionMessages({
+                  sessionKey: childSessionKey,
+                  limit: 200,
+                });
+                text = extractOutputFromMessages(msgs?.messages || []);
+              }
+
+              // Mark review
+              const reviewNow = Date.now();
+              db.prepare(
+                "UPDATE tasks SET status = 'review', output = @output, completed_at = NULL, updated_at = @updated_at WHERE id = @id",
+              ).run({ id: task.id, output: text.slice(0, 10000), updated_at: reviewNow });
+
+              if (task.threadId) {
+                const summary = text.slice(0, 1500);
+                await postToThread(task.threadId, `✅ **Resume completed**\n\n${summary}${text.length > 1500 ? "..." : ""}`);
+              }
+              onTaskChanged(task.id);
+
+              // Run QA if required
+              const freshTask = rowToTask(getTask(task.id));
+              if (resolveQaRequired(freshTask || task)) {
+                await runMaatReviewLoop(task.id);
+              } else {
+                const doneNow = Date.now();
+                db.prepare(
+                  "UPDATE tasks SET status = 'done', completed_at = @completed_at, updated_at = @updated_at WHERE id = @id",
+                ).run({ id: task.id, completed_at: doneNow, updated_at: doneNow });
+                notifyMainSession(freshTask || task, "done");
+                onTaskChanged(task.id);
+                triggerDependents(task.id);
+              }
+            } catch (e) {
+              process.stderr.write(`[RESUME] failed for ${task.id}: ${e.message}\n`);
+              const now = Date.now();
+              db.prepare(
+                "UPDATE tasks SET status = 'error', error = @error, retries = retries + 1, updated_at = @updated_at WHERE id = @id",
+              ).run({ id: task.id, error: `Resume failed: ${e.message}`, updated_at: now });
+              onTaskChanged(task.id);
+            }
+          })();
+          return true;
+        }
+
+        // /api/tasks/:id/qa — manually trigger QA review
+        if (
+          segments.length === 2 &&
+          segments[1] === "qa" &&
+          method === "POST"
+        ) {
+          if (!requireApiKey(req, res)) return true;
+          const id = segments[0];
+          const row = getTask(id);
+          if (!row) {
+            sendError(res, 404, "Task not found");
+            return true;
+          }
+          const task = rowToTask(row);
+          // Task must be in a completable state (done with qaRequired false, or in_progress/review)
+          const allowedStatuses = ["done", "in_progress", "review"];
+          if (!allowedStatuses.includes(task.status)) {
+            sendError(res, 400, `Cannot trigger QA for task in status '${task.status}'. Must be done, in_progress, or review.`);
+            return true;
+          }
+          // Move to review status if not already there
+          if (task.status !== "review") {
+            const now = Date.now();
+            db.prepare(
+              "UPDATE tasks SET status = 'review', qa_required = 1, review_attempts = 0, completed_at = NULL, updated_at = @updated_at WHERE id = @id",
+            ).run({ id: task.id, updated_at: now });
+            onTaskChanged(task.id);
+          }
+          // Respond immediately, run QA in background
+          res.writeHead(202, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: true, message: "QA review triggered", taskId: task.id }));
+          // Fire QA loop in background
+          runMaatReviewLoop(task.id).catch((e) => {
+            const now = Date.now();
+            db.prepare(
+              "UPDATE tasks SET status = 'error', error = @error, retries = retries + 1, updated_at = @updated_at WHERE id = @id",
+            ).run({
+              id: task.id,
+              error: `Manual QA review failed: ${e.message}`,
+              updated_at: now,
+            });
+            onTaskChanged(task.id);
+          });
           return true;
         }
 

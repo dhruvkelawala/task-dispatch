@@ -305,6 +305,22 @@ async function cmdStats(): Promise<void> {
   prettyPrint(data);
 }
 
+async function cmdResume(id: string): Promise<void> {
+  if (!id) fail("Usage: dispatch resume <task-id>");
+  const { data, status } = await doReq("POST", `/api/tasks/${id}/resume`, {});
+  if (status >= 400) fail(`HTTP ${status}: ${data}`);
+  process.stdout.write(`🔄 Resume triggered for task ${short(id)}\n`);
+  prettyPrint(data);
+}
+
+async function cmdQa(id: string): Promise<void> {
+  if (!id) fail("Usage: dispatch qa <task-id>");
+  const { data, status } = await doReq("POST", `/api/tasks/${id}/qa`, {});
+  if (status >= 400) fail(`HTTP ${status}: ${data}`);
+  process.stdout.write(`🔍 QA review triggered for task ${short(id)}\n`);
+  prettyPrint(data);
+}
+
 async function cmdHealth(): Promise<void> {
   const { data, status } = await doReq("GET", "/api/dispatch/health", null);
   if (status >= 400) fail(`HTTP ${status}: ${data}`);
@@ -322,6 +338,8 @@ COMMANDS:
   prompt <id>  Send follow-up to existing task session
   update <id>  Update task status
   delete <id>  Delete a task
+  resume <id>  Resume a failed task's ACP session
+  qa <id>      Manually trigger QA review (Nemesis) on a task
   stats        Show task statistics
   health       Check plugin health
 
@@ -442,6 +460,14 @@ async function main(): Promise<void> {
     case "rm":
     case "d":
       await cmdDelete(argv[1] || "");
+      break;
+    case "resume":
+    case "r":
+      await cmdResume(argv[1] || "");
+      break;
+    case "qa":
+    case "review":
+      await cmdQa(argv[1] || "");
       break;
     case "stats":
     case "s":
