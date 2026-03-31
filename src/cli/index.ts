@@ -1,6 +1,8 @@
 #!/usr/bin/env bun
 
 import { existsSync, readFileSync } from "node:fs";
+import { createInterface } from "node:readline/promises";
+import { stdin as input, stdout as output } from "node:process";
 
 const defaultBase = "http://localhost:18789";
 const defaultApiKey = "24b1b4e5472806f373c62c49cfe119d6";
@@ -262,6 +264,43 @@ function statusLabel(status: string): string {
   }
 }
 
+function classifyTaskFailure(task: Record<string, unknown>): { category: string; nextStep: string } {
+  const error = String(task.error || "");
+  if (!error) {
+    if (String(task.status || "") === "done") {
+      return { category: "done", nextStep: "Inspect the thread or test the output locally." };
+    }
+    if (["ready", "dispatched", "in_progress", "review"].includes(String(task.status || ""))) {
+      return { category: "active", nextStep: "Use dispatch follow <id> to watch it progress live." };
+    }
+    return { category: "unknown", nextStep: "Inspect the task history/logs if you need more detail." };
+  }
+  if (error.includes("LiveSessionModelSwitchError")) {
+    return { category: "qa_model_switch", nextStep: "Use dispatch retry <id> --no-qa or fix the QA runtime path first." };
+  }
+  if (error.includes("produced nothing") || error.includes("no output")) {
+    return { category: "silent_failure", nextStep: "Retry with a fresh run and verify the model/runtime selection." };
+  }
+  if (error.includes("thread binding") || error.includes("no thread binding") || error.includes("Discord thread")) {
+    return { category: "thread_binding", nextStep: "Check project/channel routing and Discord thread binding before retrying." };
+  }
+  if (String(task.status || "") === "blocked") {
+    return { category: "blocked", nextStep: "Human intervention is probably needed before another rerun." };
+  }
+  return { category: "generic_error", nextStep: "Use dispatch retry <id> for a fresh rerun, or fix the underlying issue first if it is systemic." };
+}
+
+async function askInteractive(question: string, defaultValue = ""): Promise<string> {
+  const rl = createInterface({ input, output });
+  try {
+    const suffix = defaultValue ? ` [${defaultValue}]` : "";
+    const answer = (await rl.question(`${question}${suffix}: `)).trim();
+    return answer || defaultValue;
+  } finally {
+    rl.close();
+  }
+}
+
 async function cmdCreate(args: string[]): Promise<void> {
   const payload: Record<string, unknown> = {
     agent: "zeus",
@@ -273,6 +312,8 @@ async function cmdCreate(args: string[]): Promise<void> {
   let desc = "";
   let selectedProject: ProjectEntry | null = null;
   let dryRun = false;
+  let interactive = false;
+  let reuseThread = false;
   let fromTaskId = "";
   let explicitAgent = false;
 
@@ -339,6 +380,12 @@ async function cmdCreate(args: string[]): Promise<void> {
       case "--dry-run":
         dryRun = true;
         break;
+      case "--interactive":
+        interactive = true;
+        break;
+      case "--reuse-thread":
+        reuseThread = true;
+        break;
       case "--model":
         i += 1;
         payload.model = args[i] || "";
@@ -394,6 +441,7 @@ async function cmdCreate(args: string[]): Promise<void> {
     if (payload.thinking == null && fromTask.thinking) payload.thinking = fromTask.thinking;
     if (!args.includes("--timeout") && fromTask.timeoutMs) payload.timeoutMs = fromTask.timeoutMs;
     if (!args.includes("--no-qa")) payload.qaRequired = fromTask.qaRequired !== false;
+    if (reuseThread && fromTask.threadId) payload.threadId = fromTask.threadId;
   }
 
   if (typeof payload.cwd === "string" && !payload.projectId) {
@@ -402,6 +450,47 @@ async function cmdCreate(args: string[]): Promise<void> {
       selectedProject = inferred;
       payload.projectId = inferred.key;
       if (!explicitAgent && inferred.defaultAgent) payload.agent = inferred.defaultAgent;
+    }
+  }
+
+  if (interactive) {
+    if (!input.isTTY || !output.isTTY) {
+      fail("--interactive requires a TTY");
+    }
+    if (!title) title = await askInteractive("Task title");
+    if (!payload.cwd) {
+      const maybeCwd = await askInteractive("Working directory (optional)");
+      if (maybeCwd) payload.cwd = maybeCwd;
+    }
+    if (typeof payload.cwd === "string" && !payload.projectId) {
+      const inferred = inferProjectFromCwd(String(payload.cwd));
+      if (inferred) {
+        selectedProject = inferred;
+        payload.projectId = inferred.key;
+        if (!explicitAgent && inferred.defaultAgent) payload.agent = inferred.defaultAgent;
+      }
+    }
+    if (!payload.projectId) {
+      process.stdout.write(`Projects: ${projectEntries().map((p) => p.key).join(", ")}\n`);
+      const projectAnswer = await askInteractive("Project key");
+      const resolved = resolveProject(projectAnswer);
+      if (!resolved) fail(`Unknown project: ${projectAnswer}`);
+      selectedProject = resolved;
+      payload.projectId = resolved.key;
+      if (!payload.cwd || payload.cwd === "-") payload.cwd = resolved.cwd !== "-" ? resolved.cwd : payload.cwd;
+      if (!explicitAgent && resolved.defaultAgent) payload.agent = resolved.defaultAgent;
+    }
+    if (!desc) desc = await askInteractive("Description (optional)");
+    if (!explicitAgent) payload.agent = await askInteractive("Agent", String(payload.agent || "zeus"));
+    const qaAnswer = await askInteractive("QA? yes/no", payload.qaRequired ? "yes" : "no");
+    payload.qaRequired = !["n", "no", "false", "0"].includes(qaAnswer.toLowerCase());
+    const timeoutAnswer = await askInteractive("Timeout ms", String(payload.timeoutMs || ""));
+    if (timeoutAnswer) payload.timeoutMs = Number(timeoutAnswer);
+    process.stdout.write(`\nCreate task?\nProject: ${String(payload.projectId)}\nCWD: ${String(payload.cwd || "-")}\nAgent: ${String(payload.agent || "-")}\nQA: ${payload.qaRequired ? "on" : "off"}\n`);
+    const confirm = await askInteractive("Proceed? yes/no", "yes");
+    if (["n", "no", "false", "0"].includes(confirm.toLowerCase())) {
+      process.stdout.write("Aborted.\n");
+      return;
     }
   }
 
@@ -646,8 +735,54 @@ async function cmdRecentErrors(args: string[] = []): Promise<void> {
     return;
   }
   for (const task of errors) {
+    const classification = classifyTaskFailure(task);
     process.stdout.write(`${short(String(task.id || ""))}  ${statusLabel(String(task.status || ""))}  ${String(task.projectId || task.project_id || "-")}  ${String(task.title || "")}\n`);
+    process.stdout.write(`  category: ${classification.category}\n`);
     process.stdout.write(`  error: ${truncate(String(task.error || ""), 220)}\n`);
+    process.stdout.write(`  next: ${classification.nextStep}\n`);
+  }
+}
+
+async function cmdWatch(args: string[] = []): Promise<void> {
+  const parsed = parseArgs(args);
+  const intervalMs = Math.max(1000, Number(parsed.interval || 3) * 1000);
+  const projectFilter = typeof parsed.project === "string" ? (resolveProject(parsed.project)?.key || parsed.project) : "";
+  const once = Boolean(parsed.once);
+
+  for (;;) {
+    const tasks = await fetchTasks();
+    const filtered = projectFilter
+      ? tasks.filter((task) => String(task.projectId || task.project_id || "") === projectFilter)
+      : tasks;
+    const active = filtered
+      .filter((task) => ["ready", "dispatched", "in_progress", "review"].includes(String(task.status || "")))
+      .sort((a, b) => Number(b.updatedAt || b.updated_at || 0) - Number(a.updatedAt || a.updated_at || 0))
+      .slice(0, 10);
+    const errors = filtered
+      .filter((task) => ["error", "blocked"].includes(String(task.status || "")))
+      .sort((a, b) => Number(b.updatedAt || b.updated_at || 0) - Number(a.updatedAt || a.updated_at || 0))
+      .slice(0, 5);
+    process.stdout.write("\x1b[2J\x1b[H");
+    process.stdout.write(`dispatch watch${projectFilter ? ` — ${projectFilter}` : ""} (${new Date().toLocaleTimeString("en-GB")})\n\n`);
+    process.stdout.write("Active tasks:\n");
+    if (active.length === 0) {
+      process.stdout.write("  none\n");
+    } else {
+      for (const task of active) {
+        process.stdout.write(`  ${short(String(task.id || ""))}  ${statusLabel(String(task.status || ""))}  ${truncate(String(task.title || ""), 70)}\n`);
+      }
+    }
+    process.stdout.write("\nRecent errors:\n");
+    if (errors.length === 0) {
+      process.stdout.write("  none\n");
+    } else {
+      for (const task of errors) {
+        const classification = classifyTaskFailure(task);
+        process.stdout.write(`  ${short(String(task.id || ""))}  ${classification.category}  ${truncate(String(task.title || ""), 56)}\n`);
+      }
+    }
+    if (once) break;
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
   }
 }
 
@@ -744,25 +879,7 @@ async function cmdFollow(id: string): Promise<void> {
 }
 
 function explainNextStep(task: Record<string, unknown>): string {
-  const error = String(task.error || "");
-  if (!error) {
-    if (String(task.status || "") === "done") return "Next step: inspect the thread or test the output locally.";
-    if (["ready", "dispatched", "in_progress", "review"].includes(String(task.status || ""))) return "Next step: use dispatch follow <id> to watch it progress live.";
-    return "Next step: inspect the task history/logs if you need more detail.";
-  }
-  if (error.includes("LiveSessionModelSwitchError")) {
-    return "Next step: this looks like a reviewer/runtime model-switch issue. Use dispatch retry <id> --no-qa or fix the QA runtime path first.";
-  }
-  if (error.includes("produced nothing") || error.includes("no output")) {
-    return "Next step: the agent likely failed silently. Use dispatch retry <id> for a fresh rerun and verify the model/runtime selection.";
-  }
-  if (error.includes("thread binding") || error.includes("no thread binding") || error.includes("Discord thread")) {
-    return "Next step: this looks like a Discord/thread binding problem. Check channel/project routing, then retry the task.";
-  }
-  if (String(task.status || "") === "blocked") {
-    return "Next step: the task is blocked after retries/review cycles. Human intervention is probably needed before another rerun.";
-  }
-  return "Next step: use dispatch retry <id> if you want a fresh rerun, or fix the underlying plugin/runtime issue first if the error is systemic.";
+  return classifyTaskFailure(task).nextStep;
 }
 
 async function cmdExplain(id: string): Promise<void> {
@@ -878,8 +995,9 @@ COMMANDS:
   create, c        Create a new task
   list, ls         List tasks (supports --project / --status)
   active           Show live tasks in ready/dispatched/in_progress/review
+  watch            Live board for active tasks and recent errors
   history          Show completed/failed/blocked task history
-  recent-errors    Show recent error/blocked tasks
+  recent-errors    Show recent error/blocked tasks with suggested next steps
   get <id>         Get task details (short IDs supported)
   inspect <id>     Human-friendly task summary with thread/session links
   explain <id>     Plain-English task summary + suggested next step
@@ -914,6 +1032,7 @@ CREATE FLAGS:
   --timeout         Timeout in ms (defaults to config value)
   --no-qa           Skip Maat code review
   --dry-run         Show resolved project/cwd/agent and exit
+  --interactive     Prompt for missing task fields in TTY mode
   --model           Override model
   --thinking        Thinking level
 
@@ -921,6 +1040,11 @@ RETRY FLAGS:
   --no-qa           Retry with QA disabled
   --reuse-thread    Reuse the previous Discord thread
   --fresh-thread    Force a fresh thread (default behavior)
+
+WATCH FLAGS:
+  --project         Filter live board to a single project
+  --interval        Refresh interval in seconds (default: 3)
+  --once            Render once instead of refreshing continuously
 
 PROMPT:
   dispatch prompt <id> "message"
@@ -937,10 +1061,12 @@ EXAMPLES:
   dispatch create -t "Add feature" -p mission-control -d "Build usage dashboard" --no-qa
   dispatch create -t "Task B" -p 0xready --depends-on abc12345 -f desc.md
   dispatch create -t "Task C" -p go-hevy --after abc12345,def67890 --dry-run
-  dispatch create --from abc123 -t "Follow-up task" --no-qa
+  dispatch create --from abc123 -t "Follow-up task" --no-qa --reuse-thread
   dispatch create -t "Infer project from cwd" --cwd /Users/sumo-deus/.openclaw/workspace/hevy-cli --dry-run
+  dispatch create --interactive
   dispatch create -t "Continue thread" -p task-dispatch -T 1488561798167793894 -d "Follow-up work"
   dispatch active --project go-hevy
+  dispatch watch --project go-hevy --once
   dispatch recent-errors --project go-hevy
   dispatch list --project go-hevy --status error
   dispatch history --project go-hevy
@@ -1026,6 +1152,9 @@ async function main(): Promise<void> {
       break;
     case "active":
       await cmdActive(argv.slice(1));
+      break;
+    case "watch":
+      await cmdWatch(argv.slice(1));
       break;
     case "history":
       await cmdHistory(argv.slice(1));
