@@ -113,6 +113,15 @@ function resolveProject(input: string): ProjectEntry | null {
   return match || null;
 }
 
+function inferProjectFromCwd(cwd: string): ProjectEntry | null {
+  const normalized = (cwd || "").trim().replace(/\/$/, "");
+  if (!normalized) return null;
+  return (
+    projectEntries().find((entry) => entry.cwd !== "-" && entry.cwd.replace(/\/$/, "") === normalized) ||
+    null
+  );
+}
+
 async function fetchTasks(): Promise<Array<Record<string, unknown>>> {
   const { data, status } = await doReq("GET", "/api/tasks", null);
   if (status >= 400) fail(`HTTP ${status}: ${data}`);
@@ -264,6 +273,8 @@ async function cmdCreate(args: string[]): Promise<void> {
   let desc = "";
   let selectedProject: ProjectEntry | null = null;
   let dryRun = false;
+  let fromTaskId = "";
+  let explicitAgent = false;
 
   for (let i = 0; i < args.length; i += 1) {
     const arg = args[i] ?? "";
@@ -283,6 +294,7 @@ async function cmdCreate(args: string[]): Promise<void> {
       case "--agent":
         i += 1;
         payload.agent = args[i] || "zeus";
+        explicitAgent = true;
         break;
       case "-p":
       case "--project": {
@@ -309,6 +321,10 @@ async function cmdCreate(args: string[]): Promise<void> {
       case "--cwd":
         i += 1;
         payload.cwd = args[i] || "";
+        break;
+      case "--from":
+        i += 1;
+        fromTaskId = args[i] || "";
         break;
       case "--timeout": {
         i += 1;
@@ -361,9 +377,37 @@ async function cmdCreate(args: string[]): Promise<void> {
     }
   }
 
+  if (fromTaskId) {
+    const resolvedFromId = await resolveTaskId(fromTaskId);
+    const { data, status } = await doReq("GET", `/api/tasks/${resolvedFromId}`, null);
+    if (status >= 400) fail(`HTTP ${status}: ${data}`);
+    const fromTask = JSON.parse(data) as Record<string, unknown>;
+    if (!title) title = String(fromTask.title || "");
+    if (!desc) desc = String(fromTask.description || "");
+    if (!payload.projectId && fromTask.projectId) {
+      payload.projectId = String(fromTask.projectId);
+      selectedProject = resolveProject(String(fromTask.projectId));
+    }
+    if (!payload.cwd && fromTask.cwd) payload.cwd = String(fromTask.cwd);
+    if (!explicitAgent && fromTask.agent) payload.agent = String(fromTask.agent);
+    if (payload.model == null && fromTask.model) payload.model = fromTask.model;
+    if (payload.thinking == null && fromTask.thinking) payload.thinking = fromTask.thinking;
+    if (!args.includes("--timeout") && fromTask.timeoutMs) payload.timeoutMs = fromTask.timeoutMs;
+    if (!args.includes("--no-qa")) payload.qaRequired = fromTask.qaRequired !== false;
+  }
+
+  if (typeof payload.cwd === "string" && !payload.projectId) {
+    const inferred = inferProjectFromCwd(String(payload.cwd));
+    if (inferred) {
+      selectedProject = inferred;
+      payload.projectId = inferred.key;
+      if (!explicitAgent && inferred.defaultAgent) payload.agent = inferred.defaultAgent;
+    }
+  }
+
   if (!title) {
     fail(
-      "Usage: dispatch create -t \"title\" -d \"description\" -p project [-a agent] [-c category] [--no-qa] [--timeout ms]",
+      "Usage: dispatch create -t \"title\" -d \"description\" -p project [-a agent] [-c category] [--no-qa] [--timeout ms] [--from task-id]",
     );
   }
 
@@ -379,8 +423,9 @@ async function cmdCreate(args: string[]): Promise<void> {
   if (desc) payload.description = desc;
 
   if (typeof payload.cwd === "string" && !cwdMatchesProject(String(payload.cwd), selectedProject)) {
+    const inferred = inferProjectFromCwd(String(payload.cwd));
     fail(
-      `CWD/project mismatch.\nSelected project: ${selectedProject?.key || "-"}\nProject cwd: ${selectedProject?.cwd || "-"}\nProvided cwd: ${String(payload.cwd)}\n\nUse the matching project or override intentionally with the correct project key.`,
+      `CWD/project mismatch.\nSelected project: ${selectedProject?.key || "-"}\nProject cwd: ${selectedProject?.cwd || "-"}\nProvided cwd: ${String(payload.cwd)}${inferred ? `\nLikely project for this cwd: ${inferred.key}` : ""}\n\nUse the matching project or override intentionally with the correct project key.`,
     );
   }
 
@@ -698,6 +743,28 @@ async function cmdFollow(id: string): Promise<void> {
   }
 }
 
+function explainNextStep(task: Record<string, unknown>): string {
+  const error = String(task.error || "");
+  if (!error) {
+    if (String(task.status || "") === "done") return "Next step: inspect the thread or test the output locally.";
+    if (["ready", "dispatched", "in_progress", "review"].includes(String(task.status || ""))) return "Next step: use dispatch follow <id> to watch it progress live.";
+    return "Next step: inspect the task history/logs if you need more detail.";
+  }
+  if (error.includes("LiveSessionModelSwitchError")) {
+    return "Next step: this looks like a reviewer/runtime model-switch issue. Use dispatch retry <id> --no-qa or fix the QA runtime path first.";
+  }
+  if (error.includes("produced nothing") || error.includes("no output")) {
+    return "Next step: the agent likely failed silently. Use dispatch retry <id> for a fresh rerun and verify the model/runtime selection.";
+  }
+  if (error.includes("thread binding") || error.includes("no thread binding") || error.includes("Discord thread")) {
+    return "Next step: this looks like a Discord/thread binding problem. Check channel/project routing, then retry the task.";
+  }
+  if (String(task.status || "") === "blocked") {
+    return "Next step: the task is blocked after retries/review cycles. Human intervention is probably needed before another rerun.";
+  }
+  return "Next step: use dispatch retry <id> if you want a fresh rerun, or fix the underlying plugin/runtime issue first if the error is systemic.";
+}
+
 async function cmdExplain(id: string): Promise<void> {
   const resolvedId = await resolveTaskId(id);
   const { data, status } = await doReq("GET", `/api/tasks/${resolvedId}`, null);
@@ -707,10 +774,8 @@ async function cmdExplain(id: string): Promise<void> {
   process.stdout.write(`It belongs to project ${String(task.projectId || "unknown")} and runs as ${String(task.agent || "unknown")}.\n`);
   process.stdout.write(`Current status: ${String(task.status || "unknown")}.\n`);
   if (task.threadId) process.stdout.write(`Discord thread: ${formatThreadUrl(String(task.threadId))}\n`);
-  if (task.error) {
-    process.stdout.write(`Failure reason: ${String(task.error)}\n`);
-    process.stdout.write("Next step: use dispatch retry <id> if you want a fresh rerun, or fix the underlying plugin/runtime issue first if the error is systemic.\n");
-  }
+  if (task.error) process.stdout.write(`Failure reason: ${String(task.error)}\n`);
+  process.stdout.write(`${explainNextStep(task)}\n`);
 }
 
 async function cmdRetry(args: string[]): Promise<void> {
@@ -844,7 +909,8 @@ CREATE FLAGS:
                     Alias: --after. Task stays waiting until deps complete.
                     Can be repeated: --depends-on id1 --depends-on id2
   -T, --thread      Reuse an existing Discord thread ID
-  --cwd             Override working directory
+  --cwd             Override working directory (can auto-infer project)
+  --from            Seed create flags from an existing task
   --timeout         Timeout in ms (defaults to config value)
   --no-qa           Skip Maat code review
   --dry-run         Show resolved project/cwd/agent and exit
@@ -871,6 +937,8 @@ EXAMPLES:
   dispatch create -t "Add feature" -p mission-control -d "Build usage dashboard" --no-qa
   dispatch create -t "Task B" -p 0xready --depends-on abc12345 -f desc.md
   dispatch create -t "Task C" -p go-hevy --after abc12345,def67890 --dry-run
+  dispatch create --from abc123 -t "Follow-up task" --no-qa
+  dispatch create -t "Infer project from cwd" --cwd /Users/sumo-deus/.openclaw/workspace/hevy-cli --dry-run
   dispatch create -t "Continue thread" -p task-dispatch -T 1488561798167793894 -d "Follow-up work"
   dispatch active --project go-hevy
   dispatch recent-errors --project go-hevy
