@@ -172,6 +172,31 @@ function formatThreadUrl(threadId: string): string {
   return `https://discord.com/channels/${discordGuildId}/${threadId}`;
 }
 
+function cwdMatchesProject(cwd: string, project: ProjectEntry | null): boolean {
+  if (!cwd || !project || project.cwd === "-") return true;
+  return cwd === project.cwd;
+}
+
+function parseArgs(argv: string[]): Record<string, string | boolean | string[]> {
+  const parsed: Record<string, string | boolean | string[]> = { _: [] };
+  for (let i = 0; i < argv.length; i += 1) {
+    const arg = argv[i] || "";
+    if (!arg.startsWith("--")) {
+      (parsed._ as string[]).push(arg);
+      continue;
+    }
+    const key = arg.slice(2);
+    const next = argv[i + 1];
+    if (!next || next.startsWith("--")) {
+      parsed[key] = true;
+      continue;
+    }
+    parsed[key] = next;
+    i += 1;
+  }
+  return parsed;
+}
+
 function statusLabel(status: string): string {
   switch (status) {
     case "done":
@@ -197,11 +222,13 @@ async function cmdCreate(args: string[]): Promise<void> {
   const payload: Record<string, unknown> = {
     agent: "zeus",
     qaRequired: true,
-    timeoutMs: 1800000,
+    timeoutMs: Number(config.defaults?.taskTimeoutMs || 1800000),
   };
 
   let title = "";
   let desc = "";
+  let selectedProject: ProjectEntry | null = null;
+  let dryRun = false;
 
   for (let i = 0; i < args.length; i += 1) {
     const arg = args[i] ?? "";
@@ -232,9 +259,10 @@ async function cmdCreate(args: string[]): Promise<void> {
             `Unknown project: ${p}\n\nAvailable projects:\n${availableProjectsText()}\n\nTip: run \`dispatch projects\` to inspect configured projects.`,
           );
         }
+        selectedProject = resolved;
         payload.cwd = resolved.cwd !== "-" ? resolved.cwd : undefined;
         payload.projectId = resolved.key;
-        if (!payload.agent && resolved.defaultAgent) payload.agent = resolved.defaultAgent;
+        if (resolved.defaultAgent) payload.agent = resolved.defaultAgent;
         break;
       }
       case "-c":
@@ -255,6 +283,9 @@ async function cmdCreate(args: string[]): Promise<void> {
       }
       case "--no-qa":
         payload.qaRequired = false;
+        break;
+      case "--dry-run":
+        dryRun = true;
         break;
       case "--model":
         i += 1;
@@ -311,6 +342,22 @@ async function cmdCreate(args: string[]): Promise<void> {
   payload.title = title;
   if (desc) payload.description = desc;
 
+  if (typeof payload.cwd === "string" && !cwdMatchesProject(String(payload.cwd), selectedProject)) {
+    fail(
+      `CWD/project mismatch.\nSelected project: ${selectedProject?.key || "-"}\nProject cwd: ${selectedProject?.cwd || "-"}\nProvided cwd: ${String(payload.cwd)}\n\nUse the matching project or override intentionally with the correct project key.`,
+    );
+  }
+
+  if (dryRun) {
+    process.stdout.write("DRY RUN — no task created\n");
+    process.stdout.write(`Project: ${String(payload.projectId || "-")}\n`);
+    process.stdout.write(`CWD: ${String(payload.cwd || "-")}\n`);
+    process.stdout.write(`Agent: ${String(payload.agent || "-")}\n`);
+    process.stdout.write(`QA: ${payload.qaRequired ? "on" : "off"}\n`);
+    process.stdout.write(`TimeoutMs: ${String(payload.timeoutMs || "-")}\n`);
+    return;
+  }
+
   const { data, status } = await doReq("POST", "/api/tasks", payload);
   if (status >= 400) fail(`HTTP ${status}: ${data}`);
   const result = JSON.parse(data) as Record<string, unknown>;
@@ -321,8 +368,15 @@ async function cmdCreate(args: string[]): Promise<void> {
   prettyPrint(data);
 }
 
-async function cmdList(): Promise<void> {
-  const { data, status } = await doReq("GET", "/api/tasks", null);
+async function cmdList(args: string[] = []): Promise<void> {
+  const parsed = parseArgs(args);
+  const qs = new URLSearchParams();
+  if (typeof parsed.status === "string") qs.set("status", parsed.status);
+  if (typeof parsed.project === "string") {
+    const resolved = resolveProject(parsed.project);
+    qs.set("projectId", resolved?.key || parsed.project);
+  }
+  const { data, status } = await doReq("GET", `/api/tasks${qs.toString() ? `?${qs.toString()}` : ""}`, null);
   if (status >= 400) fail(`HTTP ${status}: ${data}`);
   const tasks = JSON.parse(data) as Array<Record<string, unknown>>;
   if (tasks.length === 0) {
@@ -342,9 +396,11 @@ async function cmdList(): Promise<void> {
       id: short(String(t.id || "")),
       status: statusLabel(String(t.status || "")),
       agent: String(t.agent || ""),
+      project: String(t.projectId || t.project_id || "-"),
       title: truncate(String(t.title || ""), 50),
       deps: deps.length > 0 ? deps.map((d: string) => short(d)).join(",") : "",
       created: formatTime(t.created_at),
+      updated: formatTime(t.updated_at),
     };
   });
 
@@ -352,6 +408,7 @@ async function cmdList(): Promise<void> {
     id: Math.max(2, ...rows.map((r) => r.id.length)),
     status: Math.max(6, ...rows.map((r) => r.status.length)),
     agent: Math.max(5, ...rows.map((r) => r.agent.length)),
+    project: Math.max(7, ...rows.map((r) => r.project.length)),
     title: Math.max(5, ...rows.map((r) => r.title.length)),
     deps: Math.max(4, ...rows.map((r) => r.deps.length)),
   };
@@ -359,14 +416,14 @@ async function cmdList(): Promise<void> {
   const showDeps = rows.some((r) => r.deps.length > 0);
 
   const header = showDeps
-    ? `${pad("ID", widths.id)}  ${pad("STATUS", widths.status)}  ${pad("AGENT", widths.agent)}  ${pad("DEPS", widths.deps)}  ${pad("TITLE", widths.title)}  CREATED\n`
-    : `${pad("ID", widths.id)}  ${pad("STATUS", widths.status)}  ${pad("AGENT", widths.agent)}  ${pad("TITLE", widths.title)}  CREATED\n`;
+    ? `${pad("ID", widths.id)}  ${pad("STATUS", widths.status)}  ${pad("AGENT", widths.agent)}  ${pad("PROJECT", widths.project)}  ${pad("DEPS", widths.deps)}  ${pad("TITLE", widths.title)}  UPDATED\n`
+    : `${pad("ID", widths.id)}  ${pad("STATUS", widths.status)}  ${pad("AGENT", widths.agent)}  ${pad("PROJECT", widths.project)}  ${pad("TITLE", widths.title)}  UPDATED\n`;
   process.stdout.write(header);
 
   for (const row of rows) {
     const line = showDeps
-      ? `${pad(row.id, widths.id)}  ${pad(row.status, widths.status)}  ${pad(row.agent, widths.agent)}  ${pad(row.deps, widths.deps)}  ${pad(row.title, widths.title)}  ${row.created}\n`
-      : `${pad(row.id, widths.id)}  ${pad(row.status, widths.status)}  ${pad(row.agent, widths.agent)}  ${pad(row.title, widths.title)}  ${row.created}\n`;
+      ? `${pad(row.id, widths.id)}  ${pad(row.status, widths.status)}  ${pad(row.agent, widths.agent)}  ${pad(row.project, widths.project)}  ${pad(row.deps, widths.deps)}  ${pad(row.title, widths.title)}  ${row.updated}\n`
+      : `${pad(row.id, widths.id)}  ${pad(row.status, widths.status)}  ${pad(row.agent, widths.agent)}  ${pad(row.project, widths.project)}  ${pad(row.title, widths.title)}  ${row.updated}\n`;
     process.stdout.write(line);
   }
 }
@@ -451,6 +508,32 @@ async function cmdStats(): Promise<void> {
   prettyPrint(data);
 }
 
+async function cmdHistory(args: string[] = []): Promise<void> {
+  const parsed = parseArgs(args);
+  const qs = new URLSearchParams();
+  if (typeof parsed.project === "string") {
+    const resolved = resolveProject(parsed.project);
+    qs.set("projectId", resolved?.key || parsed.project);
+  }
+  if (typeof parsed.status === "string") qs.set("status", parsed.status);
+  const { data, status } = await doReq("GET", `/api/tasks${qs.toString() ? `?${qs.toString()}` : ""}`, null);
+  if (status >= 400) fail(`HTTP ${status}: ${data}`);
+  const tasks = (JSON.parse(data) as Array<Record<string, unknown>>)
+    .filter((task) => ["done", "error", "blocked"].includes(String(task.status || "")))
+    .sort((a, b) => Number(b.updated_at || 0) - Number(a.updated_at || 0));
+  if (tasks.length === 0) {
+    process.stdout.write("No historical tasks found.\n");
+    return;
+  }
+  for (const task of tasks.slice(0, Number(parsed.limit || 20))) {
+    const threadId = String(task.threadId || task.thread_id || "");
+    process.stdout.write(`${short(String(task.id || ""))}  ${statusLabel(String(task.status || ""))}  ${String(task.projectId || task.project_id || "-")}  ${String(task.title || "")}\n`);
+    process.stdout.write(`  updated: ${formatTime(task.updated_at)} | agent: ${String(task.agent || "-")}\n`);
+    if (threadId) process.stdout.write(`  thread: ${formatThreadUrl(threadId)}\n`);
+    if (task.error) process.stdout.write(`  error: ${truncate(String(task.error), 220)}\n`);
+  }
+}
+
 async function cmdResume(id: string): Promise<void> {
   if (!id) fail("Usage: dispatch resume <task-id>");
   const resolvedId = await resolveTaskId(id);
@@ -458,6 +541,48 @@ async function cmdResume(id: string): Promise<void> {
   if (status >= 400) fail(`HTTP ${status}: ${data}`);
   process.stdout.write(`🔄 Resume triggered for task ${short(resolvedId)}\n`);
   prettyPrint(data);
+}
+
+async function cmdOpen(id: string): Promise<void> {
+  const resolvedId = await resolveTaskId(id);
+  const { data, status } = await doReq("GET", `/api/tasks/${resolvedId}`, null);
+  if (status >= 400) fail(`HTTP ${status}: ${data}`);
+  const task = JSON.parse(data) as Record<string, unknown>;
+  const threadId = String(task.threadId || "");
+  if (!threadId) fail(`Task ${resolvedId} has no Discord thread.`);
+  process.stdout.write(`${formatThreadUrl(threadId)}\n`);
+}
+
+async function cmdDoctor(): Promise<void> {
+  process.stdout.write("dispatch doctor\n\n");
+  process.stdout.write(`Config: ${existsSync(configPath) ? "ok" : "missing"} (${configPath})\n`);
+  process.stdout.write(`Projects configured: ${projectEntries().length}\n`);
+  for (const project of projectEntries()) {
+    const cwdOk = project.cwd === "-" ? "n/a" : existsSync(project.cwd) ? "ok" : "missing";
+    process.stdout.write(`- ${project.key}: cwd=${cwdOk} channel=${project.channel} agent=${project.defaultAgent}\n`);
+  }
+  const { data, status } = await doReq("GET", "/api/dispatch/health", null);
+  if (status >= 400) fail(`Health check failed (${status}): ${data}`);
+  process.stdout.write("Plugin health: ok\n");
+}
+
+async function cmdFollow(id: string): Promise<void> {
+  const resolvedId = await resolveTaskId(id);
+  process.stdout.write(`Following task ${resolvedId}. Press Ctrl+C to stop.\n`);
+  let lastStatus = "";
+  for (;;) {
+    const { data, status } = await doReq("GET", `/api/tasks/${resolvedId}`, null);
+    if (status >= 400) fail(`HTTP ${status}: ${data}`);
+    const task = JSON.parse(data) as Record<string, unknown>;
+    const nextStatus = String(task.status || "");
+    if (nextStatus !== lastStatus) {
+      process.stdout.write(`[${formatTime(task.updatedAt || task.updated_at)}] ${nextStatus}\n`);
+      if (task.error) process.stdout.write(`error: ${String(task.error)}\n`);
+      lastStatus = nextStatus;
+    }
+    if (["done", "error", "blocked"].includes(nextStatus)) break;
+    await new Promise((resolve) => setTimeout(resolve, 2500));
+  }
 }
 
 async function cmdQa(id: string): Promise<void> {
@@ -530,9 +655,12 @@ function printUsage(): void {
 
 COMMANDS:
   create, c      Create a new task
-  list, ls       List all tasks
+  list, ls       List tasks (supports --project / --status)
+  history        Show completed/failed/blocked task history
   get <id>       Get task details (short IDs supported)
   inspect <id>   Human-friendly task summary with thread/session links
+  open <id>      Print Discord thread URL for a task
+  follow <id>    Poll a task until it finishes
   prompt <id>    Send follow-up to existing task session
   update <id>    Update task status
   delete <id>    Delete a task
@@ -540,6 +668,7 @@ COMMANDS:
   qa <id>        Manually trigger QA review (Nemesis) on a task
   stats          Show task statistics
   projects       List configured projects, channels, cwd, agents
+  doctor         Validate config/cwd/plugin health
   health         Check plugin health
 
 CREATE FLAGS:
@@ -554,8 +683,9 @@ CREATE FLAGS:
                     Can be repeated: --depends-on id1 --depends-on id2
   -T, --thread      Reuse an existing Discord thread ID
   --cwd             Override working directory
-  --timeout         Timeout in ms (default 1800000 = 30min)
+  --timeout         Timeout in ms (defaults to config value)
   --no-qa           Skip Maat code review
+  --dry-run         Show resolved project/cwd/agent and exit
   --model           Override model
   --thinking        Thinking level
 
@@ -569,14 +699,18 @@ ENVIRONMENT:
 
 EXAMPLES:
   dispatch projects
+  dispatch doctor
   dispatch create -t "Fix bug" -p visaroy -c bug -d "Fix the login flow"
   dispatch create -t "Add feature" -p mission-control -d "Build usage dashboard" --no-qa
   dispatch create -t "Task B" -p 0xready --depends-on abc12345 -f desc.md
-  dispatch create -t "Task C" -p go-hevy --after abc12345,def67890
+  dispatch create -t "Task C" -p go-hevy --after abc12345,def67890 --dry-run
   dispatch create -t "Continue thread" -p task-dispatch -T 1488561798167793894 -d "Follow-up work"
-  dispatch list
+  dispatch list --project go-hevy --status error
+  dispatch history --project go-hevy
+  dispatch inspect abc123
+  dispatch open abc123
+  dispatch follow abc123
   dispatch prompt abc123 "Add error handling to the API route"
-  dispatch get abc123
   dispatch update abc123 --status blocked --error "Needs clarification"
 `);
 }
@@ -647,7 +781,10 @@ async function main(): Promise<void> {
     case "list":
     case "ls":
     case "l":
-      await cmdList();
+      await cmdList(argv.slice(1));
+      break;
+    case "history":
+      await cmdHistory(argv.slice(1));
       break;
     case "get":
     case "show":
@@ -657,6 +794,14 @@ async function main(): Promise<void> {
     case "inspect":
     case "i":
       await cmdInspect(argv[1] || "");
+      break;
+    case "open":
+    case "o":
+      await cmdOpen(argv[1] || "");
+      break;
+    case "follow":
+    case "f":
+      await cmdFollow(argv[1] || "");
       break;
     case "prompt":
     case "send":
@@ -687,6 +832,9 @@ async function main(): Promise<void> {
     case "projects":
     case "project":
       await cmdProjects();
+      break;
+    case "doctor":
+      await cmdDoctor();
       break;
     case "health":
     case "h":
