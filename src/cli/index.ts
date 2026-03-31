@@ -119,6 +119,14 @@ async function fetchTasks(): Promise<Array<Record<string, unknown>>> {
   return JSON.parse(data) as Array<Record<string, unknown>>;
 }
 
+async function fetchTaskEvents(id: string, order: "asc" | "desc" = "desc", limit = 100): Promise<Array<Record<string, unknown>>> {
+  const resolvedId = await resolveTaskId(id);
+  const qs = new URLSearchParams({ order, limit: String(limit) });
+  const { data, status } = await doReq("GET", `/api/tasks/${resolvedId}/events?${qs.toString()}`, null);
+  if (status >= 400) fail(`HTTP ${status}: ${data}`);
+  return JSON.parse(data) as Array<Record<string, unknown>>;
+}
+
 async function resolveTaskId(input: string): Promise<string> {
   const id = (input || "").trim();
   if (!id) fail("Task ID is required");
@@ -427,8 +435,8 @@ async function cmdList(args: string[] = []): Promise<void> {
       project: String(t.projectId || t.project_id || "-"),
       title: truncate(String(t.title || ""), 50),
       deps: deps.length > 0 ? deps.map((d: string) => short(d)).join(",") : "",
-      created: formatTime(t.created_at),
-      updated: formatTime(t.updated_at),
+      created: formatTime(t.createdAt || t.created_at),
+      updated: formatTime(t.updatedAt || t.updated_at),
     };
   });
 
@@ -548,7 +556,7 @@ async function cmdHistory(args: string[] = []): Promise<void> {
   if (status >= 400) fail(`HTTP ${status}: ${data}`);
   const tasks = (JSON.parse(data) as Array<Record<string, unknown>>)
     .filter((task) => ["done", "error", "blocked"].includes(String(task.status || "")))
-    .sort((a, b) => Number(b.updated_at || 0) - Number(a.updated_at || 0));
+    .sort((a, b) => Number(b.updatedAt || b.updated_at || 0) - Number(a.updatedAt || a.updated_at || 0));
   if (tasks.length === 0) {
     process.stdout.write("No historical tasks found.\n");
     return;
@@ -556,9 +564,76 @@ async function cmdHistory(args: string[] = []): Promise<void> {
   for (const task of tasks.slice(0, Number(parsed.limit || 20))) {
     const threadId = String(task.threadId || task.thread_id || "");
     process.stdout.write(`${short(String(task.id || ""))}  ${statusLabel(String(task.status || ""))}  ${String(task.projectId || task.project_id || "-")}  ${String(task.title || "")}\n`);
-    process.stdout.write(`  updated: ${formatTime(task.updated_at)} | agent: ${String(task.agent || "-")}\n`);
+    process.stdout.write(`  updated: ${formatTime(task.updatedAt || task.updated_at)} | agent: ${String(task.agent || "-")}\n`);
     if (threadId) process.stdout.write(`  thread: ${formatThreadUrl(threadId)}\n`);
     if (task.error) process.stdout.write(`  error: ${truncate(String(task.error), 220)}\n`);
+  }
+}
+
+async function cmdActive(args: string[] = []): Promise<void> {
+  const parsed = parseArgs(args);
+  const tasks = await fetchTasks();
+  const active = tasks
+    .filter((task) => ["ready", "dispatched", "in_progress", "review"].includes(String(task.status || "")))
+    .filter((task) => (typeof parsed.project === "string" ? String(task.projectId || task.project_id || "") === (resolveProject(parsed.project)?.key || parsed.project) : true))
+    .sort((a, b) => Number(b.updatedAt || b.updated_at || 0) - Number(a.updatedAt || a.updated_at || 0));
+  if (active.length === 0) {
+    process.stdout.write("No active tasks.\n");
+    return;
+  }
+  for (const task of active) {
+    process.stdout.write(`${short(String(task.id || ""))}  ${statusLabel(String(task.status || ""))}  ${String(task.projectId || task.project_id || "-")}  ${String(task.title || "")}\n`);
+    process.stdout.write(`  updated: ${formatTime(task.updatedAt || task.updated_at)} | agent: ${String(task.agent || "-")}\n`);
+    if (task.threadId || task.thread_id) process.stdout.write(`  thread: ${formatThreadUrl(String(task.threadId || task.thread_id))}\n`);
+  }
+}
+
+async function cmdRecentErrors(args: string[] = []): Promise<void> {
+  const parsed = parseArgs(args);
+  const tasks = await fetchTasks();
+  const errors = tasks
+    .filter((task) => ["error", "blocked"].includes(String(task.status || "")))
+    .filter((task) => (typeof parsed.project === "string" ? String(task.projectId || task.project_id || "") === (resolveProject(parsed.project)?.key || parsed.project) : true))
+    .sort((a, b) => Number(b.updatedAt || b.updated_at || 0) - Number(a.updatedAt || a.updated_at || 0))
+    .slice(0, Number(parsed.limit || 10));
+  if (errors.length === 0) {
+    process.stdout.write("No recent errors.\n");
+    return;
+  }
+  for (const task of errors) {
+    process.stdout.write(`${short(String(task.id || ""))}  ${statusLabel(String(task.status || ""))}  ${String(task.projectId || task.project_id || "-")}  ${String(task.title || "")}\n`);
+    process.stdout.write(`  error: ${truncate(String(task.error || ""), 220)}\n`);
+  }
+}
+
+async function cmdLogs(id: string): Promise<void> {
+  const events = await fetchTaskEvents(id, "desc", 50);
+  if (events.length === 0) {
+    process.stdout.write("No task events found.\n");
+    return;
+  }
+  for (const event of events) {
+    process.stdout.write(`[${formatTime(event.createdAt || event.created_at)}] ${String(event.eventType || event.event_type)}\n`);
+    if (event.payload) process.stdout.write(`  ${JSON.stringify(event.payload)}\n`);
+  }
+}
+
+async function cmdTimeline(id: string): Promise<void> {
+  const events = await fetchTaskEvents(id, "asc", 100);
+  if (events.length === 0) {
+    process.stdout.write("No task events found.\n");
+    return;
+  }
+  for (const event of events) {
+    const payload = (event.payload || {}) as Record<string, unknown>;
+    const bits = [
+      payload.status ? `status=${String(payload.status)}` : "",
+      payload.threadId ? `thread=${String(payload.threadId)}` : "",
+      payload.runId ? `run=${String(payload.runId)}` : "",
+      payload.model ? `model=${String(payload.model)}` : "",
+      payload.summary ? `summary=${String(payload.summary)}` : "",
+    ].filter(Boolean);
+    process.stdout.write(`[${formatTime(event.createdAt || event.created_at)}] ${String(event.eventType || event.event_type)}${bits.length ? ` — ${bits.join(" | ")}` : ""}\n`);
   }
 }
 
@@ -640,12 +715,13 @@ async function cmdExplain(id: string): Promise<void> {
 
 async function cmdRetry(args: string[]): Promise<void> {
   const id = args[0];
-  if (!id) fail("Usage: dispatch retry <task-id> [--no-qa]");
+  if (!id) fail("Usage: dispatch retry <task-id> [--no-qa] [--reuse-thread|--fresh-thread]");
   const resolvedId = await resolveTaskId(id);
   const { data, status } = await doReq("GET", `/api/tasks/${resolvedId}`, null);
   if (status >= 400) fail(`HTTP ${status}: ${data}`);
   const task = JSON.parse(data) as Record<string, unknown>;
   const parsed = parseArgs(args.slice(1));
+  const reuseThread = Boolean(parsed["reuse-thread"]);
   const payload: Record<string, unknown> = {
     title: task.title,
     description: task.description,
@@ -656,6 +732,7 @@ async function cmdRetry(args: string[]): Promise<void> {
     qaRequired: parsed["no-qa"] ? false : task.qaRequired !== false,
     model: task.model || null,
     thinking: task.thinking || null,
+    threadId: reuseThread ? (task.threadId || null) : null,
   };
   const create = await doReq("POST", "/api/tasks", payload);
   if (create.status >= 400) fail(`HTTP ${create.status}: ${create.data}`);
@@ -733,24 +810,28 @@ function printUsage(): void {
   process.stdout.write(`dispatch — Task Dispatch CLI
 
 COMMANDS:
-  create, c      Create a new task
-  list, ls       List tasks (supports --project / --status)
-  history        Show completed/failed/blocked task history
-  get <id>       Get task details (short IDs supported)
-  inspect <id>   Human-friendly task summary with thread/session links
-  explain <id>   Plain-English task summary + suggested next step
-  open <id>      Print Discord thread URL for a task
-  follow <id>    Poll a task until it finishes
-  retry <id>     Create a fresh task from an existing one
-  prompt <id>    Send follow-up to existing task session
-  update <id>    Update task status
-  delete <id>    Delete a task
-  resume <id>    Resume a failed task's ACP session
-  qa <id>        Manually trigger QA review (Nemesis) on a task
-  stats          Show task statistics
-  projects       List configured projects, channels, cwd, agents
-  doctor         Validate config/cwd/plugin health
-  health         Check plugin health
+  create, c        Create a new task
+  list, ls         List tasks (supports --project / --status)
+  active           Show live tasks in ready/dispatched/in_progress/review
+  history          Show completed/failed/blocked task history
+  recent-errors    Show recent error/blocked tasks
+  get <id>         Get task details (short IDs supported)
+  inspect <id>     Human-friendly task summary with thread/session links
+  explain <id>     Plain-English task summary + suggested next step
+  logs <id>        Show recent task event log entries
+  timeline <id>    Show task events oldest → newest
+  open <id>        Print Discord thread URL for a task
+  follow <id>      Poll a task until it finishes
+  retry <id>       Create a fresh task from an existing one
+  prompt <id>      Send follow-up to existing task session
+  update <id>      Update task status
+  delete <id>      Delete a task
+  resume <id>      Resume a failed task's ACP session
+  qa <id>          Manually trigger QA review (Nemesis) on a task
+  stats            Show task statistics
+  projects         List configured projects, channels, cwd, agents
+  doctor           Validate config/cwd/plugin health
+  health           Check plugin health
 
 CREATE FLAGS:
   -t, --title       Task title (required)
@@ -770,6 +851,11 @@ CREATE FLAGS:
   --model           Override model
   --thinking        Thinking level
 
+RETRY FLAGS:
+  --no-qa           Retry with QA disabled
+  --reuse-thread    Reuse the previous Discord thread
+  --fresh-thread    Force a fresh thread (default behavior)
+
 PROMPT:
   dispatch prompt <id> "message"
   dispatch prompt <id> -f message.md
@@ -786,13 +872,17 @@ EXAMPLES:
   dispatch create -t "Task B" -p 0xready --depends-on abc12345 -f desc.md
   dispatch create -t "Task C" -p go-hevy --after abc12345,def67890 --dry-run
   dispatch create -t "Continue thread" -p task-dispatch -T 1488561798167793894 -d "Follow-up work"
+  dispatch active --project go-hevy
+  dispatch recent-errors --project go-hevy
   dispatch list --project go-hevy --status error
   dispatch history --project go-hevy
   dispatch inspect abc123
   dispatch explain abc123
+  dispatch logs abc123
+  dispatch timeline abc123
   dispatch open abc123
   dispatch follow abc123
-  dispatch retry abc123 --no-qa
+  dispatch retry abc123 --no-qa --reuse-thread
   dispatch prompt abc123 "Add error handling to the API route"
   dispatch update abc123 --status blocked --error "Needs clarification"
 `);
@@ -866,8 +956,14 @@ async function main(): Promise<void> {
     case "l":
       await cmdList(argv.slice(1));
       break;
+    case "active":
+      await cmdActive(argv.slice(1));
+      break;
     case "history":
       await cmdHistory(argv.slice(1));
+      break;
+    case "recent-errors":
+      await cmdRecentErrors(argv.slice(1));
       break;
     case "get":
     case "show":
@@ -880,6 +976,12 @@ async function main(): Promise<void> {
       break;
     case "explain":
       await cmdExplain(argv[1] || "");
+      break;
+    case "logs":
+      await cmdLogs(argv[1] || "");
+      break;
+    case "timeline":
+      await cmdTimeline(argv[1] || "");
       break;
     case "open":
     case "o":

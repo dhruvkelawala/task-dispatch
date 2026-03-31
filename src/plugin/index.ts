@@ -506,6 +506,17 @@ function initDb(dbPath) {
       detail TEXT,
       created_at TEXT DEFAULT (datetime('now'))
     );
+
+    CREATE TABLE IF NOT EXISTS task_events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      task_id TEXT NOT NULL REFERENCES tasks(id),
+      event_type TEXT NOT NULL,
+      payload TEXT,
+      created_at INTEGER NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_task_events_task_created
+      ON task_events(task_id, created_at DESC);
   `);
 
   try {
@@ -586,6 +597,17 @@ function rowToTask(row) {
     createdAt: row.created_at,
     updatedAt: row.updated_at,
     completedAt: row.completed_at,
+  };
+}
+
+function rowToTaskEvent(row) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    taskId: row.task_id,
+    eventType: row.event_type,
+    payload: safeJsonParse(row.payload || "null"),
+    createdAt: row.created_at,
   };
 }
 
@@ -964,6 +986,11 @@ export default function setup(api) {
       db.prepare(
         "UPDATE tasks SET thread_id = ?, updated_at = ? WHERE id = ?",
       ).run(threadId, now, task.id);
+      recordTaskEvent(task.id, "thread.created", {
+        threadId,
+        channelId,
+        agent: task.agent,
+      });
 
       process.stderr.write(
         `[DISCORD] Created thread ${threadId} for task ${task.id}\n`,
@@ -1167,6 +1194,11 @@ export default function setup(api) {
     const maatSessionKey = `agent:nemesis:subagent:review:${crypto.randomUUID()}`;
     const reviewPrompt = buildQAReviewPrompt(task);
     const qaModel = CONFIG.agents?.nemesis?.model || "kimi-code";
+    recordTaskEvent(task.id, "qa.started", {
+      reviewer: "nemesis",
+      model: qaModel,
+      threadId: task.threadId || null,
+    });
     const run = await api.runtime.subagent.run({
       sessionKey: maatSessionKey,
       message: reviewPrompt,
@@ -1273,6 +1305,10 @@ export default function setup(api) {
     while (task && task.status === "review") {
       const review = await runMaatOneShotReview(task);
       const reviewText = truncateForPrompt(review.text || "", 2000);
+      recordTaskEvent(task.id, `qa.${review.verdict}`, {
+        summary: review.summary,
+        attempts: task.reviewAttempts || 0,
+      });
       const reviewMessage = [
         `VERDICT: ${review.verdict === "approve" ? "APPROVE" : "REQUEST_CHANGES"}`,
         `SUMMARY: ${review.summary}`,
@@ -2100,6 +2136,8 @@ export default function setup(api) {
       VALUES (@id, @title, @description, @agent, @runtime, @project_id, @channel_id, @cwd, @model, @thinking, @depends_on, @chain_id, @status, @manual_complete, @timeout_ms, @thread_id, @review_attempts, @qa_required, @created_at, @updated_at)
     `),
     getById: db.prepare("SELECT * FROM tasks WHERE id = ?"),
+    deleteTaskEventsByTaskId: db.prepare("DELETE FROM task_events WHERE task_id = ?"),
+    deleteCommentsByTaskId: db.prepare("DELETE FROM comments WHERE task_id = ?"),
     deleteById: db.prepare("DELETE FROM tasks WHERE id = ?"),
     updateStatus: db.prepare(
       "UPDATE tasks SET status = @status, updated_at = @updated_at, completed_at = @completed_at WHERE id = @id",
@@ -2153,10 +2191,34 @@ export default function setup(api) {
     return stmts.getById.get(id);
   }
 
+  function recordTaskEvent(taskId, eventType, payload = null) {
+    try {
+      db.prepare(
+        "INSERT INTO task_events (task_id, event_type, payload, created_at) VALUES (@task_id, @event_type, @payload, @created_at)",
+      ).run({
+        task_id: taskId,
+        event_type: eventType,
+        payload: payload == null ? null : JSON.stringify(payload),
+        created_at: Date.now(),
+      });
+    } catch (e) {
+      process.stderr.write(`[TASK_EVENTS] Failed to record ${eventType} for ${taskId}: ${e.message}\n`);
+    }
+  }
+
   function onTaskChanged(taskId) {
     const task = getTask(taskId);
     if (task) {
-      broadcastTaskEvent(rowToTask(task));
+      const normalized = rowToTask(task);
+      broadcastTaskEvent(normalized);
+      recordTaskEvent(taskId, `task.${task.status}`, {
+        status: normalized?.status || task.status,
+        error: normalized?.error || null,
+        runId: normalized?.runId || null,
+        sessionKey: normalized?.sessionKey || null,
+        threadId: normalized?.threadId || null,
+        updatedAt: normalized?.updatedAt || task.updated_at || Date.now(),
+      });
     }
 
     // When a task becomes done, check for newly ready tasks
@@ -2641,6 +2703,14 @@ Be specific — reference actual commit messages and features. Don't be vague.`;
 
     stmts.insert.run(row);
     const created = rowToTask(getTask(id));
+    recordTaskEvent(id, "task.created", {
+      status,
+      projectId: row.project_id,
+      agent: row.agent,
+      cwd: row.cwd,
+      qaRequired: row.qa_required !== 0,
+      threadId: row.thread_id,
+    });
 
     sendJson(res, created, 201);
     broadcastTaskEvent(created);
@@ -2663,6 +2733,21 @@ Be specific — reference actual commit messages and features. Don't be vague.`;
       return;
     }
     sendJson(res, rowToTask(task));
+  }
+
+  function handleGetEvents(req, res, id) {
+    const task = getTask(id);
+    if (!task) {
+      sendError(res, 404, "Task not found");
+      return;
+    }
+    const query = parseQuery(req.url);
+    const limit = Math.max(1, Math.min(parseInt(query.limit || "100", 10) || 100, 500));
+    const order = String(query.order || "desc").toLowerCase() === "asc" ? "ASC" : "DESC";
+    const rows = db
+      .prepare(`SELECT * FROM task_events WHERE task_id = ? ORDER BY created_at ${order} LIMIT ?`)
+      .all(id, limit);
+    sendJson(res, rows.map(rowToTaskEvent));
   }
 
   async function handleUpdate(req, res, id) {
@@ -2787,6 +2872,8 @@ Be specific — reference actual commit messages and features. Don't be vague.`;
       return;
     }
 
+    stmts.deleteTaskEventsByTaskId.run(id);
+    stmts.deleteCommentsByTaskId.run(id);
     stmts.deleteById.run(id);
     sendJson(res, { deleted: true, id });
   }
@@ -3736,6 +3823,16 @@ Be specific — reference actual commit messages and features. Don't be vague.`;
           return true;
         }
 
+        // /api/tasks/:id/events
+        if (
+          segments.length === 2 &&
+          segments[1] === "events" &&
+          method === "GET"
+        ) {
+          handleGetEvents(req, res, segments[0]);
+          return true;
+        }
+
         // /api/tasks/:id/prompt
         if (
           segments.length === 2 &&
@@ -3792,6 +3889,11 @@ Be specific — reference actual commit messages and features. Don't be vague.`;
               channel: "discord",
               accountId,
               threadId: task.thread_id || undefined,
+            });
+            recordTaskEvent(id, "task.prompt", {
+              runId: result.runId || null,
+              threadId: task.thread_id || null,
+              messagePreview: truncateForPrompt(message, 200),
             });
             const threadId = task.thread_id || undefined;
             const threadUrl = formatDiscordThreadUrl(threadId);
@@ -3873,6 +3975,10 @@ Be specific — reference actual commit messages and features. Don't be vague.`;
               db.prepare(
                 "UPDATE tasks SET status = 'in_progress', error = NULL, updated_at = @updated_at WHERE id = @id",
               ).run({ id: task.id, updated_at: now });
+              recordTaskEvent(task.id, "task.resume_triggered", {
+                sessionKey: task.sessionKey,
+                threadId: task.threadId || null,
+              });
               onTaskChanged(task.id);
 
               if (task.threadId) {
