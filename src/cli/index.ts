@@ -1244,4 +1244,15 @@ async function main(): Promise<void> {
   }
 }
 
-main().catch((err) => fail(`Error: ${(err as Error).message}`));
+export const __test = {
+  resolveProject,
+  suggestProjects,
+  inferProjectFromCwd,
+  classifyTaskFailure,
+  explainNextStep,
+  parseArgs,
+};
+
+if (import.meta.main) {
+  main().catch((err) => fail(`Error: ${(err as Error).message}`));
+}

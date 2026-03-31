@@ -70,6 +70,7 @@ function createInMemoryDb(): any {
     tasks: Array<Record<string, any>>;
     schedules: Array<Record<string, any>>;
     comments: Array<Record<string, any>>;
+    task_events: Array<Record<string, any>>;
     projects: Array<Record<string, any>>;
     project_commits: Array<Record<string, any>>;
     project_snapshots: Array<Record<string, any>>;
@@ -77,6 +78,7 @@ function createInMemoryDb(): any {
     tasks: [],
     schedules: [],
     comments: [],
+    task_events: [],
     projects: [],
     project_commits: [],
     project_snapshots: [],
@@ -136,8 +138,22 @@ function createInMemoryDb(): any {
             tables.comments.push({ ...(args[0] || {}) });
             return;
           }
+          if (sql.startsWith("INSERT INTO task_events")) {
+            tables.task_events.push({ ...(args[0] || {}) });
+            return;
+          }
           if (sql.startsWith("INSERT INTO schedules")) {
             tables.schedules.push({ ...(args[0] || {}) });
+            return;
+          }
+          if (sql.startsWith("DELETE FROM task_events WHERE task_id = ?")) {
+            const id = String(args[0]);
+            tables.task_events = tables.task_events.filter((row) => row.task_id !== id);
+            return;
+          }
+          if (sql.startsWith("DELETE FROM comments WHERE task_id = ?")) {
+            const id = String(args[0]);
+            tables.comments = tables.comments.filter((row) => row.task_id !== id);
             return;
           }
           if (sql.startsWith("DELETE FROM tasks WHERE id = ?")) {
@@ -162,6 +178,7 @@ function createInMemoryDb(): any {
               { name: "tasks" },
               { name: "schedules" },
               { name: "comments" },
+              { name: "task_events" },
               { name: "projects" },
               { name: "project_commits" },
               { name: "project_snapshots" },
@@ -260,6 +277,18 @@ export function initDb(dbPath: string): any {
 
     CREATE INDEX IF NOT EXISTS idx_comments_task_created
       ON comments(task_id, created_at);
+
+    CREATE TABLE IF NOT EXISTS task_events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      task_id TEXT NOT NULL,
+      event_type TEXT NOT NULL,
+      payload TEXT,
+      created_at INTEGER NOT NULL,
+      FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_task_events_task_created
+      ON task_events(task_id, created_at);
 
     CREATE TABLE IF NOT EXISTS projects (
       id TEXT PRIMARY KEY,
