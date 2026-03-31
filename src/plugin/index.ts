@@ -5,6 +5,7 @@ import { createRequire } from "node:module";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import crypto from "node:crypto";
+import { buildExistingThreadDispatchMessage } from "./thread-messages";
 
 const require = createRequire(import.meta.url);
 const execFileAsync = promisify(execFile);
@@ -1737,6 +1738,20 @@ export default function setup(api) {
             `failed to bind existing Discord thread ${existingThreadId} to session ${childSessionKey}`,
           );
         }
+        await postToThread(
+          existingThreadId,
+          buildExistingThreadDispatchMessage(task, resolvedCwd),
+          accountId,
+        ).catch((error) => {
+          process.stderr.write(
+            `[DISPATCH.ACP] Failed to post reused-thread kickoff for ${task.id}: ${error.message}\n`,
+          );
+        });
+        recordTaskEvent(task.id, "thread.reused.notified", {
+          threadId: existingThreadId,
+          sessionKey: childSessionKey,
+          runId: childRunId,
+        });
       } else {
         // Look up the thread ID from the bindings file using childSessionKey.
         // spawnAcpDirect returns immediately after dispatching — give the binding
