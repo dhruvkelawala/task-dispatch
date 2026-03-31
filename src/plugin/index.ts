@@ -293,6 +293,13 @@ function truncateForPrompt(text, maxChars) {
   return `${text.slice(0, maxChars)}\n\n[truncated]`;
 }
 
+function formatDiscordThreadUrl(threadId) {
+  if (typeof threadId !== "string" || !threadId.trim()) {
+    return null;
+  }
+  return `https://discord.com/channels/1475480367166128354/${threadId}`;
+}
+
 function safeJsonParse(text) {
   if (typeof text !== "string") {
     return null;
@@ -783,7 +790,12 @@ export default function setup(api) {
   const db = initDb(dbPath);
   seedProjectsIfEmpty(db);
 
-  // ---- Phase 5: Restart resilience — recover stuck tasks ----
+  // ---- Phase 5: Restart resilience — log stuck tasks (don't mark as error) ----
+  // Previously this marked all dispatched/in_progress/blocked tasks as 'error'
+  // on every plugin startup, causing false "Gateway restart" errors even when
+  // the gateway didn't actually restart (e.g., plugin hot-reload, config change).
+  // Now we just log them — if the ACP session is truly dead, the task timeout
+  // will catch it. If it's still alive, it'll complete normally.
   const stuckTasks = db
     .prepare(
       "SELECT * FROM tasks WHERE status IN ('dispatched', 'in_progress', 'blocked')",
@@ -791,15 +803,11 @@ export default function setup(api) {
     .all();
   if (stuckTasks.length > 0) {
     process.stderr.write(
-      `[STARTUP] Found ${stuckTasks.length} stuck active tasks\n`,
+      `[STARTUP] Found ${stuckTasks.length} active tasks (leaving as-is, timeout will catch dead sessions)\n`,
     );
     for (const row of stuckTasks) {
-      // Mark as error with retry flag — user can re-run manually
-      db.prepare(
-        "UPDATE tasks SET status = 'error', error = 'Gateway restart during execution', retries = retries + 1, updated_at = ? WHERE id = ?",
-      ).run(Date.now(), row.id);
       process.stderr.write(
-        `[STARTUP] Marked task ${row.id} as error (was stuck)\n`,
+        `[STARTUP]   ${row.id} status=${row.status} agent=${row.agent}\n`,
       );
     }
   }
@@ -1573,6 +1581,67 @@ export default function setup(api) {
     const prompt = formatTaskPrompt(task);
     const channelId = resolveChannel(task);
     const accountId = resolveAccountId(task.agent);
+    const existingThreadId =
+      typeof task.threadId === "string" && task.threadId.trim()
+        ? task.threadId.trim()
+        : null;
+
+    function bindSessionToThread(threadId, targetSessionKey, label) {
+      if (!threadId || !targetSessionKey) return false;
+      try {
+        const { readFileSync, writeFileSync } = require("node:fs");
+        const bindingsPath = `${process.env.HOME}/.openclaw/discord/thread-bindings.json`;
+        let bindingsFile = { version: 1, bindings: {} };
+        try {
+          bindingsFile = JSON.parse(readFileSync(bindingsPath, "utf8"));
+        } catch (_) {
+          // File may not exist yet; we'll create it.
+        }
+
+        const bindings =
+          bindingsFile && typeof bindingsFile.bindings === "object"
+            ? bindingsFile.bindings
+            : {};
+        const key = `${accountId}:${threadId}`;
+        const existing =
+          bindings[key] && typeof bindings[key] === "object" ? bindings[key] : {};
+        const now = Date.now();
+
+        bindings[key] = {
+          ...existing,
+          accountId,
+          channelId: existing.channelId || channelId || null,
+          threadId,
+          targetKind: "acp",
+          targetSessionKey,
+          agentId: "opencode",
+          label,
+          boundBy: "task-dispatch",
+          boundAt: now,
+          lastActivityAt: now,
+          idleTimeoutMs: Number(existing.idleTimeoutMs) || 24 * 60 * 60 * 1000,
+          maxAgeMs: Number(existing.maxAgeMs) || 0,
+          metadata: {
+            ...(existing.metadata || {}),
+            agentId: "opencode",
+            label,
+            boundBy: "task-dispatch",
+          },
+        };
+
+        writeFileSync(
+          bindingsPath,
+          JSON.stringify({ version: bindingsFile.version || 1, bindings }, null, 2),
+          "utf8",
+        );
+        return true;
+      } catch (error) {
+        process.stderr.write(
+          `[DISPATCH.ACP] Failed to bind existing thread ${threadId}: ${error.message}\n`,
+        );
+        return false;
+      }
+    }
 
     // Mark as dispatched
     const dispNow = Date.now();
@@ -1588,10 +1657,10 @@ export default function setup(api) {
       const result = await api.runtime.acp.spawn(
         {
           task: prompt,
-          label: `${task.title.slice(0, 45)}-${task.id.slice(0, 8)}-${Date.now()}`,
+          label: `${task.title.slice(0, 32)}-${task.id.slice(0, 8)}-${Date.now()}`,
           agentId: "opencode",
           cwd: resolvedCwd,
-          thread: true,
+          thread: !existingThreadId,
         },
         {
           agentChannel: "discord",
@@ -1617,34 +1686,48 @@ export default function setup(api) {
         `[DISPATCH.ACP] spawn accepted for ${task.id}, runId=${childRunId}, session=${childSessionKey}\n`,
       );
 
-      // Look up the thread ID from the bindings file using childSessionKey.
-      // spawnAcpDirect returns immediately after dispatching — give the binding
-      // service a moment to flush the new entry to disk.
-      let boundThreadId = null;
-      try {
-        const bindingsPath = `${process.env.HOME}/.openclaw/discord/thread-bindings.json`;
-        const { readFileSync } = await import("node:fs");
-        // Retry up to 5x with 500ms gap (binding flush may be async)
-        for (let attempt = 0; attempt < 5; attempt++) {
-          await new Promise((r) => setTimeout(r, 500));
-          try {
-            const bindingsData = JSON.parse(readFileSync(bindingsPath, "utf8"));
-            const bindings = bindingsData.bindings || {};
-            for (const binding of Object.values(bindings)) {
-              if (binding.targetSessionKey === childSessionKey) {
-                boundThreadId = String(binding.threadId);
-                break;
-              }
-            }
-            if (boundThreadId) break;
-          } catch (_) {
-            /* file not ready yet */
-          }
-        }
-      } catch (e) {
-        process.stderr.write(
-          `[DISPATCH.ACP] Could not read thread binding: ${e.message}\n`,
+      let boundThreadId = existingThreadId;
+      if (existingThreadId) {
+        const label = `${task.title.slice(0, 32)}-${task.id.slice(0, 8)}-${Date.now()}`;
+        const rebound = bindSessionToThread(
+          existingThreadId,
+          childSessionKey,
+          label,
         );
+        if (!rebound) {
+          throw new Error(
+            `failed to bind existing Discord thread ${existingThreadId} to session ${childSessionKey}`,
+          );
+        }
+      } else {
+        // Look up the thread ID from the bindings file using childSessionKey.
+        // spawnAcpDirect returns immediately after dispatching — give the binding
+        // service a moment to flush the new entry to disk.
+        try {
+          const bindingsPath = `${process.env.HOME}/.openclaw/discord/thread-bindings.json`;
+          const { readFileSync } = await import("node:fs");
+          // Retry up to 5x with 500ms gap (binding flush may be async)
+          for (let attempt = 0; attempt < 5; attempt++) {
+            await new Promise((r) => setTimeout(r, 500));
+            try {
+              const bindingsData = JSON.parse(readFileSync(bindingsPath, "utf8"));
+              const bindings = bindingsData.bindings || {};
+              for (const binding of Object.values(bindings)) {
+                if (binding.targetSessionKey === childSessionKey) {
+                  boundThreadId = String(binding.threadId);
+                  break;
+                }
+              }
+              if (boundThreadId) break;
+            } catch (_) {
+              /* file not ready yet */
+            }
+          }
+        } catch (e) {
+          process.stderr.write(
+            `[DISPATCH.ACP] Could not read thread binding: ${e.message}\n`,
+          );
+        }
       }
 
       db.prepare(
@@ -1659,7 +1742,7 @@ export default function setup(api) {
 
       if (boundThreadId) {
         process.stderr.write(
-          `[DISPATCH.ACP] bound thread ${boundThreadId} for task ${task.id}\n`,
+          `[DISPATCH.ACP] bound thread ${boundThreadId} for task ${task.id}${existingThreadId ? " (reused)" : ""}\n`,
         );
       } else {
         // Hard fail — a null threadId means we lost the Discord thread.
@@ -2011,8 +2094,8 @@ export default function setup(api) {
 
   const stmts = {
     insert: db.prepare(`
-      INSERT INTO tasks (id, title, description, agent, runtime, project_id, channel_id, cwd, model, thinking, depends_on, chain_id, status, manual_complete, timeout_ms, review_attempts, qa_required, created_at, updated_at)
-      VALUES (@id, @title, @description, @agent, @runtime, @project_id, @channel_id, @cwd, @model, @thinking, @depends_on, @chain_id, @status, @manual_complete, @timeout_ms, @review_attempts, @qa_required, @created_at, @updated_at)
+      INSERT INTO tasks (id, title, description, agent, runtime, project_id, channel_id, cwd, model, thinking, depends_on, chain_id, status, manual_complete, timeout_ms, thread_id, review_attempts, qa_required, created_at, updated_at)
+      VALUES (@id, @title, @description, @agent, @runtime, @project_id, @channel_id, @cwd, @model, @thinking, @depends_on, @chain_id, @status, @manual_complete, @timeout_ms, @thread_id, @review_attempts, @qa_required, @created_at, @updated_at)
     `),
     getById: db.prepare("SELECT * FROM tasks WHERE id = ?"),
     deleteById: db.prepare("DELETE FROM tasks WHERE id = ?"),
@@ -2493,6 +2576,11 @@ Be specific — reference actual commit messages and features. Don't be vague.`;
       return;
     }
 
+    if (!body.cwd) {
+      sendError(res, 400, "cwd is required — use dispatch CLI with -p flag or pass cwd in the request body");
+      return;
+    }
+
     const now = Date.now();
     const id = crypto.randomUUID();
     const dependsOn = (body.dependsOn || []).filter(
@@ -2539,6 +2627,10 @@ Be specific — reference actual commit messages and features. Don't be vague.`;
       status,
       manual_complete: body.manualComplete ? 1 : 0,
       timeout_ms: normalizeTimeoutMs(body.timeoutMs, defaultTaskTimeoutMs),
+      thread_id:
+        typeof body.threadId === "string" && body.threadId.trim()
+          ? body.threadId.trim()
+          : null,
       review_attempts: 0,
       qa_required: body.qaRequired === false ? 0 : 1,
       created_at: now,
@@ -3699,8 +3791,17 @@ Be specific — reference actual commit messages and features. Don't be vague.`;
               accountId,
               threadId: task.thread_id || undefined,
             });
+            const threadId = task.thread_id || undefined;
+            const threadUrl = formatDiscordThreadUrl(threadId);
             res.writeHead(200, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ ok: true, runId: result.runId }));
+            res.end(
+              JSON.stringify({
+                ok: true,
+                runId: result.runId,
+                threadId,
+                threadUrl: threadUrl || undefined,
+              }),
+            );
           } catch (e) {
             sendError(res, 500, e.message || String(e));
           }
@@ -4013,144 +4114,20 @@ Be specific — reference actual commit messages and features. Don't be vague.`;
     }
   })();
 
-  // ---- Auto-resume tasks killed by gateway restart ----
-  (async () => {
-    try {
-      // Wait for gateway + ACP runtime to fully settle
-      await new Promise((r) => setTimeout(r, 8000));
-
-      // Only resume tasks that were marked as errored in the last 5 minutes
-      // (i.e. by THIS startup's stuck-task cleanup, not old stale errors)
-      const cutoff = Date.now() - 5 * 60_000;
-      const restartErrored = db
-        .prepare(
-          "SELECT * FROM tasks WHERE status = 'error' AND error = 'Gateway restart during execution' AND session_key IS NOT NULL AND updated_at > ?",
-        )
-        .all(cutoff);
-
-      if (restartErrored.length === 0) return;
-
-      process.stderr.write(
-        `[AUTO-RESUME] Found ${restartErrored.length} task(s) interrupted by gateway restart\n`,
-      );
-
-      for (const row of restartErrored) {
-        const task = rowToTask(row);
-        process.stderr.write(
-          `[AUTO-RESUME] Resuming task ${task.id} (${task.title})\n`,
-        );
-
-        try {
-          const resolvedCwd = task.cwd || resolveCwd(task);
-          const accountId = resolveAccountId(task.agent);
-          const channelId = resolveChannel(task);
-
-          // Mark as in_progress
-          db.prepare(
-            "UPDATE tasks SET status = 'in_progress', error = NULL, updated_at = @updated_at WHERE id = @id",
-          ).run({ id: task.id, updated_at: Date.now() });
-          onTaskChanged(task.id);
-
-          if (task.threadId) {
-            await postToThread(task.threadId, "🔄 **Auto-resuming** — gateway restarted, picking up where we left off...", "sumodeus").catch(() => {});
-          }
-
-          const result = await api.runtime.acp.spawn(
-            {
-              task: "Continue where you left off. Your previous session was interrupted by a gateway restart. Check git log and git status to see your progress, then complete the remaining work.",
-              label: `auto-resume-${task.id.slice(0, 8)}-${Date.now()}`,
-              agentId: "opencode",
-              cwd: resolvedCwd,
-              resumeSessionId: task.sessionKey,
-              thread: false,
-            },
-            {
-              agentChannel: "discord",
-              agentAccountId: accountId,
-              agentTo: channelId ? `channel:${channelId}` : undefined,
-            },
-          );
-
-          if (result?.status !== "accepted") {
-            throw new Error(result?.error || `resume spawn failed: ${result?.status || "unknown"}`);
-          }
-
-          const childRunId = typeof result?.runId === "string" ? result.runId.trim() : "";
-          const childSessionKey = result?.childSessionKey || task.sessionKey;
-          if (!childRunId) throw new Error("resume spawn did not return runId");
-
-          process.stderr.write(
-            `[AUTO-RESUME] spawn accepted for ${task.id}, runId=${childRunId}\n`,
-          );
-
-          db.prepare(
-            "UPDATE tasks SET session_key = @sessionKey, run_id = @runId, updated_at = @updated_at WHERE id = @id",
-          ).run({ id: task.id, sessionKey: childSessionKey, runId: childRunId, updated_at: Date.now() });
-
-          // Wait for completion
-          const wait = await api.runtime.subagent.waitForRun({
-            runId: childRunId,
-            timeoutMs: resolveTaskTimeoutMs(task),
-          });
-          const waitStatus = wait?.status || "timeout";
-          if (waitStatus !== "ok") {
-            const waitError = wait?.error ? `: ${wait.error}` : "";
-            throw new Error(`resumed run failed (${waitStatus})${waitError}`);
-          }
-
-          // Get output
-          let text = "";
-          if (api.runtime?.subagent?.getSessionMessages) {
-            const msgs = await api.runtime.subagent.getSessionMessages({
-              sessionKey: childSessionKey,
-              limit: 200,
-            });
-            text = extractOutputFromMessages(msgs?.messages || []);
-          }
-
-          // Mark review
-          db.prepare(
-            "UPDATE tasks SET status = 'review', output = @output, completed_at = NULL, updated_at = @updated_at WHERE id = @id",
-          ).run({ id: task.id, output: text.slice(0, 10000), updated_at: Date.now() });
-
-          if (task.threadId) {
-            await postToThread(task.threadId, `✅ **Resume completed**\n\n${text.slice(0, 1500)}${text.length > 1500 ? "..." : ""}`);
-          }
-          onTaskChanged(task.id);
-
-          // Run QA if required
-          const freshTask = rowToTask(getTask(task.id));
-          if (resolveQaRequired(freshTask || task)) {
-            await runMaatReviewLoop(task.id);
-          } else {
-            const doneNow = Date.now();
-            db.prepare(
-              "UPDATE tasks SET status = 'done', completed_at = @completed_at, updated_at = @updated_at WHERE id = @id",
-            ).run({ id: task.id, completed_at: doneNow, updated_at: doneNow });
-            notifyMainSession(freshTask || task, "done");
-            onTaskChanged(task.id);
-            triggerDependents(task.id);
-          }
-
-          process.stderr.write(
-            `[AUTO-RESUME] Task ${task.id} successfully resumed and completed\n`,
-          );
-        } catch (e) {
-          process.stderr.write(
-            `[AUTO-RESUME] Failed for task ${task.id}: ${e.message}\n`,
-          );
-          db.prepare(
-            "UPDATE tasks SET status = 'error', error = @error, retries = retries + 1, updated_at = @updated_at WHERE id = @id",
-          ).run({ id: task.id, error: `Auto-resume failed: ${e.message}`, updated_at: Date.now() });
-          onTaskChanged(task.id);
-        }
-      }
-    } catch (e) {
-      process.stderr.write(
-        `[AUTO-RESUME] Startup error: ${e.message}\n`,
-      );
-    }
-  })();
+  // ---- Auto-resume disabled ----
+  // Previously attempted to auto-resume tasks killed by gateway restart,
+  // but acpx session resume is unreliable (always exits code 1 with
+  // "queue owner unavailable"). The auto-resume also triggered false
+  // positives — posting "gateway restarted" messages when no restart
+  // occurred (Phase 5 marks in-progress tasks as errored on every startup,
+  // and auto-resume picked them up within the 5min window).
+  //
+  // Tasks interrupted by restart are left in 'error' status for manual
+  // re-dispatch via `dispatch retry <id>` or creating a new task.
+  //
+  // To re-enable in future: gate on a startup sentinel (e.g. write a
+  // timestamp file at startup, only resume if tasks were marked errored
+  // AFTER that timestamp and BEFORE the 8s settle delay).
 
   // ---- Completion hook (Phase 3 dispatch will populate session_key) ----
 

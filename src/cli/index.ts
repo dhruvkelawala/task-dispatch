@@ -4,6 +4,7 @@ import { readFileSync } from "node:fs";
 
 const defaultBase = "http://localhost:18789";
 const defaultApiKey = "24b1b4e5472806f373c62c49cfe119d6";
+const discordGuildId = "1475480367166128354";
 
 function base(): string {
   return process.env.DISPATCH_URL || defaultBase;
@@ -32,6 +33,8 @@ const projectCwd: Record<string, string> = {
   "mission-control": "/Users/sumo-deus/.openclaw/workspace/mission-control-v3",
   forayy: "/Users/sumo-deus/.openclaw/workspace/forayy",
   "task-dispatch": "/Users/sumo-deus/.openclaw/extensions/task-dispatch",
+  "0xready": "/Users/sumo-deus/.openclaw/workspace/beryl",
+  oxr: "/Users/sumo-deus/.openclaw/workspace/beryl",
 };
 
 const projectId: Record<string, string> = {
@@ -40,6 +43,8 @@ const projectId: Record<string, string> = {
   "mission-control": "mission-control",
   forayy: "forayy",
   "task-dispatch": "task-dispatch",
+  "0xready": "0xready",
+  oxr: "0xready",
 };
 
 function fail(message: string): never {
@@ -181,6 +186,12 @@ async function cmdCreate(args: string[]): Promise<void> {
         i += 1;
         payload.thinking = args[i] || "";
         break;
+      case "-T":
+      case "--thread":
+        i += 1;
+        if (!(args[i] || "").trim()) fail("--thread requires a Discord thread ID");
+        payload.threadId = (args[i] || "").trim();
+        break;
       case "-f":
       case "--file":
         i += 1;
@@ -190,6 +201,15 @@ async function cmdCreate(args: string[]): Promise<void> {
           fail(`Error reading file: ${(err as Error).message}`);
         }
         break;
+      case "--depends-on":
+      case "--after": {
+        i += 1;
+        const depIds = (args[i] || "").split(",").map((s) => s.trim()).filter(Boolean);
+        if (depIds.length === 0) fail("--depends-on requires at least one task ID");
+        const existing = (payload.dependsOn as string[] | undefined) || [];
+        payload.dependsOn = [...existing, ...depIds];
+        break;
+      }
       default:
         if (!title) title = arg;
         else if (!desc) desc = arg;
@@ -199,6 +219,13 @@ async function cmdCreate(args: string[]): Promise<void> {
   if (!title) {
     fail(
       "Usage: dispatch create -t \"title\" -d \"description\" -p project [-a agent] [-c category] [--no-qa] [--timeout ms]",
+    );
+  }
+
+  if (!payload.projectId) {
+    fail(
+      "Error: --project (-p) is required. Tasks without a project land in the wrong channel.\n" +
+      `Available projects: ${Object.keys(projectId).join(", ")}`,
     );
   }
 
@@ -221,28 +248,44 @@ async function cmdList(): Promise<void> {
     return;
   }
 
-  const rows = tasks.map((t) => ({
-    id: short(String(t.id || "")),
-    status: statusLabel(String(t.status || "")),
-    agent: String(t.agent || ""),
-    title: truncate(String(t.title || ""), 50),
-    created: formatTime(t.created_at),
-  }));
+  const rows = tasks.map((t) => {
+    const deps = Array.isArray(t.depends_on)
+      ? t.depends_on
+      : typeof t.depends_on === "string"
+        ? JSON.parse(t.depends_on || "[]")
+        : Array.isArray(t.dependsOn)
+          ? t.dependsOn
+          : [];
+    return {
+      id: short(String(t.id || "")),
+      status: statusLabel(String(t.status || "")),
+      agent: String(t.agent || ""),
+      title: truncate(String(t.title || ""), 50),
+      deps: deps.length > 0 ? deps.map((d: string) => short(d)).join(",") : "",
+      created: formatTime(t.created_at),
+    };
+  });
 
   const widths = {
     id: Math.max(2, ...rows.map((r) => r.id.length)),
     status: Math.max(6, ...rows.map((r) => r.status.length)),
     agent: Math.max(5, ...rows.map((r) => r.agent.length)),
     title: Math.max(5, ...rows.map((r) => r.title.length)),
+    deps: Math.max(4, ...rows.map((r) => r.deps.length)),
   };
 
-  process.stdout.write(
-    `${pad("ID", widths.id)}  ${pad("STATUS", widths.status)}  ${pad("AGENT", widths.agent)}  ${pad("TITLE", widths.title)}  CREATED\n`,
-  );
+  const showDeps = rows.some((r) => r.deps.length > 0);
+
+  const header = showDeps
+    ? `${pad("ID", widths.id)}  ${pad("STATUS", widths.status)}  ${pad("AGENT", widths.agent)}  ${pad("DEPS", widths.deps)}  ${pad("TITLE", widths.title)}  CREATED\n`
+    : `${pad("ID", widths.id)}  ${pad("STATUS", widths.status)}  ${pad("AGENT", widths.agent)}  ${pad("TITLE", widths.title)}  CREATED\n`;
+  process.stdout.write(header);
+
   for (const row of rows) {
-    process.stdout.write(
-      `${pad(row.id, widths.id)}  ${pad(row.status, widths.status)}  ${pad(row.agent, widths.agent)}  ${pad(row.title, widths.title)}  ${row.created}\n`,
-    );
+    const line = showDeps
+      ? `${pad(row.id, widths.id)}  ${pad(row.status, widths.status)}  ${pad(row.agent, widths.agent)}  ${pad(row.deps, widths.deps)}  ${pad(row.title, widths.title)}  ${row.created}\n`
+      : `${pad(row.id, widths.id)}  ${pad(row.status, widths.status)}  ${pad(row.agent, widths.agent)}  ${pad(row.title, widths.title)}  ${row.created}\n`;
+    process.stdout.write(line);
   }
 }
 
@@ -270,7 +313,24 @@ async function cmdPrompt(args: string[]): Promise<void> {
   }
   const { data, status } = await doReq("POST", `/api/tasks/${id}/prompt`, { message });
   if (status >= 400) fail(`HTTP ${status}: ${data}`);
+  let runId = "";
+  let threadId = "";
+  let threadUrl = "";
+  try {
+    const parsed = JSON.parse(data) as Record<string, unknown>;
+    runId = typeof parsed.runId === "string" ? parsed.runId : "";
+    threadId = typeof parsed.threadId === "string" ? parsed.threadId : "";
+    threadUrl = typeof parsed.threadUrl === "string"
+      ? parsed.threadUrl
+      : threadId
+        ? `https://discord.com/channels/${discordGuildId}/${threadId}`
+        : "";
+  } catch {
+    // Keep backward compatibility with non-JSON responses.
+  }
   process.stdout.write(`✅ Prompt sent to task ${short(id)}\n`);
+  if (runId) process.stdout.write(`Run ID: ${runId}\n`);
+  if (threadUrl) process.stdout.write(`Thread: ${threadUrl}\n`);
   prettyPrint(data);
 }
 
@@ -350,6 +410,10 @@ CREATE FLAGS:
   -a, --agent       Agent: zeus (default), atum
   -p, --project     Project: visaroy, mc, forayy (auto-sets cwd)
   -c, --category    Category: bug, feat, chore, design
+  --depends-on      Comma-separated task IDs this task depends on (DAG)
+                    Alias: --after. Task stays waiting until deps complete.
+                    Can be repeated: --depends-on id1 --depends-on id2
+  -T, --thread      Reuse an existing Discord thread ID
   --cwd             Override working directory
   --timeout         Timeout in ms (default 1800000 = 30min)
   --no-qa           Skip Maat code review
@@ -367,6 +431,9 @@ ENVIRONMENT:
 EXAMPLES:
   dispatch create -t "Fix bug" -p visaroy -c bug -d "Fix the login flow"
   dispatch create -t "Add feature" -p mc -d "Build usage dashboard" --no-qa
+  dispatch create -t "Task B" -p oxr --depends-on abc12345 -f desc.md
+  dispatch create -t "Task C" -p oxr --after abc12345,def67890
+  dispatch create -t "Continue thread" -p task-dispatch -T 1488561798167793894 -d "Follow-up work"
   dispatch list
   dispatch prompt abc123 "Add error handling to the API route"
   dispatch get abc123
