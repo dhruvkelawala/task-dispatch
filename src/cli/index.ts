@@ -83,6 +83,28 @@ function availableProjectsText(): string {
     .join("\n");
 }
 
+function levenshtein(a: string, b: string): number {
+  const dp = Array.from({ length: a.length + 1 }, () => Array(b.length + 1).fill(0));
+  for (let i = 0; i <= a.length; i += 1) dp[i][0] = i;
+  for (let j = 0; j <= b.length; j += 1) dp[0][j] = j;
+  for (let i = 1; i <= a.length; i += 1) {
+    for (let j = 1; j <= b.length; j += 1) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      dp[i][j] = Math.min(dp[i - 1][j] + 1, dp[i][j - 1] + 1, dp[i - 1][j - 1] + cost);
+    }
+  }
+  return dp[a.length][b.length];
+}
+
+function suggestProjects(input: string): string[] {
+  const normalized = (input || "").trim().toLowerCase();
+  return projectEntries()
+    .map((entry) => ({ key: entry.key, score: levenshtein(normalized, entry.key.toLowerCase()) }))
+    .sort((a, b) => a.score - b.score)
+    .slice(0, 3)
+    .map((entry) => entry.key);
+}
+
 function resolveProject(input: string): ProjectEntry | null {
   const normalized = (input || "").trim();
   if (!normalized) return null;
@@ -129,6 +151,11 @@ function truncate(s: string, n: number): string {
 }
 
 function formatTime(v: unknown): string {
+  if (v && typeof v === "object") {
+    const maybe = v as Record<string, unknown>;
+    if ("updated_at" in maybe) return formatTime(maybe.updated_at);
+    if ("updatedAt" in maybe) return formatTime(maybe.updatedAt);
+  }
   if (typeof v === "number") {
     const ms = v > 1e12 ? v : v * 1000;
     return new Date(ms).toLocaleString("en-GB", {
@@ -255,8 +282,9 @@ async function cmdCreate(args: string[]): Promise<void> {
         const p = args[i] || "";
         const resolved = resolveProject(p);
         if (!resolved) {
+          const suggestions = suggestProjects(p);
           fail(
-            `Unknown project: ${p}\n\nAvailable projects:\n${availableProjectsText()}\n\nTip: run \`dispatch projects\` to inspect configured projects.`,
+            `Unknown project: ${p}\n${suggestions.length ? `Did you mean: ${suggestions.join(", ")}?\n\n` : "\n"}Available projects:\n${availableProjectsText()}\n\nTip: run \`dispatch projects\` to inspect configured projects.`,
           );
         }
         selectedProject = resolved;
@@ -564,25 +592,76 @@ async function cmdDoctor(): Promise<void> {
   const { data, status } = await doReq("GET", "/api/dispatch/health", null);
   if (status >= 400) fail(`Health check failed (${status}): ${data}`);
   process.stdout.write("Plugin health: ok\n");
+  const tasks = await fetchTasks();
+  const recentErrors = tasks.filter((task) => String(task.status || "") === "error").slice(0, 3);
+  if (recentErrors.length > 0) {
+    process.stdout.write("Recent errors:\n");
+    for (const task of recentErrors) {
+      process.stdout.write(`- ${short(String(task.id || ""))}: ${truncate(String(task.error || ""), 180)}\n`);
+    }
+  }
 }
 
 async function cmdFollow(id: string): Promise<void> {
   const resolvedId = await resolveTaskId(id);
   process.stdout.write(`Following task ${resolvedId}. Press Ctrl+C to stop.\n`);
-  let lastStatus = "";
+  let lastSignature = "";
   for (;;) {
     const { data, status } = await doReq("GET", `/api/tasks/${resolvedId}`, null);
     if (status >= 400) fail(`HTTP ${status}: ${data}`);
     const task = JSON.parse(data) as Record<string, unknown>;
-    const nextStatus = String(task.status || "");
-    if (nextStatus !== lastStatus) {
-      process.stdout.write(`[${formatTime(task.updatedAt || task.updated_at)}] ${nextStatus}\n`);
+    const signature = `${String(task.status || "")}:${String(task.updatedAt || task.updated_at || "")}:${String(task.error || "")}`;
+    if (signature !== lastSignature) {
+      process.stdout.write(`[${formatTime(task.updatedAt || task.updated_at)}] ${String(task.status || "")}\n`);
       if (task.error) process.stdout.write(`error: ${String(task.error)}\n`);
-      lastStatus = nextStatus;
+      const threadId = String(task.threadId || "");
+      if (threadId) process.stdout.write(`thread: ${formatThreadUrl(threadId)}\n`);
+      lastSignature = signature;
     }
-    if (["done", "error", "blocked"].includes(nextStatus)) break;
+    if (["done", "error", "blocked"].includes(String(task.status || ""))) break;
     await new Promise((resolve) => setTimeout(resolve, 2500));
   }
+}
+
+async function cmdExplain(id: string): Promise<void> {
+  const resolvedId = await resolveTaskId(id);
+  const { data, status } = await doReq("GET", `/api/tasks/${resolvedId}`, null);
+  if (status >= 400) fail(`HTTP ${status}: ${data}`);
+  const task = JSON.parse(data) as Record<string, unknown>;
+  process.stdout.write(`Task ${short(String(task.id || ""))} is \"${String(task.title || "")}.\"\n`);
+  process.stdout.write(`It belongs to project ${String(task.projectId || "unknown")} and runs as ${String(task.agent || "unknown")}.\n`);
+  process.stdout.write(`Current status: ${String(task.status || "unknown")}.\n`);
+  if (task.threadId) process.stdout.write(`Discord thread: ${formatThreadUrl(String(task.threadId))}\n`);
+  if (task.error) {
+    process.stdout.write(`Failure reason: ${String(task.error)}\n`);
+    process.stdout.write("Next step: use dispatch retry <id> if you want a fresh rerun, or fix the underlying plugin/runtime issue first if the error is systemic.\n");
+  }
+}
+
+async function cmdRetry(args: string[]): Promise<void> {
+  const id = args[0];
+  if (!id) fail("Usage: dispatch retry <task-id> [--no-qa]");
+  const resolvedId = await resolveTaskId(id);
+  const { data, status } = await doReq("GET", `/api/tasks/${resolvedId}`, null);
+  if (status >= 400) fail(`HTTP ${status}: ${data}`);
+  const task = JSON.parse(data) as Record<string, unknown>;
+  const parsed = parseArgs(args.slice(1));
+  const payload: Record<string, unknown> = {
+    title: task.title,
+    description: task.description,
+    agent: task.agent || "zeus",
+    projectId: task.projectId || null,
+    cwd: task.cwd || null,
+    timeoutMs: task.timeoutMs || config.defaults?.taskTimeoutMs || 1800000,
+    qaRequired: parsed["no-qa"] ? false : task.qaRequired !== false,
+    model: task.model || null,
+    thinking: task.thinking || null,
+  };
+  const create = await doReq("POST", "/api/tasks", payload);
+  if (create.status >= 400) fail(`HTTP ${create.status}: ${create.data}`);
+  const newTask = JSON.parse(create.data) as Record<string, unknown>;
+  process.stdout.write(`Retried ${short(resolvedId)} -> ${short(String(newTask.id || ""))}\n`);
+  prettyPrint(create.data);
 }
 
 async function cmdQa(id: string): Promise<void> {
@@ -659,8 +738,10 @@ COMMANDS:
   history        Show completed/failed/blocked task history
   get <id>       Get task details (short IDs supported)
   inspect <id>   Human-friendly task summary with thread/session links
+  explain <id>   Plain-English task summary + suggested next step
   open <id>      Print Discord thread URL for a task
   follow <id>    Poll a task until it finishes
+  retry <id>     Create a fresh task from an existing one
   prompt <id>    Send follow-up to existing task session
   update <id>    Update task status
   delete <id>    Delete a task
@@ -708,8 +789,10 @@ EXAMPLES:
   dispatch list --project go-hevy --status error
   dispatch history --project go-hevy
   dispatch inspect abc123
+  dispatch explain abc123
   dispatch open abc123
   dispatch follow abc123
+  dispatch retry abc123 --no-qa
   dispatch prompt abc123 "Add error handling to the API route"
   dispatch update abc123 --status blocked --error "Needs clarification"
 `);
@@ -795,6 +878,9 @@ async function main(): Promise<void> {
     case "i":
       await cmdInspect(argv[1] || "");
       break;
+    case "explain":
+      await cmdExplain(argv[1] || "");
+      break;
     case "open":
     case "o":
       await cmdOpen(argv[1] || "");
@@ -802,6 +888,9 @@ async function main(): Promise<void> {
     case "follow":
     case "f":
       await cmdFollow(argv[1] || "");
+      break;
+    case "retry":
+      await cmdRetry(argv.slice(1));
       break;
     case "prompt":
     case "send":

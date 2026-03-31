@@ -1166,11 +1166,13 @@ export default function setup(api) {
 
     const maatSessionKey = `agent:nemesis:subagent:review:${crypto.randomUUID()}`;
     const reviewPrompt = buildQAReviewPrompt(task);
+    const qaModel = CONFIG.agents?.nemesis?.model || "kimi-code";
     const run = await api.runtime.subagent.run({
       sessionKey: maatSessionKey,
       message: reviewPrompt,
       idempotencyKey: crypto.randomUUID(),
       lane: "subagent",
+      model: qaModel,
     });
     const reviewRunId = typeof run?.runId === "string" ? run.runId.trim() : "";
     if (!reviewRunId) {

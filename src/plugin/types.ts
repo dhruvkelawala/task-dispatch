@@ -109,6 +109,7 @@ export interface SubagentRuntime {
     message: string;
     idempotencyKey: string;
     lane: "subagent";
+    model?: string;
   }) => Promise<{ runId?: string }>;
   waitForRun?: (args: { runId: string; timeoutMs: number }) => Promise<{ status?: string; error?: string }>;
   getSessionMessages?: (args: {
