@@ -1,10 +1,24 @@
 #!/usr/bin/env bun
 
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 
 const defaultBase = "http://localhost:18789";
 const defaultApiKey = "24b1b4e5472806f373c62c49cfe119d6";
 const discordGuildId = "1475480367166128354";
+const configPath = `${process.env.HOME || "/Users/sumo-deus"}/.openclaw/data/task-dispatch-config.json`;
+
+type DispatchConfig = {
+  projects?: Record<string, { cwd?: string; channel?: string; defaultAgent?: string }>;
+  agents?: Record<string, { runtime?: string; model?: string }>;
+  defaults?: { defaultCwd?: string; taskTimeoutMs?: number; reviewTimeoutMs?: number };
+};
+
+type ProjectEntry = {
+  key: string;
+  cwd: string;
+  channel: string;
+  defaultAgent: string;
+};
 
 function base(): string {
   return process.env.DISPATCH_URL || defaultBase;
@@ -27,25 +41,78 @@ async function doReq(method: string, path: string, body: unknown): Promise<{ dat
   return { data: await resp.text(), status: resp.status };
 }
 
-const projectCwd: Record<string, string> = {
-  visaroy: "/Users/sumo-deus/.openclaw/workspace/visaroy/visaroy-app",
-  mc: "/Users/sumo-deus/.openclaw/workspace/mission-control-v3",
-  "mission-control": "/Users/sumo-deus/.openclaw/workspace/mission-control-v3",
-  forayy: "/Users/sumo-deus/.openclaw/workspace/forayy",
-  "task-dispatch": "/Users/sumo-deus/.openclaw/extensions/task-dispatch",
-  "0xready": "/Users/sumo-deus/.openclaw/workspace/beryl",
-  oxr: "/Users/sumo-deus/.openclaw/workspace/beryl",
-};
+function loadConfig(): DispatchConfig {
+  if (!existsSync(configPath)) return {};
+  try {
+    return JSON.parse(readFileSync(configPath, "utf8")) as DispatchConfig;
+  } catch (err) {
+    fail(`Failed to read dispatch config at ${configPath}: ${(err as Error).message}`);
+  }
+}
 
-const projectId: Record<string, string> = {
-  visaroy: "visaroy",
-  mc: "mission-control",
-  "mission-control": "mission-control",
-  forayy: "forayy",
-  "task-dispatch": "task-dispatch",
-  "0xready": "0xready",
-  oxr: "0xready",
-};
+const config = loadConfig();
+
+function projectEntries(): ProjectEntry[] {
+  return Object.entries(config.projects || {}).map(([key, value]) => ({
+    key,
+    cwd: value.cwd || "-",
+    channel: value.channel || "-",
+    defaultAgent: value.defaultAgent || "zeus",
+  }));
+}
+
+function projectAliasMap(): Record<string, string> {
+  const entries = projectEntries();
+  const aliases: Record<string, string> = {};
+  for (const entry of entries) {
+    aliases[entry.key] = entry.key;
+  }
+  if (aliases["mission-control"]) aliases.mc = "mission-control";
+  if (aliases["0xready"]) aliases.oxr = "0xready";
+  if (aliases["argentx"]) aliases.multichain = "argentx";
+  return aliases;
+}
+
+const projectAliases = projectAliasMap();
+
+function availableProjectsText(): string {
+  const entries = projectEntries();
+  if (entries.length === 0) return "(no projects configured)";
+  return entries
+    .map((entry) => `- ${entry.key} → ${entry.cwd}${entry.channel !== "-" ? ` | channel ${entry.channel}` : ""}`)
+    .join("\n");
+}
+
+function resolveProject(input: string): ProjectEntry | null {
+  const normalized = (input || "").trim();
+  if (!normalized) return null;
+  const canonical = projectAliases[normalized] || normalized;
+  const match = projectEntries().find((entry) => entry.key === canonical);
+  return match || null;
+}
+
+async function fetchTasks(): Promise<Array<Record<string, unknown>>> {
+  const { data, status } = await doReq("GET", "/api/tasks", null);
+  if (status >= 400) fail(`HTTP ${status}: ${data}`);
+  return JSON.parse(data) as Array<Record<string, unknown>>;
+}
+
+async function resolveTaskId(input: string): Promise<string> {
+  const id = (input || "").trim();
+  if (!id) fail("Task ID is required");
+  if (id.length > 8) return id;
+  const tasks = await fetchTasks();
+  const matches = tasks.filter((task) => String(task.id || "").startsWith(id));
+  if (matches.length === 1) return String(matches[0]?.id || id);
+  if (matches.length > 1) {
+    fail(
+      `Ambiguous short task ID \"${id}\". Matches:\n${matches
+        .map((task) => `- ${String(task.id || "")}  ${String(task.title || "")}`)
+        .join("\n")}`,
+    );
+  }
+  return id;
+}
 
 function fail(message: string): never {
   process.stderr.write(`${message}\n`);
@@ -99,6 +166,10 @@ function prettyPrint(data: string): void {
 
 function pad(value: string, width: number): string {
   return value.length >= width ? value : `${value}${" ".repeat(width - value.length)}`;
+}
+
+function formatThreadUrl(threadId: string): string {
+  return `https://discord.com/channels/${discordGuildId}/${threadId}`;
 }
 
 function statusLabel(status: string): string {
@@ -155,8 +226,15 @@ async function cmdCreate(args: string[]): Promise<void> {
       case "--project": {
         i += 1;
         const p = args[i] || "";
-        if (projectCwd[p]) payload.cwd = projectCwd[p];
-        payload.projectId = projectId[p] || p;
+        const resolved = resolveProject(p);
+        if (!resolved) {
+          fail(
+            `Unknown project: ${p}\n\nAvailable projects:\n${availableProjectsText()}\n\nTip: run \`dispatch projects\` to inspect configured projects.`,
+          );
+        }
+        payload.cwd = resolved.cwd !== "-" ? resolved.cwd : undefined;
+        payload.projectId = resolved.key;
+        if (!payload.agent && resolved.defaultAgent) payload.agent = resolved.defaultAgent;
         break;
       }
       case "-c":
@@ -224,8 +302,9 @@ async function cmdCreate(args: string[]): Promise<void> {
 
   if (!payload.projectId) {
     fail(
-      "Error: --project (-p) is required. Tasks without a project land in the wrong channel.\n" +
-      `Available projects: ${Object.keys(projectId).join(", ")}`,
+      "Error: --project (-p) is required. Tasks without a project land in the wrong channel.\n\n" +
+      `Available projects:\n${availableProjectsText()}\n\n` +
+      "Tip: run `dispatch projects` to inspect configured projects.",
     );
   }
 
@@ -236,6 +315,9 @@ async function cmdCreate(args: string[]): Promise<void> {
   if (status >= 400) fail(`HTTP ${status}: ${data}`);
   const result = JSON.parse(data) as Record<string, unknown>;
   process.stdout.write(`✅ Created task ${short(String(result.id || ""))}\n`);
+  if (payload.projectId) process.stdout.write(`Project: ${String(payload.projectId)}\n`);
+  if (payload.cwd) process.stdout.write(`CWD: ${String(payload.cwd)}\n`);
+  if (payload.agent) process.stdout.write(`Agent: ${String(payload.agent)}\n`);
   prettyPrint(data);
 }
 
@@ -291,7 +373,8 @@ async function cmdList(): Promise<void> {
 
 async function cmdGet(id: string): Promise<void> {
   if (!id) fail("Usage: dispatch get <task-id>");
-  const { data, status } = await doReq("GET", `/api/tasks/${id}`, null);
+  const resolvedId = await resolveTaskId(id);
+  const { data, status } = await doReq("GET", `/api/tasks/${resolvedId}`, null);
   if (status >= 400) fail(`HTTP ${status}: ${data}`);
   prettyPrint(data);
 }
@@ -311,7 +394,8 @@ async function cmdPrompt(args: string[]): Promise<void> {
   } else {
     message = args.slice(1).join(" ");
   }
-  const { data, status } = await doReq("POST", `/api/tasks/${id}/prompt`, { message });
+  const resolvedId = await resolveTaskId(id);
+  const { data, status } = await doReq("POST", `/api/tasks/${resolvedId}/prompt`, { message });
   if (status >= 400) fail(`HTTP ${status}: ${data}`);
   let runId = "";
   let threadId = "";
@@ -328,7 +412,7 @@ async function cmdPrompt(args: string[]): Promise<void> {
   } catch {
     // Keep backward compatibility with non-JSON responses.
   }
-  process.stdout.write(`✅ Prompt sent to task ${short(id)}\n`);
+  process.stdout.write(`✅ Prompt sent to task ${short(resolvedId)}\n`);
   if (runId) process.stdout.write(`Run ID: ${runId}\n`);
   if (threadUrl) process.stdout.write(`Thread: ${threadUrl}\n`);
   prettyPrint(data);
@@ -347,16 +431,18 @@ async function cmdUpdate(args: string[]): Promise<void> {
       payload.error = args[i] || "";
     }
   }
-  const { data, status } = await doReq("PATCH", `/api/tasks/${id}`, payload);
+  const resolvedId = await resolveTaskId(id);
+  const { data, status } = await doReq("PATCH", `/api/tasks/${resolvedId}`, payload);
   if (status >= 400) fail(`HTTP ${status}: ${data}`);
-  process.stdout.write(`✅ Updated task ${short(id)}\n`);
+  process.stdout.write(`✅ Updated task ${short(resolvedId)}\n`);
 }
 
 async function cmdDelete(id: string): Promise<void> {
   if (!id) fail("Usage: dispatch delete <task-id>");
-  const { data, status } = await doReq("DELETE", `/api/tasks/${id}`, null);
+  const resolvedId = await resolveTaskId(id);
+  const { data, status } = await doReq("DELETE", `/api/tasks/${resolvedId}`, null);
   if (status >= 400) fail(`HTTP ${status}: ${data}`);
-  process.stdout.write(`🗑️  Deleted task ${short(id)}\n`);
+  process.stdout.write(`🗑️  Deleted task ${short(resolvedId)}\n`);
 }
 
 async function cmdStats(): Promise<void> {
@@ -367,17 +453,19 @@ async function cmdStats(): Promise<void> {
 
 async function cmdResume(id: string): Promise<void> {
   if (!id) fail("Usage: dispatch resume <task-id>");
-  const { data, status } = await doReq("POST", `/api/tasks/${id}/resume`, {});
+  const resolvedId = await resolveTaskId(id);
+  const { data, status } = await doReq("POST", `/api/tasks/${resolvedId}/resume`, {});
   if (status >= 400) fail(`HTTP ${status}: ${data}`);
-  process.stdout.write(`🔄 Resume triggered for task ${short(id)}\n`);
+  process.stdout.write(`🔄 Resume triggered for task ${short(resolvedId)}\n`);
   prettyPrint(data);
 }
 
 async function cmdQa(id: string): Promise<void> {
   if (!id) fail("Usage: dispatch qa <task-id>");
-  const { data, status } = await doReq("POST", `/api/tasks/${id}/qa`, {});
+  const resolvedId = await resolveTaskId(id);
+  const { data, status } = await doReq("POST", `/api/tasks/${resolvedId}/qa`, {});
   if (status >= 400) fail(`HTTP ${status}: ${data}`);
-  process.stdout.write(`🔍 QA review triggered for task ${short(id)}\n`);
+  process.stdout.write(`🔍 QA review triggered for task ${short(resolvedId)}\n`);
   prettyPrint(data);
 }
 
@@ -388,27 +476,78 @@ async function cmdHealth(): Promise<void> {
   prettyPrint(data);
 }
 
+async function cmdProjects(): Promise<void> {
+  const entries = projectEntries();
+  if (entries.length === 0) {
+    process.stdout.write(`No projects configured in ${configPath}\n`);
+    return;
+  }
+
+  const rows = entries.map((entry) => ({
+    project: entry.key,
+    agent: entry.defaultAgent,
+    cwd: entry.cwd,
+    channel: entry.channel,
+  }));
+
+  const widths = {
+    project: Math.max("PROJECT".length, ...rows.map((r) => r.project.length)),
+    agent: Math.max("AGENT".length, ...rows.map((r) => r.agent.length)),
+    cwd: Math.max("CWD".length, ...rows.map((r) => r.cwd.length)),
+    channel: Math.max("CHANNEL".length, ...rows.map((r) => r.channel.length)),
+  };
+
+  process.stdout.write(
+    `${pad("PROJECT", widths.project)}  ${pad("AGENT", widths.agent)}  ${pad("CHANNEL", widths.channel)}  CWD\n`,
+  );
+  for (const row of rows) {
+    process.stdout.write(
+      `${pad(row.project, widths.project)}  ${pad(row.agent, widths.agent)}  ${pad(row.channel, widths.channel)}  ${row.cwd}\n`,
+    );
+  }
+}
+
+async function cmdInspect(id: string): Promise<void> {
+  const resolvedId = await resolveTaskId(id);
+  const { data, status } = await doReq("GET", `/api/tasks/${resolvedId}`, null);
+  if (status >= 400) fail(`HTTP ${status}: ${data}`);
+  const task = JSON.parse(data) as Record<string, unknown>;
+  process.stdout.write(`Task: ${String(task.title || "") }\n`);
+  process.stdout.write(`ID: ${String(task.id || "")}\n`);
+  process.stdout.write(`Status: ${String(task.status || "")}\n`);
+  process.stdout.write(`Project: ${String(task.projectId || "-")}\n`);
+  process.stdout.write(`Agent: ${String(task.agent || "-")}\n`);
+  process.stdout.write(`CWD: ${String(task.cwd || "-")}\n`);
+  process.stdout.write(`Session: ${String(task.sessionKey || "-")}\n`);
+  process.stdout.write(`Run: ${String(task.runId || "-")}\n`);
+  const threadId = String(task.threadId || "");
+  process.stdout.write(`Thread: ${threadId ? formatThreadUrl(threadId) : "-"}\n`);
+  if (task.error) process.stdout.write(`Error: ${String(task.error)}\n`);
+}
+
 function printUsage(): void {
   process.stdout.write(`dispatch — Task Dispatch CLI
 
 COMMANDS:
-  create, c    Create a new task
-  list, ls     List all tasks
-  get <id>     Get task details
-  prompt <id>  Send follow-up to existing task session
-  update <id>  Update task status
-  delete <id>  Delete a task
-  resume <id>  Resume a failed task's ACP session
-  qa <id>      Manually trigger QA review (Nemesis) on a task
-  stats        Show task statistics
-  health       Check plugin health
+  create, c      Create a new task
+  list, ls       List all tasks
+  get <id>       Get task details (short IDs supported)
+  inspect <id>   Human-friendly task summary with thread/session links
+  prompt <id>    Send follow-up to existing task session
+  update <id>    Update task status
+  delete <id>    Delete a task
+  resume <id>    Resume a failed task's ACP session
+  qa <id>        Manually trigger QA review (Nemesis) on a task
+  stats          Show task statistics
+  projects       List configured projects, channels, cwd, agents
+  health         Check plugin health
 
 CREATE FLAGS:
   -t, --title       Task title (required)
   -d, --desc        Task description
   -f, --file        Read description from file
   -a, --agent       Agent: zeus (default), atum
-  -p, --project     Project: visaroy, mc, forayy (auto-sets cwd)
+  -p, --project     Project key from config (run dispatch projects)
   -c, --category    Category: bug, feat, chore, design
   --depends-on      Comma-separated task IDs this task depends on (DAG)
                     Alias: --after. Task stays waiting until deps complete.
@@ -429,10 +568,11 @@ ENVIRONMENT:
   DISPATCH_API_KEY   API key
 
 EXAMPLES:
+  dispatch projects
   dispatch create -t "Fix bug" -p visaroy -c bug -d "Fix the login flow"
-  dispatch create -t "Add feature" -p mc -d "Build usage dashboard" --no-qa
-  dispatch create -t "Task B" -p oxr --depends-on abc12345 -f desc.md
-  dispatch create -t "Task C" -p oxr --after abc12345,def67890
+  dispatch create -t "Add feature" -p mission-control -d "Build usage dashboard" --no-qa
+  dispatch create -t "Task B" -p 0xready --depends-on abc12345 -f desc.md
+  dispatch create -t "Task C" -p go-hevy --after abc12345,def67890
   dispatch create -t "Continue thread" -p task-dispatch -T 1488561798167793894 -d "Follow-up work"
   dispatch list
   dispatch prompt abc123 "Add error handling to the API route"
@@ -514,6 +654,10 @@ async function main(): Promise<void> {
     case "g":
       await cmdGet(argv[1] || "");
       break;
+    case "inspect":
+    case "i":
+      await cmdInspect(argv[1] || "");
+      break;
     case "prompt":
     case "send":
     case "p":
@@ -539,6 +683,10 @@ async function main(): Promise<void> {
     case "stats":
     case "s":
       await cmdStats();
+      break;
+    case "projects":
+    case "project":
+      await cmdProjects();
       break;
     case "health":
     case "h":
