@@ -170,6 +170,15 @@ function createInMemoryDb(): any {
             const c = tables.tasks.filter((row) => ids.includes(String(row.id)) && row.status === "done").length;
             return { c };
           }
+          if (sql.startsWith("SELECT COUNT(*) as c FROM tasks WHERE id = ?")) {
+            return { c: tables.tasks.filter((row) => row.id === String(args[0])).length };
+          }
+          if (sql.startsWith("SELECT COUNT(*) as c FROM comments WHERE task_id = ?")) {
+            return { c: tables.comments.filter((row) => row.task_id === String(args[0])).length };
+          }
+          if (sql.startsWith("SELECT COUNT(*) as c FROM task_events WHERE task_id = ?")) {
+            return { c: tables.task_events.filter((row) => row.task_id === String(args[0])).length };
+          }
           return undefined;
         },
         all: (...args: any[]) => {
@@ -189,6 +198,17 @@ function createInMemoryDb(): any {
           }
           if (sql.startsWith("SELECT * FROM comments WHERE task_id = ?")) {
             return tables.comments.filter((row) => row.task_id === args[0]);
+          }
+          if (sql.startsWith("SELECT * FROM task_events WHERE task_id = ?")) {
+            const taskId = String(args[0]);
+            const limit = Number(args[1] || tables.task_events.length);
+            const ordered = [...tables.task_events]
+              .filter((row) => row.task_id === taskId)
+              .sort((a, b) => {
+                const desc = sql.includes("ORDER BY created_at DESC");
+                return desc ? Number(b.created_at) - Number(a.created_at) : Number(a.created_at) - Number(b.created_at);
+              });
+            return ordered.slice(0, limit);
           }
           return [];
         },
@@ -434,4 +454,30 @@ export function rowToComment(row: DbRow): Comment | null {
     body: String(row.body),
     createdAt: Number(row.created_at),
   };
+}
+
+export function rowToTaskEvent(row: DbRow): { id: number; taskId: string; eventType: string; payload: any; createdAt: number } | null {
+  if (!row) return null;
+  return {
+    id: Number(row.id),
+    taskId: String(row.task_id),
+    eventType: String(row.event_type),
+    payload: row.payload ? JSON.parse(row.payload) : null,
+    createdAt: Number(row.created_at),
+  };
+}
+
+export function listTaskEvents(db: any, taskId: string, opts: { order?: "asc" | "desc"; limit?: number } = {}) {
+  const limit = Math.max(1, Math.min(Number(opts.limit || 100), 500));
+  const order = String(opts.order || "desc").toLowerCase() === "asc" ? "ASC" : "DESC";
+  return db
+    .prepare(`SELECT * FROM task_events WHERE task_id = ? ORDER BY created_at ${order} LIMIT ?`)
+    .all(taskId, limit)
+    .map(rowToTaskEvent);
+}
+
+export function deleteTaskCascade(db: any, taskId: string): void {
+  db.prepare("DELETE FROM task_events WHERE task_id = ?").run(taskId);
+  db.prepare("DELETE FROM comments WHERE task_id = ?").run(taskId);
+  db.prepare("DELETE FROM tasks WHERE id = ?").run(taskId);
 }
