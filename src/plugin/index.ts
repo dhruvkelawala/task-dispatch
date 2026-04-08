@@ -5,7 +5,12 @@ import { createRequire } from "node:module";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import crypto from "node:crypto";
-import { buildExistingThreadDispatchMessage } from "./thread-messages";
+import { createBackgroundJobQueue } from "./background-jobs";
+import {
+  buildDiscordAcpPromptContext,
+  buildDiscordAgentTarget,
+  buildExistingThreadDispatchMessage,
+} from "./thread-messages";
 
 const require = createRequire(import.meta.url);
 const execFileAsync = promisify(execFile);
@@ -1260,9 +1265,7 @@ export default function setup(api) {
     const result = await api.runtime.acp.prompt({
       sessionKey: task.sessionKey,
       text: prompt,
-      channel: "discord",
-      accountId,
-      threadId: task.threadId || undefined,
+      ...buildDiscordAcpPromptContext(task.threadId, accountId),
     });
 
     const runId = typeof result?.runId === "string" ? result.runId.trim() : "";
@@ -1404,13 +1407,7 @@ export default function setup(api) {
   function triggerDispatch(taskId) {
     const row = getTask(taskId);
     if (!row || row.status !== "ready") return;
-    if (inFlightDispatch.has(taskId)) return;
-    inFlightDispatch.add(taskId);
-    dispatchTask(rowToTask(row))
-      .catch((e) =>
-        process.stderr.write(`[DISPATCH ERROR] ${e.message}\n${e.stack}\n`),
-      )
-      .finally(() => inFlightDispatch.delete(taskId));
+    backgroundJobs.enqueue({ kind: "dispatch", taskId });
   }
 
   async function dispatchTask(task) {
@@ -1450,6 +1447,150 @@ export default function setup(api) {
     }
 
     // Status already set to 'dispatched' inside dispatchAcp/dispatchSubagent
+  }
+
+  async function resumeTask(taskId) {
+    const row = getTask(taskId);
+    if (!row) {
+      return;
+    }
+    const task = rowToTask(row);
+    if (task.status !== "error") {
+      return;
+    }
+    if (!task.sessionKey) {
+      throw new Error("Task has no session to resume");
+    }
+    if (!api.runtime?.acp?.spawn) {
+      throw new Error("acp.spawn not available");
+    }
+
+    try {
+      const resolvedCwd = task.cwd || resolveCwd(task);
+      const accountId = resolveAccountId(task.agent);
+      const channelId = resolveChannel(task);
+
+      const now = Date.now();
+      db.prepare(
+        "UPDATE tasks SET status = 'in_progress', error = NULL, updated_at = @updated_at WHERE id = @id",
+      ).run({ id: task.id, updated_at: now });
+      recordTaskEvent(task.id, "task.resume_triggered", {
+        sessionKey: task.sessionKey,
+        threadId: task.threadId || null,
+      });
+      onTaskChanged(task.id);
+
+      if (task.threadId) {
+        await postToThread(
+          task.threadId,
+          "🔄 **Resuming session** — picking up where we left off...",
+          "sumodeus",
+        ).catch(() => {});
+      }
+
+      const result = await api.runtime.acp.spawn(
+        {
+          task: "Continue where you left off. Your previous session was interrupted. Check git log and git status to see your progress, then complete the remaining work.",
+          label: `resume-${task.id.slice(0, 8)}-${Date.now()}`,
+          agentId: "opencode",
+          cwd: resolvedCwd,
+          resumeSessionId: task.sessionKey,
+          thread: false,
+        },
+        {
+          agentChannel: "discord",
+          agentAccountId: accountId,
+          agentTo: buildDiscordAgentTarget(task.threadId, channelId),
+        },
+      );
+
+      if (result?.status !== "accepted") {
+        throw new Error(result?.error || `resume spawn failed with status=${result?.status || "unknown"}`);
+      }
+
+      const childRunId = typeof result?.runId === "string" ? result.runId.trim() : "";
+      const childSessionKey = result?.childSessionKey || task.sessionKey;
+      if (!childRunId) {
+        throw new Error("resume spawn did not return runId");
+      }
+
+      process.stderr.write(
+        `[RESUME] spawn accepted for ${task.id}, runId=${childRunId}, session=${childSessionKey}\n`,
+      );
+
+      db.prepare(
+        "UPDATE tasks SET session_key = @sessionKey, run_id = @runId, updated_at = @updated_at WHERE id = @id",
+      ).run({ id: task.id, sessionKey: childSessionKey, runId: childRunId, updated_at: Date.now() });
+
+      const wait = await api.runtime.subagent.waitForRun({
+        runId: childRunId,
+        timeoutMs: resolveTaskTimeoutMs(task),
+      });
+      const waitStatus = wait?.status || "timeout";
+      if (waitStatus !== "ok") {
+        const waitError = wait?.error ? `: ${wait.error}` : "";
+        throw new Error(`resumed run failed (${waitStatus})${waitError}`);
+      }
+
+      let text = "";
+      if (api.runtime?.subagent?.getSessionMessages) {
+        const msgs = await api.runtime.subagent.getSessionMessages({
+          sessionKey: childSessionKey,
+          limit: 200,
+        });
+        text = extractOutputFromMessages(msgs?.messages || []);
+      }
+
+      const reviewNow = Date.now();
+      db.prepare(
+        "UPDATE tasks SET status = 'review', output = @output, completed_at = NULL, updated_at = @updated_at WHERE id = @id",
+      ).run({ id: task.id, output: text.slice(0, 10000), updated_at: reviewNow });
+
+      if (task.threadId) {
+        const summary = text.slice(0, 1500);
+        await postToThread(
+          task.threadId,
+          `✅ **Resume completed**\n\n${summary}${text.length > 1500 ? "..." : ""}`,
+        );
+      }
+      onTaskChanged(task.id);
+
+      const freshTask = rowToTask(getTask(task.id));
+      if (resolveQaRequired(freshTask || task)) {
+        await runMaatReviewLoop(task.id);
+      } else {
+        const doneNow = Date.now();
+        db.prepare(
+          "UPDATE tasks SET status = 'done', completed_at = @completed_at, updated_at = @updated_at WHERE id = @id",
+        ).run({ id: task.id, completed_at: doneNow, updated_at: doneNow });
+        notifyMainSession(freshTask || task, "done");
+        onTaskChanged(task.id);
+        triggerDependents(task.id);
+      }
+    } catch (e) {
+      process.stderr.write(`[RESUME] failed for ${task.id}: ${e.message}\n`);
+      const now = Date.now();
+      db.prepare(
+        "UPDATE tasks SET status = 'error', error = @error, retries = retries + 1, updated_at = @updated_at WHERE id = @id",
+      ).run({ id: task.id, error: `Resume failed: ${e.message}`, updated_at: now });
+      onTaskChanged(task.id);
+    }
+  }
+
+  async function runQueuedQaReview(taskId) {
+    try {
+      await runMaatReviewLoop(taskId);
+    } catch (e) {
+      const now = Date.now();
+      db.prepare(
+        "UPDATE tasks SET status = 'error', error = @error, retries = retries + 1, updated_at = @updated_at WHERE id = @id",
+      ).run({
+        id: taskId,
+        error: `Manual QA review failed: ${e.message}`,
+        updated_at: now,
+      });
+      onTaskChanged(taskId);
+    }
   }
 
   // ---- Session event injection ----
@@ -1611,9 +1752,9 @@ export default function setup(api) {
     );
 
     if (!api.runtime?.acp?.spawn) {
-      throw new Error(
-        "api.runtime.acp.spawn not available — OpenClaw fork required",
-      );
+        throw new Error(
+          "api.runtime.acp.spawn not available — OpenClaw build with ACP plugin runtime required",
+        );
     }
 
     const resolvedCwd = cwd || defaultCwd;
@@ -1624,6 +1765,12 @@ export default function setup(api) {
       typeof task.threadId === "string" && task.threadId.trim()
         ? task.threadId.trim()
         : null;
+    const dispatchThreadId = existingThreadId || (await createDiscordThread(task));
+    if (!dispatchThreadId) {
+      throw new Error(
+        `failed to create or resolve a Discord thread for task ${task.id}`,
+      );
+    }
 
     function bindSessionToThread(threadId, targetSessionKey, label) {
       if (!threadId || !targetSessionKey) return false;
@@ -1676,7 +1823,7 @@ export default function setup(api) {
         return true;
       } catch (error) {
         process.stderr.write(
-          `[DISPATCH.ACP] Failed to bind existing thread ${threadId}: ${error.message}\n`,
+          `[DISPATCH.ACP] Failed to bind Discord thread ${threadId}: ${error.message}\n`,
         );
         return false;
       }
@@ -1691,20 +1838,23 @@ export default function setup(api) {
 
     let childSessionKey = sessionKey;
     let childRunId = "";
+    let boundThreadId = dispatchThreadId;
     try {
-      // Single call — handles session creation, thread creation, binding, and delivery
+      const label = `${task.title.slice(0, 32)}-${task.id.slice(0, 8)}-${Date.now()}`;
       const result = await api.runtime.acp.spawn(
         {
           task: prompt,
-          label: `${task.title.slice(0, 32)}-${task.id.slice(0, 8)}-${Date.now()}`,
+          label,
           agentId: "opencode",
           cwd: resolvedCwd,
-          thread: !existingThreadId,
+          // We always target a concrete Discord thread from the plugin so we
+          // don't depend on OpenClaw's fresh child-thread binding path.
+          thread: false,
         },
         {
           agentChannel: "discord",
           agentAccountId: accountId,
-          agentTo: channelId ? `channel:${channelId}` : undefined,
+          agentTo: buildDiscordAgentTarget(dispatchThreadId, channelId),
         },
       );
 
@@ -1725,21 +1875,20 @@ export default function setup(api) {
         `[DISPATCH.ACP] spawn accepted for ${task.id}, runId=${childRunId}, session=${childSessionKey}\n`,
       );
 
-      let boundThreadId = existingThreadId;
-      if (existingThreadId) {
-        const label = `${task.title.slice(0, 32)}-${task.id.slice(0, 8)}-${Date.now()}`;
-        const rebound = bindSessionToThread(
-          existingThreadId,
-          childSessionKey,
-          label,
+      const rebound = bindSessionToThread(
+        dispatchThreadId,
+        childSessionKey,
+        label,
+      );
+      if (!rebound) {
+        throw new Error(
+          `failed to bind Discord thread ${dispatchThreadId} to session ${childSessionKey}`,
         );
-        if (!rebound) {
-          throw new Error(
-            `failed to bind existing Discord thread ${existingThreadId} to session ${childSessionKey}`,
-          );
-        }
+      }
+
+      if (existingThreadId) {
         await postToThread(
-          existingThreadId,
+          dispatchThreadId,
           buildExistingThreadDispatchMessage(task, resolvedCwd),
           accountId,
         ).catch((error) => {
@@ -1748,39 +1897,10 @@ export default function setup(api) {
           );
         });
         recordTaskEvent(task.id, "thread.reused.notified", {
-          threadId: existingThreadId,
+          threadId: dispatchThreadId,
           sessionKey: childSessionKey,
           runId: childRunId,
         });
-      } else {
-        // Look up the thread ID from the bindings file using childSessionKey.
-        // spawnAcpDirect returns immediately after dispatching — give the binding
-        // service a moment to flush the new entry to disk.
-        try {
-          const bindingsPath = `${process.env.HOME}/.openclaw/discord/thread-bindings.json`;
-          const { readFileSync } = await import("node:fs");
-          // Retry up to 5x with 500ms gap (binding flush may be async)
-          for (let attempt = 0; attempt < 5; attempt++) {
-            await new Promise((r) => setTimeout(r, 500));
-            try {
-              const bindingsData = JSON.parse(readFileSync(bindingsPath, "utf8"));
-              const bindings = bindingsData.bindings || {};
-              for (const binding of Object.values(bindings)) {
-                if (binding.targetSessionKey === childSessionKey) {
-                  boundThreadId = String(binding.threadId);
-                  break;
-                }
-              }
-              if (boundThreadId) break;
-            } catch (_) {
-              /* file not ready yet */
-            }
-          }
-        } catch (e) {
-          process.stderr.write(
-            `[DISPATCH.ACP] Could not read thread binding: ${e.message}\n`,
-          );
-        }
       }
 
       db.prepare(
@@ -1792,6 +1912,8 @@ export default function setup(api) {
         threadId: boundThreadId,
         updated_at: Date.now(),
       });
+      task.threadId = boundThreadId;
+      task.sessionKey = childSessionKey;
 
       if (boundThreadId) {
         process.stderr.write(
@@ -1986,11 +2108,7 @@ export default function setup(api) {
           ).run(Date.now(), candidate.id);
           const readyTask = { ...candidate, status: "ready" };
           onTaskChanged(candidate.id);
-          dispatchTask(readyTask).catch((e) =>
-            process.stderr.write(
-              `[DAG] Dispatch failed for ${candidate.id}: ${e.message}\n`,
-            ),
-          );
+          backgroundJobs.enqueue({ kind: "dispatch", taskId: readyTask.id });
         }
       }
     } catch (e) {
@@ -2142,8 +2260,31 @@ export default function setup(api) {
   }
 
   // Prepared statements
-  // In-flight guard — prevents double-dispatch of the same task
-  const inFlightDispatch = new Set();
+  const backgroundJobs = createBackgroundJobQueue({
+    // Keep background work on a startup-owned worker so plugin-auth HTTP routes
+    // do not leak their empty runtime scopes into api.runtime.subagent helpers.
+    runJob: async (job) => {
+      switch (job.kind) {
+        case "dispatch": {
+          const row = getTask(job.taskId);
+          if (!row || row.status !== "ready") return;
+          await dispatchTask(rowToTask(row));
+          return;
+        }
+        case "resume": {
+          await resumeTask(job.taskId);
+          return;
+        }
+        case "qa": {
+          await runQueuedQaReview(job.taskId);
+          return;
+        }
+        default:
+          process.stderr.write(`[QUEUE] unknown job kind ${job.kind} for ${job.taskId}\n`);
+      }
+    },
+    log: (message) => process.stderr.write(`${message}\n`),
+  });
 
   const stmts = {
     insert: db.prepare(`
@@ -2632,6 +2773,10 @@ Be specific — reference actual commit messages and features. Don't be vague.`;
 
   runScheduleTick();
   setInterval(runScheduleTick, 60_000);
+  const backgroundJobWorker = setInterval(() => {
+    void backgroundJobs.drainOnce();
+  }, 100);
+  backgroundJobWorker.unref?.();
   setInterval(() => {
     runProjectSummaryTick().catch((error) => {
       process.stderr.write(`[PROJECT_SUMMARY] Tick failed: ${error.message}\n`);
@@ -2863,7 +3008,7 @@ Be specific — reference actual commit messages and features. Don't be vague.`;
     if (body.status && body.status !== existing.status) {
       // If manually reset to ready, clear any stale in-flight lock
       if (body.status === "ready") {
-        inFlightDispatch.delete(id);
+        backgroundJobs.clear({ kind: "dispatch", taskId: id });
       }
       onTaskChanged(id);
     }
@@ -3459,29 +3604,14 @@ Be specific — reference actual commit messages and features. Don't be vague.`;
           return true;
         }
 
-        // Idempotency guard — prevent double-dispatch
-        if (inFlightDispatch.has(taskId)) {
-          sendJson(res, { skipped: true, reason: "already_dispatching" });
-          return true;
-        }
-        inFlightDispatch.add(taskId);
-
-        const task = rowToTask(row);
-
-        // Run dispatch BEFORE sending response — keeps handler context alive for ensureSession
-        try {
-          await dispatchTask(task);
-        } catch (e) {
-          process.stderr.write(`[DISPATCH ERROR] ${e.message}\n${e.stack}\n`);
-        } finally {
-          inFlightDispatch.delete(taskId);
-        }
+        const queued = backgroundJobs.enqueue({ kind: "dispatch", taskId });
 
         sendJson(res, {
-          dispatched: true,
+          queued,
           id: taskId,
           status: rowToTask(getTask(taskId)).status,
-        });
+          ...(queued ? {} : { reason: "already_dispatching" }),
+        }, queued ? 202 : 200);
         return true;
       } catch (e) {
         sendError(res, 500, e.message);
@@ -3901,9 +4031,7 @@ Be specific — reference actual commit messages and features. Don't be vague.`;
             const result = await api.runtime.acp.prompt({
               sessionKey: task.session_key,
               text: message,
-              channel: "discord",
-              accountId,
-              threadId: task.thread_id || undefined,
+              ...buildDiscordAcpPromptContext(task.thread_id, accountId),
             });
             recordTaskEvent(id, "task.prompt", {
               runId: result.runId || null,
@@ -3974,121 +4102,17 @@ Be specific — reference actual commit messages and features. Don't be vague.`;
             return true;
           }
 
-          // Respond immediately, resume in background
-          res.writeHead(202, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ ok: true, message: "Resume triggered", taskId: task.id, sessionKey: task.sessionKey }));
-
-          // Background: spawn with resumeSessionId
-          (async () => {
-            try {
-              const resolvedCwd = task.cwd || resolveCwd(task);
-              const accountId = resolveAccountId(task.agent);
-              const channelId = resolveChannel(task);
-
-              // Mark as in_progress
-              const now = Date.now();
-              db.prepare(
-                "UPDATE tasks SET status = 'in_progress', error = NULL, updated_at = @updated_at WHERE id = @id",
-              ).run({ id: task.id, updated_at: now });
-              recordTaskEvent(task.id, "task.resume_triggered", {
-                sessionKey: task.sessionKey,
-                threadId: task.threadId || null,
-              });
-              onTaskChanged(task.id);
-
-              if (task.threadId) {
-                await postToThread(task.threadId, "🔄 **Resuming session** — picking up where we left off...", "sumodeus").catch(() => {});
-              }
-
-              const result = await api.runtime.acp.spawn(
-                {
-                  task: "Continue where you left off. Your previous session was interrupted. Check git log and git status to see your progress, then complete the remaining work.",
-                  label: `resume-${task.id.slice(0, 8)}-${Date.now()}`,
-                  agentId: "opencode",
-                  cwd: resolvedCwd,
-                  resumeSessionId: task.sessionKey,
-                  thread: false, // reuse existing thread
-                },
-                {
-                  agentChannel: "discord",
-                  agentAccountId: accountId,
-                  agentTo: channelId ? `channel:${channelId}` : undefined,
-                },
-              );
-
-              if (result?.status !== "accepted") {
-                throw new Error(result?.error || `resume spawn failed with status=${result?.status || "unknown"}`);
-              }
-
-              const childRunId = typeof result?.runId === "string" ? result.runId.trim() : "";
-              const childSessionKey = result?.childSessionKey || task.sessionKey;
-              if (!childRunId) {
-                throw new Error("resume spawn did not return runId");
-              }
-
-              process.stderr.write(
-                `[RESUME] spawn accepted for ${task.id}, runId=${childRunId}, session=${childSessionKey}\n`,
-              );
-
-              db.prepare(
-                "UPDATE tasks SET session_key = @sessionKey, run_id = @runId, updated_at = @updated_at WHERE id = @id",
-              ).run({ id: task.id, sessionKey: childSessionKey, runId: childRunId, updated_at: Date.now() });
-
-              // Wait for completion
-              const wait = await api.runtime.subagent.waitForRun({
-                runId: childRunId,
-                timeoutMs: resolveTaskTimeoutMs(task),
-              });
-              const waitStatus = wait?.status || "timeout";
-              if (waitStatus !== "ok") {
-                const waitError = wait?.error ? `: ${wait.error}` : "";
-                throw new Error(`resumed run failed (${waitStatus})${waitError}`);
-              }
-
-              // Get output
-              let text = "";
-              if (api.runtime?.subagent?.getSessionMessages) {
-                const msgs = await api.runtime.subagent.getSessionMessages({
-                  sessionKey: childSessionKey,
-                  limit: 200,
-                });
-                text = extractOutputFromMessages(msgs?.messages || []);
-              }
-
-              // Mark review
-              const reviewNow = Date.now();
-              db.prepare(
-                "UPDATE tasks SET status = 'review', output = @output, completed_at = NULL, updated_at = @updated_at WHERE id = @id",
-              ).run({ id: task.id, output: text.slice(0, 10000), updated_at: reviewNow });
-
-              if (task.threadId) {
-                const summary = text.slice(0, 1500);
-                await postToThread(task.threadId, `✅ **Resume completed**\n\n${summary}${text.length > 1500 ? "..." : ""}`);
-              }
-              onTaskChanged(task.id);
-
-              // Run QA if required
-              const freshTask = rowToTask(getTask(task.id));
-              if (resolveQaRequired(freshTask || task)) {
-                await runMaatReviewLoop(task.id);
-              } else {
-                const doneNow = Date.now();
-                db.prepare(
-                  "UPDATE tasks SET status = 'done', completed_at = @completed_at, updated_at = @updated_at WHERE id = @id",
-                ).run({ id: task.id, completed_at: doneNow, updated_at: doneNow });
-                notifyMainSession(freshTask || task, "done");
-                onTaskChanged(task.id);
-                triggerDependents(task.id);
-              }
-            } catch (e) {
-              process.stderr.write(`[RESUME] failed for ${task.id}: ${e.message}\n`);
-              const now = Date.now();
-              db.prepare(
-                "UPDATE tasks SET status = 'error', error = @error, retries = retries + 1, updated_at = @updated_at WHERE id = @id",
-              ).run({ id: task.id, error: `Resume failed: ${e.message}`, updated_at: now });
-              onTaskChanged(task.id);
-            }
-          })();
+          const queued = backgroundJobs.enqueue({ kind: "resume", taskId: task.id });
+          res.writeHead(queued ? 202 : 200, { "Content-Type": "application/json" });
+          res.end(
+            JSON.stringify({
+              ok: true,
+              queued,
+              message: queued ? "Resume queued" : "Resume already queued",
+              taskId: task.id,
+              sessionKey: task.sessionKey,
+            }),
+          );
           return true;
         }
 
@@ -4120,21 +4144,16 @@ Be specific — reference actual commit messages and features. Don't be vague.`;
             ).run({ id: task.id, updated_at: now });
             onTaskChanged(task.id);
           }
-          // Respond immediately, run QA in background
-          res.writeHead(202, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ ok: true, message: "QA review triggered", taskId: task.id }));
-          // Fire QA loop in background
-          runMaatReviewLoop(task.id).catch((e) => {
-            const now = Date.now();
-            db.prepare(
-              "UPDATE tasks SET status = 'error', error = @error, retries = retries + 1, updated_at = @updated_at WHERE id = @id",
-            ).run({
-              id: task.id,
-              error: `Manual QA review failed: ${e.message}`,
-              updated_at: now,
-            });
-            onTaskChanged(task.id);
-          });
+          const queued = backgroundJobs.enqueue({ kind: "qa", taskId: task.id });
+          res.writeHead(queued ? 202 : 200, { "Content-Type": "application/json" });
+          res.end(
+            JSON.stringify({
+              ok: true,
+              queued,
+              message: queued ? "QA review queued" : "QA review already queued",
+              taskId: task.id,
+            }),
+          );
           return true;
         }
 
