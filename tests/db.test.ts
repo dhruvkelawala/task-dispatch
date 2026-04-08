@@ -26,7 +26,7 @@ describe("db", () => {
       id: "t1",
       title: "Title",
       description: "Desc",
-      agent: "zeus",
+      agent: "builder",
       runtime: "acp",
       project_id: "p1",
       channel_id: "c1",
@@ -60,7 +60,7 @@ describe("db", () => {
     const task = rowToTask({
       id: "t1",
       title: "Title",
-      agent: "zeus",
+      agent: "builder",
       depends_on: "[]",
       status: "ready",
       manual_complete: 0,

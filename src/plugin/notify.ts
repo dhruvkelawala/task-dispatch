@@ -3,18 +3,7 @@ import { createRequire } from "node:module";
 const require = createRequire(import.meta.url);
 
 export function resolveAccountId(agent: string): string {
-  const map: Record<string, string> = {
-    zeus: "zeus",
-    atum: "atum",
-    ibis: "ibis",
-    athena: "athena",
-    hathor: "hathor",
-    sphinx: "sphinx",
-    osiris: "osiris",
-    maat: "maat",
-    sumodeus: "sumodeus",
-  };
-  return map[agent] || "sumodeus";
+  return agent || "default";
 }
 
 export function resolveBotToken(accountId: string): string | null {

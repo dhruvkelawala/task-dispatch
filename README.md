@@ -8,88 +8,84 @@
 [![Discord](https://img.shields.io/badge/chat-Discord-5865F2?logo=discord&logoColor=white)](https://discord.com)
 [![ACP](https://img.shields.io/badge/runtime-ACP-22c55e)](#how-it-works)
 
-**A dispatch-native task router for coding agents.**
+**Dispatch tasks, not chaos.**
 
-Create tasks, route them to agents, bind them to Discord threads, track lifecycle, retry safely, inspect logs/timelines, and keep the human in the loop.
+`task-dispatch` is a plugin + CLI for sending coding work to the right agent, in the right project, in the right Discord thread, with enough state and history that you can actually debug what happened later.
 
 </div>
 
 ---
 
-## What this is
+## Why this exists
 
-`task-dispatch` is two things:
+Spawning coding agents is easy.
 
-1. a **plugin/runtime layer** that stores task state, dispatches ACP runs, binds sessions to Discord threads, manages QA/review flow, and exposes HTTP endpoints
-2. a **CLI** (`dispatch`) that makes the system pleasant to operate from terminal or agents
+Spawning them into the **correct project**, with the **correct cwd**, with **thread continuity**, with **retry/resume support**, and with a **human-usable audit trail** is where the pain starts.
 
-It is built for workflows like:
-- “send this to Zeus in the right project channel”
-- “reuse the same thread for the follow-up task”
-- “show me what failed and what to do next”
-- “retry this task without QA”
-- “show me the event timeline for this task”
+`task-dispatch` is the missing orchestration layer.
+
+It is especially handy for workflows like:
+
+- a main agent or operator working from Telegram
+- coding agents like OpenCode, Codex, or Claude Code doing the actual implementation work
+- Discord threads acting as the visible work surface
+- ACP sessions providing the runtime behind the scenes
+
+In short: this repo exists because “just spawn an agent” turns into “where did that agent go?” way too fast.
 
 ---
 
-## Why it exists
+## What it is
 
-Vanilla agent spawning is too easy to fumble:
-- wrong project
-- wrong cwd
-- wrong Discord channel
-- no thread continuity
-- no operator-friendly status surface
-- no real history/logs/timelines
+`task-dispatch` is two things:
 
-`task-dispatch` adds the missing orchestration layer.
+1. a **plugin/runtime layer** that stores task state, dispatches ACP runs, manages thread binding, handles follow-up prompts, supports retry/resume/QA flows, and exposes HTTP endpoints
+2. a **CLI** (`dispatch`) that makes the whole thing pleasant to operate from a terminal, by a human, or by another agent
 
 ---
 
 ## Highlights
 
-### Dispatch-native workflow
-- create tasks with project-aware routing
-- reuse or create Discord threads automatically
-- bind ACP sessions to the right thread
-- inspect task/session/thread state from one CLI
+### 🧭 Project-aware routing
+- route tasks to the right project/channel/cwd
+- infer project from cwd when possible
+- fuzzy-match project names when the operator gets close but not quite right
 
-### Better operator ergonomics
-- `dispatch projects`
-- `dispatch doctor`
-- `dispatch inspect`
-- `dispatch explain`
-- `dispatch watch`
-- `dispatch recent-errors`
-- `dispatch active`
+### 🧵 Discord-thread-first workflows
+- create a new thread for a task
+- reuse an existing thread when you want continuity
+- keep task → session → thread relationships tied together
+- prompt the same task session later without losing context
 
-### Safe reruns and follow-ups
-- `dispatch retry <id>`
-- `dispatch create --from <id>`
-- `dispatch create --interactive`
-- cwd → project inference
-- fuzzy project suggestions
-- thread reuse options
-
-### Rich task visibility
-- task history
+### 🧱 Durable task state
+- SQLite-backed task records
 - per-task event log
-- timeline view
-- plain-English failure explanations
-- live board for active tasks + recent errors
+- timeline view for debugging
+- readable status + failure summaries
 
-### QA / review support
-- optional QA flow
-- reviewer/runtime model pinning
-- retry with or without QA
-- review lifecycle surfaced in logs/timeline
+### 🔁 Safe retries and follow-ups
+- fresh reruns
+- same-session resume flows
+- follow-up prompts into existing ACP sessions
+- optional QA/review loops
 
-### Tested
-- CLI helper tests
-- dry-run process tests
-- task event schema checks
-- event-log ordering tests
-- delete cleanup tests
+### 🧑‍💻 Friendly to both humans and agents
+- readable CLI output
+- dry-run paths
+- inspect/explain/logs/timeline surfaces
+- automation-friendly command structure
+
+---
+
+## A quick vibe check
+
+If you’ve ever said any of these, this repo is for you:
+
+- “Wait, why did the builder agent land in the wrong channel?”
+- “Can we reuse the same thread instead of creating six more?”
+- “What failed?”
+- “Can I retry that without losing the trail?”
+- “Can the main agent dispatch coding work without me hand-holding every step?”
 
 ---
 
@@ -99,13 +95,13 @@ Vanilla agent spawning is too easy to fumble:
 dispatch projects
 dispatch doctor
 
-dispatch create -t "Fix login bug" -p visaroy -c bug -d "Fix redirect loop"
+dispatch create -t "Fix login bug" -p web-app -c bug -d "Fix redirect loop"
 dispatch create --from abc12345 -t "Follow-up task" --reuse-thread --dry-run
 dispatch create --interactive
 
-dispatch active --project go-hevy
-dispatch watch --project go-hevy
-dispatch recent-errors --project go-hevy
+dispatch active --project web-app
+dispatch watch --project web-app
+dispatch recent-errors --project web-app
 
 dispatch inspect abc12345
 dispatch explain abc12345
@@ -113,111 +109,87 @@ dispatch logs abc12345
 dispatch timeline abc12345
 
 dispatch retry abc12345 --no-qa --reuse-thread
-dispatch prompt abc12345 "Add better error handling"
+dispatch prompt abc12345 "Keep going, but fix the tests first"
+dispatch resume abc12345
 ```
 
-### Major CLI commands
+### Major commands
 
-| Command | Purpose |
+| Command | What it does |
 |---|---|
 | `dispatch create` | Create and route a task |
 | `dispatch create --from <id>` | Seed a new task from an old one |
 | `dispatch create --interactive` | Guided task creation |
-| `dispatch list` | Filtered task list |
-| `dispatch active` | Live active tasks |
-| `dispatch watch` | Live board: active + recent errors |
-| `dispatch history` | Done / error / blocked history |
-| `dispatch recent-errors` | Recent failures with next steps |
+| `dispatch list` | Show tasks with filters |
+| `dispatch active` | Show active tasks |
+| `dispatch watch` | Live board for active tasks + recent errors |
+| `dispatch history` | Browse completed/failed work |
 | `dispatch inspect` | Human-friendly task summary |
 | `dispatch explain` | Plain-English diagnosis |
-| `dispatch logs` | Recent event log entries |
-| `dispatch timeline` | Full event timeline |
-| `dispatch retry` | Fresh rerun from a prior task |
-| `dispatch prompt` | Follow-up into an existing session/thread |
-| `dispatch doctor` | Config/cwd/plugin health check |
+| `dispatch logs` | Recent task events |
+| `dispatch timeline` | Full lifecycle timeline |
+| `dispatch retry` | Fresh rerun from an earlier task |
+| `dispatch resume` | Continue the interrupted session |
+| `dispatch prompt` | Continue the existing session/thread |
+| `dispatch doctor` | Check config/cwd/plugin health |
+
+---
+
+## Configuration
+
+Projects, agents, channels, and notifications are all config-driven.
+
+Start from the example file:
+
+```bash
+cp task-dispatch.config.example.json ~/.openclaw/data/task-dispatch-config.json
+```
+
+You will usually customize:
+
+- `projects.<id>.cwd` — working directory
+- `projects.<id>.channel` — Discord parent channel for new threads
+- `projects.<id>.defaultAgent` — default agent for that project
+- `projects.<id>.aliases` — optional short names humans/agents can use in the CLI
+- `agents.<id>.runtime` — `acp` or `subagent`
+- `agents.<id>.accountId` — Discord account to post/bind as
+- `agents.<id>.channel` — fallback channel when a task is not project-scoped
+- `channels.discord.guildId` or `channels.discord.threadUrlTemplate` — thread URL generation
+- `notifications.operatorSessionKey` — optional operator notification session
+
+There are no required hardcoded project names, personal Discord IDs, or personal routes in the repo anymore.
 
 ---
 
 ## How it works
 
 ```text
-operator / agent
-      ↓
-  dispatch CLI
-      ↓
+operator / main agent
+        ↓
+   dispatch CLI
+        ↓
  task-dispatch plugin
-      ↓
- SQLite task state + task events
-      ↓
- ACP runtime spawn / resume / prompt
-      ↓
- Discord thread binding + updates
+        ↓
+ SQLite task state + event log
+        ↓
+ ACP spawn / prompt / resume flows
+        ↓
+ Discord threads + session binding
 ```
 
 ### Core ideas
 
 - a **task** is the durable unit of work
-- a **thread** is the human-visible conversation surface in Discord
-- a **session** is the underlying ACP runtime context
-- the plugin keeps those linked so follow-ups and retries stay coherent
-
----
-
-## Discord thread model
-
-This repo is heavily optimized around Discord-thread-first coding workflows.
-
-### Supports
-- creating a fresh thread for a new task
-- reusing an existing thread
-- binding resumed sessions back into the thread
-- prompting an existing task session from the CLI
-- printing/opening thread URLs from CLI
-- logging thread-related events in task timelines
-
-### Why this matters
-Without this layer, agents easily post into the wrong project channel, lose thread continuity, or force operators to manually reconstruct context.
-
----
-
-## Event log & timeline
-
-Every important transition can be surfaced as task events, including things like:
-- task creation
-- status changes
-- prompts
-- thread creation / thread reuse notification
-- QA start / QA verdict
-- resume triggers
-
-Use:
-
-```bash
-dispatch logs <task-id>
-dispatch timeline <task-id>
-```
-
-This is the backbone for debugging weird routing, retry, and review behavior.
-
----
-
-## Project-aware routing
-
-Projects are loaded from live config, not stale hardcoded maps.
-
-That enables:
-- `dispatch projects`
-- better wrong-project errors
-- fuzzy suggestions (`goheavy` → `go-hevy`)
-- cwd → project inference
-- correct channel/cwd defaults during create
+- a **thread** is the human-visible conversation surface
+- a **session** is the ACP runtime context underneath
+- `task-dispatch` keeps those tied together so retries, prompts, and resumes stay coherent
 
 ---
 
 ## Retry, resume, and follow-up flows
 
 ### Retry
-Use when you want a **fresh** rerun:
+Use retry when you want a **fresh** rerun:
 
 ```bash
 dispatch retry <task-id>
@@ -226,14 +198,14 @@ dispatch retry <task-id> --reuse-thread
 ```
 
 ### Resume
-Use when you want to continue the **same interrupted session**:
+Use resume when you want to continue the **same interrupted session**:
 
 ```bash
 dispatch resume <task-id>
 ```
 
 ### Prompt
-Use when the task/session is still alive and you want to continue in-thread:
+Use prompt when the session is still alive and you want to continue in-thread:
 
 ```bash
 dispatch prompt <task-id> "Keep going, but fix the tests first"
@@ -241,31 +213,34 @@ dispatch prompt <task-id> "Keep going, but fix the tests first"
 
 ---
 
-## Human + AI operator friendly
+## Event log and timeline
 
-This tool is designed to work well for both:
+Every meaningful task transition can be recorded as an event, including:
 
-### Humans
-- readable status summaries
-- thread URLs
-- live board
-- interactive create flow
-- safer retries
+- task creation
+- dispatch start
+- thread creation or thread reuse
+- prompts
+- QA start / verdict
+- resume triggers
+- failure transitions
 
-### Agents (OpenClaw / Codex / Claude Code / etc.)
-- deterministic CLI surface
-- dry-run path for safe planning
-- JSON-capable backend
-- strong project/cwd guardrails
-- event/timeline introspection for debugging
+Useful commands:
 
-In other words: it’s not just an internal plugin — it’s an **operator interface**.
+```bash
+dispatch logs <task-id>
+dispatch timeline <task-id>
+dispatch explain <task-id>
+```
+
+This is one of the biggest quality-of-life wins in the repo: when something weird happens, you can usually answer **what happened**, **when**, and **why** without archaeology.
 
 ---
 
 ## HTTP API
 
 Base:
+
 ```text
 http://localhost:18789/api
 ```
@@ -276,13 +251,13 @@ Examples:
 # list tasks
 curl http://localhost:18789/api/tasks
 
-# create task
+# create a task
 curl -X POST http://localhost:18789/api/tasks \
   -H "Content-Type: application/json" \
   -H "X-Api-Key: ..." \
-  -d '{"title":"Fix bug","agent":"zeus","projectId":"visaroy"}'
+  -d '{"title":"Fix bug","agent":"builder","projectId":"web-app"}'
 
-# task event log
+# fetch task events
 curl http://localhost:18789/api/tasks/<id>/events
 ```
 
@@ -291,21 +266,25 @@ curl http://localhost:18789/api/tasks/<id>/events
 ## Development
 
 ### Build
+
 ```bash
 bun run build
 ```
 
 ### Test
+
 ```bash
-bun test tests/
+bun run test
 ```
 
 ### Typecheck
+
 ```bash
 bun run typecheck
 ```
 
-### Install CLI locally
+### Install the CLI locally
+
 ```bash
 bun run build:cli
 bun run install:cli
@@ -318,7 +297,7 @@ bun run install:cli
 ```text
 src/cli/           dispatch CLI
 src/plugin/        plugin runtime, HTTP routes, QA, notify, scheduler, DB
-tests/             bun test suite
+tests/             Bun test suite
 SKILL.md           OpenClaw skill usage guide
 ```
 
@@ -326,8 +305,9 @@ SKILL.md           OpenClaw skill usage guide
 
 ## Current strengths
 
-This repo is especially strong at:
-- dispatching coding tasks into the right place
+This repo is especially good at:
+
+- dispatching coding work into the right place
 - preserving thread continuity
 - making retries less painful
 - surfacing task state for humans and agents
@@ -338,14 +318,25 @@ This repo is especially strong at:
 ## Roadmap ideas
 
 Good next additions:
+
+- prettier watch/TUI mode
 - richer event taxonomy
-- prettier `watch` board / TUI mode
-- more interactive project selection UX
-- stronger route/integration tests around reused-thread dispatches
+- stronger route/integration tests
 - more backend error classification
+- better project selection UX
+
+---
+
+## Status
+
+This repo is now public, but it is still intentionally opinionated.
+
+It is built for real-world agent orchestration, not for looking like a generic “AI task manager” demo.
+
+That is a feature, not a bug.
 
 ---
 
 ## License
 
-Private/internal for now.
+No license has been added yet. Until that changes, treat the code as source-available for reading, not automatically licensed for reuse.

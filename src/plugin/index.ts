@@ -15,48 +15,13 @@ import {
 const require = createRequire(import.meta.url);
 const execFileAsync = promisify(execFile);
 
-const PROJECT_SEED_ROWS = [
-  {
-    id: "visaroy",
-    name: "Visaroy",
-    repo: "dhruvkelawala/visaroy",
-    priority: 1,
-    status: "shipping",
-    description: "Schengen visa prep assistant",
-    cwd: "~/.openclaw/workspace/visaroy/visaroy-app",
-    tags: '["ship", "personal"]',
-  },
-  {
-    id: "forayy",
-    name: "Forayy",
-    repo: null,
-    priority: 2,
-    status: "active",
-    description: "AI street-view missions app",
-    cwd: "~/.openclaw/workspace/forayy",
-    tags: '["side"]',
-  },
-  {
-    id: "beryl",
-    name: "BERYL",
-    repo: "argentlabs/poc-friendly-pancake",
-    priority: 4,
-    status: "exploring",
-    description: "Secure embedded wallet with delegated agent access",
-    cwd: null,
-    tags: '["work", "career"]',
-  },
-  {
-    id: "mc3",
-    name: "Mission Control v3",
-    repo: null,
-    priority: 3,
-    status: "active",
-    description: "Agent operations console",
-    cwd: "~/.openclaw/workspace/mission-control-v3",
-    tags: '["infra"]',
-  },
-];
+function titleFromProjectId(projectId) {
+  return String(projectId || "project")
+    .split(/[-_]/g)
+    .filter(Boolean)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(" ");
+}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -303,7 +268,15 @@ function formatDiscordThreadUrl(threadId) {
   if (typeof threadId !== "string" || !threadId.trim()) {
     return null;
   }
-  return `https://discord.com/channels/1475480367166128354/${threadId}`;
+  const template = CONFIG.channels?.discord?.threadUrlTemplate?.trim();
+  if (template) {
+    return template.replaceAll("{threadId}", threadId.trim());
+  }
+  const guildId = CONFIG.channels?.discord?.guildId?.trim();
+  if (guildId) {
+    return `https://discord.com/channels/${guildId}/${threadId.trim()}`;
+  }
+  return null;
 }
 
 function safeJsonParse(text) {
@@ -428,7 +401,7 @@ function initDb(dbPath) {
       id TEXT PRIMARY KEY,
       title TEXT NOT NULL,
       description TEXT,
-      agent TEXT NOT NULL DEFAULT 'zeus',
+      agent TEXT NOT NULL DEFAULT 'default',
       project_id TEXT,
       cwd TEXT,
       category TEXT,
@@ -746,33 +719,53 @@ function loadConfig() {
 }
 
 const CONFIG = loadConfig();
-const HOME = process.env.HOME || "/Users/sumo-deus";
+const HOME = process.env.HOME || "";
+
+const PROJECT_SEED_ROWS = Object.entries(CONFIG.projects || {}).map(([id, value], index) => ({
+  id,
+  name: value.name || titleFromProjectId(id),
+  repo: value.repo || null,
+  priority:
+    typeof value.priority === "number" && Number.isFinite(value.priority)
+      ? Math.max(1, Math.floor(value.priority))
+      : index + 1,
+  status: value.status || "active",
+  description: value.description || null,
+  cwd: value.cwd || null,
+  tags: Array.isArray(value.tags) ? JSON.stringify(value.tags) : null,
+}));
 
 // Build maps from config
 const PROJECT_CHANNELS = {};
 const PROJECT_CWD = {};
+const PROJECT_DEFAULT_AGENTS = {};
 if (CONFIG.projects) {
   for (const [key, val] of Object.entries(CONFIG.projects)) {
     if (val.channel) PROJECT_CHANNELS[key] = val.channel;
     if (val.cwd) PROJECT_CWD[key] = val.cwd;
+    if (val.defaultAgent) PROJECT_DEFAULT_AGENTS[key] = val.defaultAgent;
   }
 }
 
-const AGENT_FALLBACK_CHANNELS = {
-  zeus: "1475499310417182810",
-  atum: "1475499340574494740",
-  ibis: "1475499396169990276",
-  athena: "1475499360031739944",
-  hathor: "1475499468051976367",
-  sphinx: "1475499433373470823",
-};
-
+const AGENT_DEFAULT_CHANNELS = {};
 const AGENT_RUNTIME = {};
+const AGENT_ACCOUNT_IDS = {};
 if (CONFIG.agents) {
   for (const [key, val] of Object.entries(CONFIG.agents)) {
     if (val.runtime) AGENT_RUNTIME[key] = val.runtime;
+    if (val.channel) AGENT_DEFAULT_CHANNELS[key] = val.channel;
+    if (val.accountId) AGENT_ACCOUNT_IDS[key] = val.accountId;
   }
 }
+
+const DEFAULT_AGENT =
+  CONFIG.defaults?.defaultAgent || Object.keys(CONFIG.agents || {})[0] || "default";
+const DEFAULT_DISCORD_ACCOUNT_ID =
+  CONFIG.notifications?.defaultDiscordAccountId ||
+  AGENT_ACCOUNT_IDS[DEFAULT_AGENT] ||
+  DEFAULT_AGENT ||
+  "default";
+const OPERATOR_LABEL = CONFIG.notifications?.operatorLabel || "operator";
 
 const maxConcurrentSessions = CONFIG.defaults?.maxConcurrentSessions || 6;
 const defaultCwd = CONFIG.defaults?.defaultCwd || `${HOME}/.openclaw/workspace`;
@@ -801,8 +794,8 @@ function resolveChannel(task) {
   if (task.channelId) return task.channelId;
   if (task.projectId && PROJECT_CHANNELS[task.projectId])
     return PROJECT_CHANNELS[task.projectId];
-  if (task.agent && AGENT_FALLBACK_CHANNELS[task.agent])
-    return AGENT_FALLBACK_CHANNELS[task.agent];
+  if (task.agent && AGENT_DEFAULT_CHANNELS[task.agent])
+    return AGENT_DEFAULT_CHANNELS[task.agent];
   return null;
 }
 
@@ -911,7 +904,7 @@ export default function setup(api) {
 
   // ---- Discord Thread Creation ----
   async function createDiscordThread(task) {
-    if (!task.projectId && !AGENT_FALLBACK_CHANNELS[task.agent]) {
+    if (!task.projectId && !AGENT_DEFAULT_CHANNELS[task.agent]) {
       process.stderr.write(
         `[DISCORD] No channel for task ${task.id}, skipping thread\n`,
       );
@@ -919,19 +912,19 @@ export default function setup(api) {
     }
 
     const channelId =
-      PROJECT_CHANNELS[task.projectId] || AGENT_FALLBACK_CHANNELS[task.agent];
+      PROJECT_CHANNELS[task.projectId] || AGENT_DEFAULT_CHANNELS[task.agent];
     const shortId = task.id.slice(0, 8);
     const threadName = `${task.title.slice(0, 70)} — #${shortId}`;
 
-    // Get bot token for the assigned agent, fall back to sumodeus
+    // Get bot token for the assigned agent, fall back to configured default.
     const discordConfig = config.channels?.discord?.accounts || {};
+    const accountId = resolveAccountId(task.agent);
     const agentToken =
-      discordConfig[task.agent]?.token ||
-      discordConfig.sumodeus?.token ||
+      discordConfig[accountId]?.token ||
       discordConfig.default?.token;
     if (!agentToken) {
       process.stderr.write(
-        `[DISCORD] No bot token for ${task.agent}, skipping thread\n`,
+        `[DISCORD] No bot token for ${accountId}, skipping thread\n`,
       );
       return null;
     }
@@ -1011,11 +1004,10 @@ export default function setup(api) {
   async function postToThread(threadId, content, accountId) {
     if (!threadId) return;
 
-    // Use specified account token, fall back to sumodeus/default
+    // Use specified account token, fall back to configured default.
     const discordConfig = config.channels?.discord?.accounts || {};
     const token =
       (accountId && discordConfig[accountId]?.token) ||
-      discordConfig.sumodeus?.token ||
       discordConfig.default?.token;
     if (!token) return;
 
@@ -1151,15 +1143,6 @@ export default function setup(api) {
         : "# no commit hash available — check git log",
       "npx tsc --noEmit 2>&1 | tail -20",
       "pnpm build 2>&1 | tail -20",
-      ...(project === "forayy"
-        ? [
-            "# Maestro E2E tests (Forayy only)",
-            "xcrun simctl privacy 12671090-B3C0-4268-8F87-4D88F4EA18B6 grant location com.forayy.app",
-            "xcrun simctl privacy 12671090-B3C0-4268-8F87-4D88F4EA18B6 grant photos com.forayy.app",
-            "xcrun simctl location 12671090-B3C0-4268-8F87-4D88F4EA18B6 set 51.5074,-0.1278",
-            'PATH="$HOME/.maestro/bin:$PATH" maestro test apps/mobile/.maestro/flows/ 2>&1 | tail -30',
-          ]
-        : []),
       "```",
       "",
       "## Decision Criteria",
@@ -1484,7 +1467,7 @@ export default function setup(api) {
         await postToThread(
           task.threadId,
           "🔄 **Resuming session** — picking up where we left off...",
-          "sumodeus",
+          DEFAULT_DISCORD_ACCOUNT_ID,
         ).catch(() => {});
       }
 
@@ -1594,7 +1577,7 @@ export default function setup(api) {
   }
 
   // ---- Session event injection ----
-  // Inject task completion directly into SumoDeus's Telegram session via acp.prompt
+  // Inject task completion into a configured operator session via acp.prompt.
   async function notifyMainSession(task, status) {
     try {
       if (!api.runtime?.acp?.prompt) {
@@ -1604,12 +1587,11 @@ export default function setup(api) {
         return;
       }
 
-      const sessionKey =
-        CONFIG.notifications?.sumodeusSessionKey ||
-        "agent:main:telegram:direct:dhruv";
-      const threadLink = task.threadId
-        ? `https://discord.com/channels/1475480367166128354/${task.threadId}`
-        : "";
+      const sessionKey = CONFIG.notifications?.operatorSessionKey;
+      if (!sessionKey) {
+        return;
+      }
+      const threadLink = task.threadId ? formatDiscordThreadUrl(task.threadId) || "" : "";
       const commitHash = extractCommitHash(task.output || "");
 
       const icon =
@@ -1621,7 +1603,7 @@ export default function setup(api) {
               ? "⚠️"
               : "ℹ️";
       const text = [
-        `[Task Completion — RELAY TO DHRUV ON TELEGRAM]`,
+        `[Task Completion — relay to configured operator]`,
         ``,
         `${icon} Task ${status}: "${task.title}"`,
         `ID: ${task.id.slice(0, 8)}`,
@@ -1629,7 +1611,7 @@ export default function setup(api) {
         task.error ? `Error: ${task.error.slice(0, 200)}` : null,
         threadLink ? `Thread: ${threadLink}` : null,
         ``,
-        `ACTION REQUIRED: Use the message tool (action=send, channel=telegram) to notify Dhruv about this task completion. Summarize what was done and include the thread link if available. Do NOT just reply in the session — Dhruv won't see it unless you use the message tool.`,
+        `ACTION REQUIRED: Use the message tool to notify the configured ${OPERATOR_LABEL} about this task completion. Summarize what was done and include the thread link if available.`,
       ]
         .filter(Boolean)
         .join("\n");
@@ -1640,7 +1622,7 @@ export default function setup(api) {
       });
 
       process.stderr.write(
-        `[NOTIFY-SESSION] Prompted SumoDeus session (${status}) for task ${task.id.slice(0, 8)}\n`,
+        `[NOTIFY-SESSION] Prompted operator session (${status}) for task ${task.id.slice(0, 8)}\n`,
       );
     } catch (e) {
       process.stderr.write(`[NOTIFY-SESSION] Failed: ${e.message}\n`);
@@ -1649,6 +1631,10 @@ export default function setup(api) {
 
   async function notifyTelegram(task, status) {
     try {
+      const chatId = CONFIG.notifications?.telegramChatId;
+      if (!chatId) {
+        return;
+      }
       const { readFileSync } = require("node:fs");
       const cfg = JSON.parse(
         readFileSync(`${process.env.HOME}/.openclaw/openclaw.json`, "utf8"),
@@ -1656,7 +1642,6 @@ export default function setup(api) {
       const botToken = cfg.channels?.telegram?.accounts?.default?.botToken;
       process.stderr.write(`[NOTIFY] botToken found: ${!!botToken}\n`);
       if (!botToken) return;
-      const chatId = "569346031"; // Dhruv
       const icon =
         status === "review"
           ? "✅"
@@ -1669,11 +1654,9 @@ export default function setup(api) {
         (task.projectId || "unknown").charAt(0).toUpperCase() +
         (task.projectId || "unknown").slice(1);
       const agent =
-        (task.agent || "zeus").charAt(0).toUpperCase() +
-        (task.agent || "zeus").slice(1);
-      const threadLink = task.threadId
-        ? `https://discord.com/channels/1475480367166128354/${task.threadId}`
-        : null;
+        (task.agent || DEFAULT_AGENT).charAt(0).toUpperCase() +
+        (task.agent || DEFAULT_AGENT).slice(1);
+      const threadLink = task.threadId ? formatDiscordThreadUrl(task.threadId) : null;
       process.stderr.write(`[NOTIFY] threadLink: ${threadLink}\n`);
       const lines = [
         `${icon} ${task.title}`,
@@ -1724,19 +1707,7 @@ export default function setup(api) {
   }
 
   function resolveAccountId(agent) {
-    // Map logical agent name to Discord bot accountId
-    const map = {
-      zeus: "zeus",
-      atum: "atum",
-      ibis: "ibis",
-      athena: "athena",
-      hathor: "hathor",
-      sphinx: "sphinx",
-      osiris: "osiris",
-      maat: "maat",
-      sumodeus: "sumodeus",
-    };
-    return map[agent] || "sumodeus";
+    return AGENT_ACCOUNT_IDS[agent] || agent || DEFAULT_DISCORD_ACCOUNT_ID;
   }
 
   function resolveChannelId(projectId) {
@@ -2517,7 +2488,7 @@ export default function setup(api) {
       id: crypto.randomUUID(),
       title: body.title,
       description: body.description || null,
-      agent: body.agent || "zeus",
+      agent: body.agent || DEFAULT_AGENT,
       project_id: body.projectId || null,
       cwd: body.cwd || null,
       category: body.category || null,
@@ -3293,7 +3264,7 @@ Be specific — reference actual commit messages and features. Don't be vague.`;
       .all();
 
     const knownAgentIds = new Set([
-      ...Object.keys(AGENT_FALLBACK_CHANNELS || {}),
+      ...Object.keys(AGENT_DEFAULT_CHANNELS || {}),
       ...Object.keys(CONFIG.agents || {}),
       ...latestRows.map((row) => row.agent_id),
     ]);
@@ -4009,7 +3980,7 @@ Be specific — reference actual commit messages and features. Don't be vague.`;
             // Post orchestrator message to Discord thread (facade for visibility)
             if (task.thread_id) {
               try {
-                const botToken = resolveBotToken("sumodeus");
+                const botToken = resolveBotToken(DEFAULT_DISCORD_ACCOUNT_ID);
                 if (botToken) {
                   await fetch(
                     `https://discord.com/api/v10/channels/${task.thread_id}/messages`,

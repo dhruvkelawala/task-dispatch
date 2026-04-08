@@ -37,7 +37,7 @@ describe("routes", () => {
 
     const res = createRes();
     await handleCreateTask(
-      { body: { title: "T", agent: "zeus" } },
+      { body: { title: "T", agent: "builder" } },
       res,
       {
         db,
@@ -61,7 +61,7 @@ describe("routes", () => {
 
     const res = createRes();
     await handleCreateTask(
-      { body: { agent: "zeus" } },
+      { body: { agent: "builder" } },
       res,
       {
         db,
@@ -84,7 +84,7 @@ describe("routes", () => {
       id: "task-1",
       title: "T",
       description: null,
-      agent: "zeus",
+      agent: "builder",
       runtime: null,
       project_id: null,
       channel_id: null,

@@ -22,7 +22,7 @@ describe("qa", () => {
 
   test("buildQAReviewPrompt includes cwd and task id", () => {
     const prompt = buildQAReviewPrompt(
-      { id: "task-1", title: "Refactor", cwd: "/repo", agent: "zeus", output: "ok" },
+      { id: "task-1", title: "Refactor", cwd: "/repo", agent: "builder", output: "ok" },
       () => "/fallback",
     );
     expect(prompt.includes("task-1")).toBeTrue();

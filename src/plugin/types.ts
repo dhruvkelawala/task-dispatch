@@ -71,17 +71,37 @@ export interface PluginConfig {
   defaults?: {
     maxConcurrentSessions?: number;
     defaultCwd?: string;
+    defaultAgent?: string;
     taskTimeoutMs?: number;
     reviewTimeoutMs?: number;
     maxReviewCycles?: number;
   };
   notifications?: {
-    sumodeusSessionKey?: string;
+    operatorLabel?: string;
+    operatorSessionKey?: string;
+    telegramChatId?: string;
+    defaultDiscordAccountId?: string;
   };
-  agents?: Record<string, { runtime?: string }>;
-  projects?: Record<string, { channel?: string; cwd?: string }>;
+  agents?: Record<string, { runtime?: string; channel?: string; accountId?: string }>;
+  projects?: Record<
+    string,
+    {
+      name?: string;
+      repo?: string;
+      description?: string;
+      status?: string;
+      priority?: number;
+      tags?: string[];
+      aliases?: string[];
+      channel?: string;
+      cwd?: string;
+      defaultAgent?: string;
+    }
+  >;
   channels?: {
     discord?: {
+      guildId?: string;
+      threadUrlTemplate?: string;
       accounts?: Record<string, { token?: string }>;
     };
   };
@@ -125,6 +145,8 @@ export interface AcpRuntime {
     channel?: string;
     accountId?: string;
     threadId?: string;
+    conversationId?: string;
+    parentConversationId?: string;
   }) => Promise<{ runId?: string }>;
   spawn?: (
     payload: {

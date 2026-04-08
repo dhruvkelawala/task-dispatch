@@ -26,13 +26,13 @@ describe("cli process", () => {
       JSON.stringify(
         {
           projects: {
-            "go-hevy": {
-              cwd: "/tmp/hevy-cli",
+            cli: {
+              cwd: "/tmp/cli",
               channel: "123",
-              defaultAgent: "zeus",
+              defaultAgent: "builder",
             },
           },
-          defaults: { taskTimeoutMs: 1234567 },
+          defaults: { taskTimeoutMs: 1234567, defaultAgent: "builder" },
         },
         null,
         2,
@@ -47,10 +47,10 @@ describe("cli process", () => {
         "-t",
         "Dry Run Test",
         "--cwd",
-        "/tmp/hevy-cli",
+        "/tmp/cli",
         "--dry-run",
       ],
-      cwd: "/Users/sumo-deus/.openclaw/extensions/task-dispatch",
+      cwd: process.cwd(),
       env: { ...process.env, HOME: home },
       stdout: "pipe",
       stderr: "pipe",
@@ -62,9 +62,9 @@ describe("cli process", () => {
     expect(proc.exitCode).toBe(0);
     expect(stderr).toBe("");
     expect(stdout).toContain("DRY RUN — no task created");
-    expect(stdout).toContain("Project: go-hevy");
-    expect(stdout).toContain("CWD: /tmp/hevy-cli");
-    expect(stdout).toContain("Agent: zeus");
+    expect(stdout).toContain("Project: cli");
+    expect(stdout).toContain("CWD: /tmp/cli");
+    expect(stdout).toContain("Agent: builder");
     expect(stdout).toContain("TimeoutMs: 1234567");
   });
 });

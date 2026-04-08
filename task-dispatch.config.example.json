@@ -1,0 +1,63 @@
+{
+  "apiKey": "replace-with-a-random-write-api-key",
+  "defaults": {
+    "defaultAgent": "builder",
+    "defaultCwd": "~/workspace",
+    "taskTimeoutMs": 1800000,
+    "reviewTimeoutMs": 600000,
+    "maxConcurrentSessions": 6,
+    "maxReviewCycles": 3
+  },
+  "channels": {
+    "discord": {
+      "guildId": "123456789012345678",
+      "threadUrlTemplate": "https://discord.com/channels/123456789012345678/{threadId}",
+      "accounts": {
+        "default": {
+          "token": "<discord-bot-token>"
+        },
+        "builder-bot": {
+          "token": "<discord-bot-token>"
+        }
+      }
+    }
+  },
+  "agents": {
+    "builder": {
+      "runtime": "acp",
+      "accountId": "builder-bot",
+      "channel": "234567890123456789"
+    },
+    "reviewer": {
+      "runtime": "subagent",
+      "accountId": "default"
+    }
+  },
+  "projects": {
+    "web-app": {
+      "name": "Web App",
+      "repo": "org/web-app",
+      "description": "Primary customer-facing application",
+      "status": "active",
+      "priority": 1,
+      "tags": ["frontend", "shipping"],
+      "cwd": "~/workspace/web-app",
+      "channel": "345678901234567890",
+      "defaultAgent": "builder",
+      "aliases": ["web", "frontend"]
+    },
+    "control-plane": {
+      "name": "Control Plane",
+      "cwd": "~/workspace/control-plane",
+      "channel": "456789012345678901",
+      "defaultAgent": "builder",
+      "aliases": ["control"]
+    }
+  },
+  "notifications": {
+    "operatorLabel": "operator",
+    "operatorSessionKey": "agent:main:telegram:direct:your-operator",
+    "telegramChatId": "<optional-chat-id>",
+    "defaultDiscordAccountId": "default"
+  }
+}

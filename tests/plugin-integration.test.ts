@@ -34,7 +34,7 @@ describe("plugin integration-ish behavior", () => {
 
     const res = createRes();
     await handleCreateTask(
-      { body: { title: "T", agent: "zeus", dependsOn: ["blocked-dep"], qaRequired: false } },
+      { body: { title: "T", agent: "builder", dependsOn: ["blocked-dep"], qaRequired: false } },
       res,
       {
         db,
@@ -77,7 +77,7 @@ describe("plugin integration-ish behavior", () => {
       id: "task-1",
       title: "T",
       description: null,
-      agent: "zeus",
+      agent: "builder",
       runtime: null,
       project_id: null,
       channel_id: null,
@@ -97,7 +97,7 @@ describe("plugin integration-ish behavior", () => {
     db.prepare("INSERT INTO comments (id, task_id, author, body, created_at) VALUES (@id, @task_id, @author, @body, @created_at)").run({
       id: "comment-1",
       task_id: "task-1",
-      author: "sumodeus",
+      author: "operator",
       body: "hello",
       created_at: now,
     });

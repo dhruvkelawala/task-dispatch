@@ -5,14 +5,32 @@ import { createInterface } from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 
 const defaultBase = "http://localhost:18789";
-const defaultApiKey = "24b1b4e5472806f373c62c49cfe119d6";
-const discordGuildId = "1475480367166128354";
-const configPath = `${process.env.HOME || "/Users/sumo-deus"}/.openclaw/data/task-dispatch-config.json`;
+const configPath = `${process.env.HOME || ""}/.openclaw/data/task-dispatch-config.json`;
 
 type DispatchConfig = {
-  projects?: Record<string, { cwd?: string; channel?: string; defaultAgent?: string }>;
-  agents?: Record<string, { runtime?: string; model?: string }>;
-  defaults?: { defaultCwd?: string; taskTimeoutMs?: number; reviewTimeoutMs?: number };
+  apiKey?: string;
+  projects?: Record<
+    string,
+    {
+      cwd?: string;
+      channel?: string;
+      defaultAgent?: string;
+      aliases?: string[];
+    }
+  >;
+  agents?: Record<string, { runtime?: string; model?: string; channel?: string; accountId?: string }>;
+  defaults?: {
+    defaultAgent?: string;
+    defaultCwd?: string;
+    taskTimeoutMs?: number;
+    reviewTimeoutMs?: number;
+  };
+  channels?: {
+    discord?: {
+      guildId?: string;
+      threadUrlTemplate?: string;
+    };
+  };
 };
 
 type ProjectEntry = {
@@ -26,14 +44,22 @@ function base(): string {
   return process.env.DISPATCH_URL || defaultBase;
 }
 
-function apiKey(): string {
-  return process.env.DISPATCH_API_KEY || defaultApiKey;
+function apiKey(required = false): string {
+  const value = process.env.DISPATCH_API_KEY || config.apiKey || "";
+  if (!value && required) {
+    fail(
+      `DISPATCH_API_KEY is required for write requests. Set DISPATCH_API_KEY or add apiKey to ${configPath}.`,
+    );
+  }
+  return value;
 }
 
 async function doReq(method: string, path: string, body: unknown): Promise<{ data: string; status: number }> {
-  const headers: Record<string, string> = {
-    "X-Api-Key": apiKey(),
-  };
+  const headers: Record<string, string> = {};
+  const normalizedMethod = method.toUpperCase();
+  const writeRequest = !["GET", "HEAD"].includes(normalizedMethod);
+  const resolvedApiKey = apiKey(writeRequest);
+  if (resolvedApiKey) headers["X-Api-Key"] = resolvedApiKey;
   if (body != null) headers["Content-Type"] = "application/json";
   const resp = await fetch(`${base()}${path}`, {
     method,
@@ -59,8 +85,14 @@ function projectEntries(): ProjectEntry[] {
     key,
     cwd: value.cwd || "-",
     channel: value.channel || "-",
-    defaultAgent: value.defaultAgent || "zeus",
+    defaultAgent: value.defaultAgent || config.defaults?.defaultAgent || defaultAgent(),
   }));
+}
+
+function defaultAgent(): string {
+  if (config.defaults?.defaultAgent?.trim()) return config.defaults.defaultAgent.trim();
+  const firstConfiguredAgent = Object.keys(config.agents || {})[0];
+  return firstConfiguredAgent || "default";
 }
 
 function projectAliasMap(): Record<string, string> {
@@ -68,10 +100,11 @@ function projectAliasMap(): Record<string, string> {
   const aliases: Record<string, string> = {};
   for (const entry of entries) {
     aliases[entry.key] = entry.key;
+    const configEntry = config.projects?.[entry.key];
+    for (const alias of configEntry?.aliases || []) {
+      aliases[alias] = entry.key;
+    }
   }
-  if (aliases["mission-control"]) aliases.mc = "mission-control";
-  if (aliases["0xready"]) aliases.oxr = "0xready";
-  if (aliases["argentx"]) aliases.multichain = "argentx";
   return aliases;
 }
 
@@ -215,7 +248,15 @@ function pad(value: string, width: number): string {
 }
 
 function formatThreadUrl(threadId: string): string {
-  return `https://discord.com/channels/${discordGuildId}/${threadId}`;
+  const template = config.channels?.discord?.threadUrlTemplate?.trim();
+  if (template) {
+    return template.replaceAll("{threadId}", threadId);
+  }
+  const guildId = config.channels?.discord?.guildId?.trim();
+  if (guildId) {
+    return `https://discord.com/channels/${guildId}/${threadId}`;
+  }
+  return threadId;
 }
 
 function cwdMatchesProject(cwd: string, project: ProjectEntry | null): boolean {
@@ -303,7 +344,7 @@ async function askInteractive(question: string, defaultValue = ""): Promise<stri
 
 async function cmdCreate(args: string[]): Promise<void> {
   const payload: Record<string, unknown> = {
-    agent: "zeus",
+    agent: defaultAgent(),
     qaRequired: true,
     timeoutMs: Number(config.defaults?.taskTimeoutMs || 1800000),
   };
@@ -334,7 +375,7 @@ async function cmdCreate(args: string[]): Promise<void> {
       case "-a":
       case "--agent":
         i += 1;
-        payload.agent = args[i] || "zeus";
+        payload.agent = args[i] || defaultAgent();
         explicitAgent = true;
         break;
       case "-p":
@@ -481,7 +522,8 @@ async function cmdCreate(args: string[]): Promise<void> {
       if (!explicitAgent && resolved.defaultAgent) payload.agent = resolved.defaultAgent;
     }
     if (!desc) desc = await askInteractive("Description (optional)");
-    if (!explicitAgent) payload.agent = await askInteractive("Agent", String(payload.agent || "zeus"));
+    if (!explicitAgent)
+      payload.agent = await askInteractive("Agent", String(payload.agent || defaultAgent()));
     const qaAnswer = await askInteractive("QA? yes/no", payload.qaRequired ? "yes" : "no");
     payload.qaRequired = !["n", "no", "false", "0"].includes(qaAnswer.toLowerCase());
     const timeoutAnswer = await askInteractive("Timeout ms", String(payload.timeoutMs || ""));
@@ -637,7 +679,7 @@ async function cmdPrompt(args: string[]): Promise<void> {
         ? `https://discord.com/channels/${discordGuildId}/${threadId}`
         : "";
   } catch {
-    // Keep backward compatibility with non-JSON responses.
+    // Non-JSON response; best-effort output continues below.
   }
   process.stdout.write(`✅ Prompt sent to task ${short(resolvedId)}\n`);
   if (runId) process.stdout.write(`Run ID: ${runId}\n`);
@@ -907,7 +949,7 @@ async function cmdRetry(args: string[]): Promise<void> {
   const payload: Record<string, unknown> = {
     title: task.title,
     description: task.description,
-    agent: task.agent || "zeus",
+    agent: task.agent || defaultAgent(),
     projectId: task.projectId || null,
     cwd: task.cwd || null,
     timeoutMs: task.timeoutMs || config.defaults?.taskTimeoutMs || 1800000,
@@ -1020,7 +1062,7 @@ CREATE FLAGS:
   -t, --title       Task title (required)
   -d, --desc        Task description
   -f, --file        Read description from file
-  -a, --agent       Agent: zeus (default), atum
+  -a, --agent       Agent id (default: config defaults.defaultAgent)
   -p, --project     Project key from config (run dispatch projects)
   -c, --category    Category: bug, feat, chore, design
   --depends-on      Comma-separated task IDs this task depends on (DAG)
@@ -1057,19 +1099,19 @@ ENVIRONMENT:
 EXAMPLES:
   dispatch projects
   dispatch doctor
-  dispatch create -t "Fix bug" -p visaroy -c bug -d "Fix the login flow"
-  dispatch create -t "Add feature" -p mission-control -d "Build usage dashboard" --no-qa
-  dispatch create -t "Task B" -p 0xready --depends-on abc12345 -f desc.md
-  dispatch create -t "Task C" -p go-hevy --after abc12345,def67890 --dry-run
+  dispatch create -t "Fix bug" -p web-app -c bug -d "Fix the login flow"
+  dispatch create -t "Add feature" -p control-plane -d "Build usage dashboard" --no-qa
+  dispatch create -t "Task B" -p sdk --depends-on abc12345 -f desc.md
+  dispatch create -t "Task C" -p cli --after abc12345,def67890 --dry-run
   dispatch create --from abc123 -t "Follow-up task" --no-qa --reuse-thread
-  dispatch create -t "Infer project from cwd" --cwd /Users/sumo-deus/.openclaw/workspace/hevy-cli --dry-run
+  dispatch create -t "Infer project from cwd" --cwd ~/workspace/cli --dry-run
   dispatch create --interactive
-  dispatch create -t "Continue thread" -p task-dispatch -T 1488561798167793894 -d "Follow-up work"
-  dispatch active --project go-hevy
-  dispatch watch --project go-hevy --once
-  dispatch recent-errors --project go-hevy
-  dispatch list --project go-hevy --status error
-  dispatch history --project go-hevy
+  dispatch create -t "Continue thread" -p control-plane -T 123456789012345678 -d "Follow-up work"
+  dispatch active --project cli
+  dispatch watch --project cli --once
+  dispatch recent-errors --project cli
+  dispatch list --project cli --status error
+  dispatch history --project cli
   dispatch inspect abc123
   dispatch explain abc123
   dispatch logs abc123

@@ -10,16 +10,16 @@ describe("thread reuse kickoff message", () => {
     const message = buildExistingThreadDispatchMessage(
       {
         id: "d3f892af-0d86-4613-a809-debec1e0bfdd",
-        title: "hevy-cli follow-up: fix help text and history UX",
-        cwd: "/Users/sumo-deus/.openclaw/workspace/hevy-cli",
+        title: "cli follow-up: fix help text and history UX",
+        cwd: "/workspace/cli",
       },
-      "/Users/sumo-deus/.openclaw/workspace/hevy-cli",
+      "/workspace/cli",
     );
 
     expect(message).toContain("session active (reused thread)");
     expect(message).toContain("Messages here go directly to this session");
-    expect(message).toContain("hevy-cli follow-up: fix help text and history UX-d3f892af-");
-    expect(message).toContain("cwd: /Users/sumo-deus/.openclaw/workspace/hevy-cli");
+    expect(message).toContain("cli follow-up: fix help text and history UX-d3f892af-");
+    expect(message).toContain("cwd: /workspace/cli");
   });
 });
 
@@ -29,15 +29,15 @@ test("buildDiscordAgentTarget prefers thread ids over parent channel ids", () =>
   expect(buildDiscordAgentTarget(undefined, undefined)).toBeUndefined();
 });
 
-test("buildDiscordAcpPromptContext keeps legacy threadId and upstream conversationId", () => {
-  expect(buildDiscordAcpPromptContext("1488655623087325327", "zeus")).toEqual({
+test("buildDiscordAcpPromptContext includes thread and conversation ids", () => {
+  expect(buildDiscordAcpPromptContext("1488655623087325327", "builder-bot")).toEqual({
     channel: "discord",
-    accountId: "zeus",
+    accountId: "builder-bot",
     threadId: "1488655623087325327",
     conversationId: "1488655623087325327",
   });
-  expect(buildDiscordAcpPromptContext(undefined, "zeus")).toEqual({
+  expect(buildDiscordAcpPromptContext(undefined, "builder-bot")).toEqual({
     channel: "discord",
-    accountId: "zeus",
+    accountId: "builder-bot",
   });
 });

@@ -3,7 +3,7 @@ import type { PluginConfig, Task } from "./types";
 
 const require = createRequire(import.meta.url);
 
-export const HOME = process.env.HOME || "/Users/sumo-deus";
+export const HOME = process.env.HOME || "";
 
 export function loadConfig(): PluginConfig {
   const { readFileSync, existsSync } = require("node:fs") as {

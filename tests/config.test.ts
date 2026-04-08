@@ -4,8 +4,8 @@ import { resolveChannel, resolveCwd } from "../src/plugin/config";
 describe("config", () => {
   test("resolveChannel returns project channel", () => {
     const channel = resolveChannel(
-      { projectId: "mission-control", agent: "zeus" },
-      { "mission-control": "chan-1" },
+      { projectId: "control-plane", agent: "builder" },
+      { "control-plane": "chan-1" },
     );
     expect(channel).toBe("chan-1");
   });

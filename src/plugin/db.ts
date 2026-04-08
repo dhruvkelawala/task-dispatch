@@ -5,48 +5,16 @@ import type { Comment, Schedule, Task, TaskStatus } from "./types";
 
 const require = createRequire(import.meta.url);
 
-export const PROJECT_SEED_ROWS = [
-  {
-    id: "visaroy",
-    name: "Visaroy",
-    repo: "dhruvkelawala/visaroy",
-    priority: 1,
-    status: "shipping",
-    description: "Schengen visa prep assistant",
-    cwd: "~/.openclaw/workspace/visaroy/visaroy-app",
-    tags: '["ship", "personal"]',
-  },
-  {
-    id: "forayy",
-    name: "Forayy",
-    repo: null,
-    priority: 2,
-    status: "active",
-    description: "AI street-view missions app",
-    cwd: "~/.openclaw/workspace/forayy",
-    tags: '["side"]',
-  },
-  {
-    id: "beryl",
-    name: "BERYL",
-    repo: "argentlabs/poc-friendly-pancake",
-    priority: 4,
-    status: "exploring",
-    description: "Secure embedded wallet with delegated agent access",
-    cwd: null,
-    tags: '["work", "career"]',
-  },
-  {
-    id: "mc3",
-    name: "Mission Control v3",
-    repo: null,
-    priority: 3,
-    status: "active",
-    description: "Agent operations console",
-    cwd: "~/.openclaw/workspace/mission-control-v3",
-    tags: '["infra"]',
-  },
-];
+export const PROJECT_SEED_ROWS: Array<{
+  id: string;
+  name: string;
+  repo: string | null;
+  priority: number;
+  status: string;
+  description: string | null;
+  cwd: string | null;
+  tags: string | null;
+}> = [];
 
 export const VALID_TRANSITIONS: Record<TaskStatus, TaskStatus[]> = {
   pending: ["ready", "cancelled"],
@@ -268,7 +236,7 @@ export function initDb(dbPath: string): any {
       id TEXT PRIMARY KEY,
       title TEXT NOT NULL,
       description TEXT,
-      agent TEXT NOT NULL DEFAULT 'zeus',
+      agent TEXT NOT NULL DEFAULT 'default',
       project_id TEXT,
       cwd TEXT,
       category TEXT,

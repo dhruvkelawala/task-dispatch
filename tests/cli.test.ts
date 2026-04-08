@@ -16,11 +16,12 @@ beforeAll(async () => {
     JSON.stringify(
       {
         projects: {
-          visaroy: { cwd: "/tmp/visaroy", channel: "chan-vis", defaultAgent: "zeus" },
-          "mission-control": { cwd: "/tmp/mc", channel: "chan-mc", defaultAgent: "zeus" },
-          "0xready": { cwd: "/tmp/0xready", channel: "chan-oxr", defaultAgent: "zeus" },
-          "go-hevy": { cwd: "/Users/sumo-deus/.openclaw/workspace/hevy-cli", channel: "chan-hevy", defaultAgent: "zeus" },
+          "web-app": { cwd: "/tmp/web-app", channel: "chan-web", defaultAgent: "builder", aliases: ["web"] },
+          "control-plane": { cwd: "/tmp/control", channel: "chan-control", defaultAgent: "builder", aliases: ["cp"] },
+          sdk: { cwd: "/tmp/sdk", channel: "chan-sdk", defaultAgent: "reviewer", aliases: ["kit"] },
+          cli: { cwd: "/tmp/cli", channel: "chan-cli", defaultAgent: "builder" },
         },
+        defaults: { defaultAgent: "builder" },
       },
       null,
       2,
@@ -40,22 +41,22 @@ afterAll(() => {
 
 describe("cli helpers", () => {
   test("suggestProjects returns useful fuzzy matches", () => {
-    const suggestions = cliTest.suggestProjects("goheavy");
-    expect(suggestions).toContain("go-hevy");
+    const suggestions = cliTest.suggestProjects("webapp");
+    expect(suggestions).toContain("web-app");
   });
 
   test("resolveProject supports aliases", () => {
-    expect(cliTest.resolveProject("mc")?.key).toBe("mission-control");
-    expect(cliTest.resolveProject("oxr")?.key).toBe("0xready");
+    expect(cliTest.resolveProject("cp")?.key).toBe("control-plane");
+    expect(cliTest.resolveProject("kit")?.key).toBe("sdk");
   });
 
   test("inferProjectFromCwd maps exact configured cwd to project", () => {
-    expect(cliTest.inferProjectFromCwd("/Users/sumo-deus/.openclaw/workspace/hevy-cli")?.key).toBe("go-hevy");
+    expect(cliTest.inferProjectFromCwd("/tmp/cli")?.key).toBe("cli");
   });
 
   test("parseArgs handles boolean and value flags", () => {
-    const parsed = cliTest.parseArgs(["--project", "go-hevy", "--once", "--interval", "5"]);
-    expect(parsed.project).toBe("go-hevy");
+    const parsed = cliTest.parseArgs(["--project", "cli", "--once", "--interval", "5"]);
+    expect(parsed.project).toBe("cli");
     expect(parsed.once).toBeTrue();
     expect(parsed.interval).toBe("5");
   });
