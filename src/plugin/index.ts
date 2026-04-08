@@ -1766,6 +1766,12 @@ export default function setup(api) {
       typeof task.threadId === "string" && task.threadId.trim()
         ? task.threadId.trim()
         : null;
+    const dispatchThreadId = existingThreadId || (await createDiscordThread(task));
+    if (!dispatchThreadId) {
+      throw new Error(
+        `failed to create or resolve a Discord thread for task ${task.id}`,
+      );
+    }
 
     function bindSessionToThread(threadId, targetSessionKey, label) {
       if (!threadId || !targetSessionKey) return false;
@@ -1818,7 +1824,7 @@ export default function setup(api) {
         return true;
       } catch (error) {
         process.stderr.write(
-          `[DISPATCH.ACP] Failed to bind existing thread ${threadId}: ${error.message}\n`,
+          `[DISPATCH.ACP] Failed to bind Discord thread ${threadId}: ${error.message}\n`,
         );
         return false;
       }
@@ -1833,20 +1839,23 @@ export default function setup(api) {
 
     let childSessionKey = sessionKey;
     let childRunId = "";
+    let boundThreadId = dispatchThreadId;
     try {
-      // Single call — handles session creation, thread creation, binding, and delivery
+      const label = `${task.title.slice(0, 32)}-${task.id.slice(0, 8)}-${Date.now()}`;
       const result = await api.runtime.acp.spawn(
         {
           task: prompt,
-          label: `${task.title.slice(0, 32)}-${task.id.slice(0, 8)}-${Date.now()}`,
+          label,
           agentId: "opencode",
           cwd: resolvedCwd,
-          thread: !existingThreadId,
+          // We always target a concrete Discord thread from the plugin so we
+          // don't depend on OpenClaw's fresh child-thread binding path.
+          thread: false,
         },
         {
           agentChannel: "discord",
           agentAccountId: accountId,
-          agentTo: buildDiscordAgentTarget(existingThreadId, channelId),
+          agentTo: buildDiscordAgentTarget(dispatchThreadId, channelId),
         },
       );
 
@@ -1867,21 +1876,20 @@ export default function setup(api) {
         `[DISPATCH.ACP] spawn accepted for ${task.id}, runId=${childRunId}, session=${childSessionKey}\n`,
       );
 
-      let boundThreadId = existingThreadId;
-      if (existingThreadId) {
-        const label = `${task.title.slice(0, 32)}-${task.id.slice(0, 8)}-${Date.now()}`;
-        const rebound = bindSessionToThread(
-          existingThreadId,
-          childSessionKey,
-          label,
+      const rebound = bindSessionToThread(
+        dispatchThreadId,
+        childSessionKey,
+        label,
+      );
+      if (!rebound) {
+        throw new Error(
+          `failed to bind Discord thread ${dispatchThreadId} to session ${childSessionKey}`,
         );
-        if (!rebound) {
-          throw new Error(
-            `failed to bind existing Discord thread ${existingThreadId} to session ${childSessionKey}`,
-          );
-        }
+      }
+
+      if (existingThreadId) {
         await postToThread(
-          existingThreadId,
+          dispatchThreadId,
           buildExistingThreadDispatchMessage(task, resolvedCwd),
           accountId,
         ).catch((error) => {
@@ -1890,39 +1898,10 @@ export default function setup(api) {
           );
         });
         recordTaskEvent(task.id, "thread.reused.notified", {
-          threadId: existingThreadId,
+          threadId: dispatchThreadId,
           sessionKey: childSessionKey,
           runId: childRunId,
         });
-      } else {
-        // Look up the thread ID from the bindings file using childSessionKey.
-        // spawnAcpDirect returns immediately after dispatching — give the binding
-        // service a moment to flush the new entry to disk.
-        try {
-          const bindingsPath = `${process.env.HOME}/.openclaw/discord/thread-bindings.json`;
-          const { readFileSync } = await import("node:fs");
-          // Retry up to 5x with 500ms gap (binding flush may be async)
-          for (let attempt = 0; attempt < 5; attempt++) {
-            await new Promise((r) => setTimeout(r, 500));
-            try {
-              const bindingsData = JSON.parse(readFileSync(bindingsPath, "utf8"));
-              const bindings = bindingsData.bindings || {};
-              for (const binding of Object.values(bindings)) {
-                if (binding.targetSessionKey === childSessionKey) {
-                  boundThreadId = String(binding.threadId);
-                  break;
-                }
-              }
-              if (boundThreadId) break;
-            } catch (_) {
-              /* file not ready yet */
-            }
-          }
-        } catch (e) {
-          process.stderr.write(
-            `[DISPATCH.ACP] Could not read thread binding: ${e.message}\n`,
-          );
-        }
       }
 
       db.prepare(
@@ -1934,6 +1913,8 @@ export default function setup(api) {
         threadId: boundThreadId,
         updated_at: Date.now(),
       });
+      task.threadId = boundThreadId;
+      task.sessionKey = childSessionKey;
 
       if (boundThreadId) {
         process.stderr.write(
