@@ -1,5 +1,9 @@
 import { describe, expect, test } from "bun:test";
-import { buildDiscordAgentTarget, buildExistingThreadDispatchMessage } from "../src/plugin/thread-messages";
+import {
+  buildDiscordAcpPromptContext,
+  buildDiscordAgentTarget,
+  buildExistingThreadDispatchMessage,
+} from "../src/plugin/thread-messages";
 
 describe("thread reuse kickoff message", () => {
   test("builds a reused-thread session active message with cwd", () => {
@@ -23,4 +27,17 @@ test("buildDiscordAgentTarget prefers thread ids over parent channel ids", () =>
   expect(buildDiscordAgentTarget("1488655623087325327", "1488587493698703411")).toBe("channel:1488655623087325327");
   expect(buildDiscordAgentTarget(undefined, "1488587493698703411")).toBe("channel:1488587493698703411");
   expect(buildDiscordAgentTarget(undefined, undefined)).toBeUndefined();
+});
+
+test("buildDiscordAcpPromptContext keeps legacy threadId and upstream conversationId", () => {
+  expect(buildDiscordAcpPromptContext("1488655623087325327", "zeus")).toEqual({
+    channel: "discord",
+    accountId: "zeus",
+    threadId: "1488655623087325327",
+    conversationId: "1488655623087325327",
+  });
+  expect(buildDiscordAcpPromptContext(undefined, "zeus")).toEqual({
+    channel: "discord",
+    accountId: "zeus",
+  });
 });

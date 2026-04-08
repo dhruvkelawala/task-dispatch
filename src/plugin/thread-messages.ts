@@ -12,3 +12,25 @@ export function buildDiscordAgentTarget(threadId?: string | null, channelId?: st
   if (channelId && channelId.trim()) return `channel:${channelId}`;
   return undefined;
 }
+
+export function buildDiscordAcpPromptContext(
+  threadId?: string | null,
+  accountId?: string | null,
+): {
+  channel: "discord";
+  accountId?: string;
+  threadId?: string;
+  conversationId?: string;
+} {
+  const normalizedThreadId = threadId?.trim() || undefined;
+  const normalizedAccountId = accountId?.trim() || undefined;
+  return {
+    channel: "discord",
+    ...(normalizedAccountId ? { accountId: normalizedAccountId } : {}),
+    // Keep threadId for current fork compatibility and add conversationId for
+    // the upstream ACP runtime shape once it lands.
+    ...(normalizedThreadId
+      ? { threadId: normalizedThreadId, conversationId: normalizedThreadId }
+      : {}),
+  };
+}

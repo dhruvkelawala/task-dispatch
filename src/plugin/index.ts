@@ -7,6 +7,7 @@ import { promisify } from "node:util";
 import crypto from "node:crypto";
 import { createBackgroundJobQueue } from "./background-jobs";
 import {
+  buildDiscordAcpPromptContext,
   buildDiscordAgentTarget,
   buildExistingThreadDispatchMessage,
 } from "./thread-messages";
@@ -1264,9 +1265,7 @@ export default function setup(api) {
     const result = await api.runtime.acp.prompt({
       sessionKey: task.sessionKey,
       text: prompt,
-      channel: "discord",
-      accountId,
-      threadId: task.threadId || undefined,
+      ...buildDiscordAcpPromptContext(task.threadId, accountId),
     });
 
     const runId = typeof result?.runId === "string" ? result.runId.trim() : "";
@@ -1753,9 +1752,9 @@ export default function setup(api) {
     );
 
     if (!api.runtime?.acp?.spawn) {
-      throw new Error(
-        "api.runtime.acp.spawn not available — OpenClaw fork required",
-      );
+        throw new Error(
+          "api.runtime.acp.spawn not available — OpenClaw build with ACP plugin runtime required",
+        );
     }
 
     const resolvedCwd = cwd || defaultCwd;
@@ -4032,9 +4031,7 @@ Be specific — reference actual commit messages and features. Don't be vague.`;
             const result = await api.runtime.acp.prompt({
               sessionKey: task.session_key,
               text: message,
-              channel: "discord",
-              accountId,
-              threadId: task.thread_id || undefined,
+              ...buildDiscordAcpPromptContext(task.thread_id, accountId),
             });
             recordTaskEvent(id, "task.prompt", {
               runId: result.runId || null,
