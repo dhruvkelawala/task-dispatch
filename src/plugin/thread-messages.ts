@@ -6,3 +6,9 @@ export function buildExistingThreadDispatchMessage(task: { id?: string; title?: 
   const cwdLine = `cwd: ${cwd || task?.cwd || "-"}`;
   return `${header}\n${cwdLine}`;
 }
+
+export function buildDiscordAgentTarget(threadId?: string | null, channelId?: string | null): string | undefined {
+  if (threadId && threadId.trim()) return `channel:${threadId}`;
+  if (channelId && channelId.trim()) return `channel:${channelId}`;
+  return undefined;
+}

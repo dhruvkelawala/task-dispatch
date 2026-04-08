@@ -6,7 +6,10 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import crypto from "node:crypto";
 import { createBackgroundJobQueue } from "./background-jobs";
-import { buildExistingThreadDispatchMessage } from "./thread-messages";
+import {
+  buildDiscordAgentTarget,
+  buildExistingThreadDispatchMessage,
+} from "./thread-messages";
 
 const require = createRequire(import.meta.url);
 const execFileAsync = promisify(execFile);
@@ -1498,7 +1501,7 @@ export default function setup(api) {
         {
           agentChannel: "discord",
           agentAccountId: accountId,
-          agentTo: channelId ? `channel:${channelId}` : undefined,
+          agentTo: buildDiscordAgentTarget(task.threadId, channelId),
         },
       );
 
@@ -1843,7 +1846,7 @@ export default function setup(api) {
         {
           agentChannel: "discord",
           agentAccountId: accountId,
-          agentTo: channelId ? `channel:${channelId}` : undefined,
+          agentTo: buildDiscordAgentTarget(existingThreadId, channelId),
         },
       );
 
