@@ -3,6 +3,7 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "bridge": "bun run src/bridge/index.ts",
     "build:plugin": "bun build src/plugin/index.ts --target=node --format=esm --outfile=build/plugin.mjs --external better-sqlite3",
     "build:cli": "bun build src/cli/index.ts --compile --outfile=build/dispatch",
     "build": "bun run build:plugin && bun run build:cli",
