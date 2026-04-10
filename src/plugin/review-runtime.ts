@@ -10,9 +10,21 @@ import {
   REVIEW_DEBOUNCE_WINDOW_MS,
   shouldAdvanceReviewCursor,
   transitionPendingReviewState,
+  type ParsedReviewSummary,
   type ReviewRequest,
   type ReviewStateRow,
 } from "./review";
+import {
+  executePlannedReviewIssues,
+  planReviewIssues,
+  type ReviewIssueWriteResult,
+} from "./review-issues";
+import {
+  commentOnGitHubIssue,
+  createGitHubIssue,
+  getInstallationToken,
+  searchIssuesByFingerprint,
+} from "./github-app-auth";
 
 type ReviewStatements = {
   getReviewStateByRepo: PreparedStatementLike<ReviewStateRow | undefined>;
@@ -35,6 +47,7 @@ export type ReviewDeliveryRow = {
   sha: string;
   task_id: string | null;
   status: string;
+  installation_id?: number | null;
   accepted_at: number;
 };
 
@@ -67,6 +80,11 @@ type ReviewRuntimeDeps = {
   defaultAgent: string;
   defaultCwd: string;
   reviewTimers: Map<string, ReturnType<typeof setTimeout>>;
+  githubApp?: {
+    appId: string;
+    privateKeyPath: string;
+  };
+  getInstallationIdForRepo?: (repo: string) => number | null;
   db: {
     prepare: (sql: string) => PreparedStatementLike;
     transaction: <TArgs extends unknown[]>(
@@ -83,6 +101,7 @@ type ReviewRuntimeDeps = {
   ) => void;
   onTaskChanged: (taskId: string) => void;
   resolveReviewAgentId: (config: PluginConfig, projectId: string, fallbackAgent: string) => string;
+  stderr: Pick<typeof process.stderr, "write">;
 };
 
 export function createReviewRuntime(deps: ReviewRuntimeDeps) {
@@ -134,6 +153,7 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps) {
       task_id: delivery.task_id || null,
       status: delivery.status,
       accepted_at: delivery.accepted_at,
+      installation_id: delivery.installation_id ?? null,
     });
   }
 
@@ -264,15 +284,97 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps) {
     deps.reviewTimers.set(repo, timer);
   }
 
-  function finalizeReviewTask(task: Task): void {
+  async function executeIssueWriting(
+    task: Task,
+    parsedSummary: ParsedReviewSummary,
+    reviewState: ReviewStateRow,
+  ): Promise<ReviewIssueWriteResult[]> {
+    if (parsedSummary.findingsCount === 0 || parsedSummary.findings.length === 0) {
+      return [];
+    }
+
+    if (!deps.githubApp || !deps.getInstallationIdForRepo) {
+      deps.stderr.write(
+        `[ISSUE-WRITER] GitHub App not configured, skipping issue writing for ${task.id}\n`,
+      );
+      return [];
+    }
+
+    const installationId = deps.getInstallationIdForRepo(reviewState.repo);
+    if (!installationId) {
+      deps.stderr.write(
+        `[ISSUE-WRITER] No installation ID for repo ${reviewState.repo}, skipping\n`,
+      );
+      return [];
+    }
+
+    const token = await getInstallationToken(deps.githubApp, installationId);
+    const reviewRange = `${reviewState.active_from_sha || "unknown"}..${reviewState.active_to_sha || "unknown"}`;
+    const planned = planReviewIssues({
+      repo: reviewState.repo,
+      reviewRange,
+      findings: parsedSummary.findings,
+      minSeverity: "medium",
+    });
+
+    if (planned.length === 0) {
+      return [];
+    }
+
+    return await executePlannedReviewIssues({
+      token,
+      repo: reviewState.repo,
+      reviewRange,
+      issues: planned,
+      searchIssuesByFingerprint,
+      createGitHubIssue,
+      commentOnGitHubIssue,
+      stderr: deps.stderr,
+    });
+  }
+
+  async function finalizeReviewTask(task: Task): Promise<void> {
     const reviewState = deps.stmts.getReviewStateByActiveTaskId.get(task.id);
     if (!reviewState) {
       return;
     }
 
     const parsedSummary = parseReviewSummary(task.output || "");
-    const succeeded = task.status === "done" && shouldAdvanceReviewCursor(parsedSummary);
     const now = Date.now();
+
+    if (task.status !== "done" || !parsedSummary) {
+      // Task failed or no valid summary — do not advance cursor
+      handleFailedReview(task, reviewState, parsedSummary, now);
+      return;
+    }
+
+    // Execute server-side issue writing
+    let issueOps: ReviewIssueWriteResult[] = [];
+    try {
+      issueOps = await executeIssueWriting(task, parsedSummary, reviewState);
+      deps.recordTaskEvent(task.id, "review.issues_written", {
+        repo: reviewState.repo,
+        issueOpsCount: issueOps.length,
+        created: issueOps.filter((op) => op.operation === "created").length,
+        duplicateExisting: issueOps.filter((op) => op.operation === "duplicate_existing").length,
+        failedRetryable: issueOps.filter((op) => op.operation === "failed_retryable").length,
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      deps.stderr.write(`[ISSUE-WRITER] Batch failed for ${task.id}: ${message}\n`);
+      deps.recordTaskEvent(task.id, "review.issues_failed", {
+        repo: reviewState.repo,
+        error: message,
+      });
+    }
+
+    // Attach issueOps to the parsed summary for cursor decision
+    const summaryWithOps: ParsedReviewSummary = {
+      ...parsedSummary,
+      issueOps: issueOps.length > 0 ? issueOps : undefined,
+    };
+
+    const succeeded = shouldAdvanceReviewCursor(summaryWithOps);
 
     if (succeeded) {
       saveReviewState(applySuccessfulReviewCompletion(reviewState, now));
@@ -285,6 +387,16 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps) {
       }
       return;
     }
+
+    handleFailedReview(task, reviewState, parsedSummary, now);
+  }
+
+  function handleFailedReview(
+    task: Task,
+    reviewState: ReviewStateRow,
+    parsedSummary: ParsedReviewSummary | null,
+    now: number,
+  ): void {
 
     const mergedFrom = reviewState.active_from_sha || reviewState.pending_from_sha;
     const mergedTo = reviewState.pending_to_sha || reviewState.active_to_sha;

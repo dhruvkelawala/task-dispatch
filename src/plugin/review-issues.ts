@@ -129,7 +129,94 @@ export async function executePlannedReviewIssuesDryRun(
 ): Promise<ReviewIssueWriteResult[]> {
   return issues.map((issue) => ({
     fingerprint: issue.fingerprint,
-    operation: "created",
+    operation: "created" as const,
     reason: "dry_run",
   }));
+}
+
+export async function executePlannedReviewIssues(params: {
+  token: string;
+  repo: string;
+  reviewRange: string;
+  issues: PlannedReviewIssue[];
+  searchIssuesByFingerprint: (p: {
+    token: string;
+    repo: string;
+    fingerprint: string;
+  }) => Promise<Array<{ number: number; html_url: string; state: string }>>;
+  createGitHubIssue: (p: {
+    token: string;
+    repo: string;
+    title: string;
+    body: string;
+    labels: string[];
+  }) => Promise<{ number: number; html_url: string }>;
+  commentOnGitHubIssue: (p: {
+    token: string;
+    repo: string;
+    issueNumber: number;
+    body: string;
+  }) => Promise<void>;
+  stderr?: Pick<typeof process.stderr, "write">;
+}): Promise<ReviewIssueWriteResult[]> {
+  const results: ReviewIssueWriteResult[] = [];
+
+  for (const issue of params.issues) {
+    try {
+      const existing = await params.searchIssuesByFingerprint({
+        token: params.token,
+        repo: params.repo,
+        fingerprint: issue.fingerprint,
+      });
+
+      const openMatch = existing.find((i) => i.state === "open");
+      if (openMatch) {
+        await params.commentOnGitHubIssue({
+          token: params.token,
+          repo: params.repo,
+          issueNumber: openMatch.number,
+          body: `Re-detected in review range \`${params.reviewRange}\`.\n\nFingerprint: \`${issue.fingerprint}\``,
+        });
+        results.push({
+          fingerprint: issue.fingerprint,
+          operation: "duplicate_existing",
+          issueNumber: openMatch.number,
+          issueUrl: openMatch.html_url,
+        });
+        params.stderr?.write(
+          `[ISSUE-WRITER] duplicate_existing #${openMatch.number} for ${issue.fingerprint.slice(0, 20)}\n`,
+        );
+        continue;
+      }
+
+      const created = await params.createGitHubIssue({
+        token: params.token,
+        repo: params.repo,
+        title: issue.title,
+        body: issue.body,
+        labels: issue.labels,
+      });
+      results.push({
+        fingerprint: issue.fingerprint,
+        operation: "created",
+        issueNumber: created.number,
+        issueUrl: created.html_url,
+      });
+      params.stderr?.write(
+        `[ISSUE-WRITER] created #${created.number} for ${issue.fingerprint.slice(0, 20)}\n`,
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      results.push({
+        fingerprint: issue.fingerprint,
+        operation: "failed_retryable",
+        reason: message,
+      });
+      params.stderr?.write(
+        `[ISSUE-WRITER] failed_retryable for ${issue.fingerprint.slice(0, 20)}: ${message}\n`,
+      );
+    }
+  }
+
+  return results;
 }

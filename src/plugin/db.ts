@@ -409,9 +409,16 @@ export function initDb(dbPath: string): DatabaseLike {
       sha TEXT NOT NULL,
       task_id TEXT,
       status TEXT NOT NULL,
-      accepted_at INTEGER NOT NULL
+      accepted_at INTEGER NOT NULL,
+      installation_id INTEGER
     );
   `);
+
+  try {
+    db.exec("ALTER TABLE review_deliveries ADD COLUMN installation_id INTEGER");
+  } catch {
+    // Column already exists
+  }
 
   try {
     db.exec("ALTER TABLE tasks ADD COLUMN run_id TEXT");

@@ -258,11 +258,7 @@ export function shouldAdvanceReviewCursor(summary: ParsedReviewSummary | null): 
     return true;
   }
   if (!summary.issueOps) {
-    // Temporary stopgap: Nemesis analysis is now structured, but the
-    // server-side issue writer is not wired yet. Treat a valid success payload
-    // with findings as cursor-advancing so we do not requeue the same review
-    // forever while the issue writer lands next.
-    return true;
+    return false;
   }
   return summary.issueOps.every(
     (entry) =>

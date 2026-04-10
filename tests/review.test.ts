@@ -167,7 +167,7 @@ describe("review helpers", () => {
           },
         ],
       }),
-    ).toBeTrue();
+    ).toBeFalse();
     expect(
       shouldAdvanceReviewCursor({
         schemaVersion: 1,

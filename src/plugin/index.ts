@@ -550,11 +550,31 @@ export default function setup(api: PluginApi) {
     return created;
   }
 
+  // GitHub App config for issue writing (loaded from env or .env)
+  const githubAppId = process.env.GITHUB_APP_ID || "";
+  const githubAppPrivateKeyPath = process.env.GITHUB_APP_PRIVATE_KEY_PATH || "";
+  const githubAppConfig =
+    githubAppId && githubAppPrivateKeyPath
+      ? { appId: githubAppId, privateKeyPath: githubAppPrivateKeyPath }
+      : undefined;
+
+  // Installation ID lookup — stored in review_deliveries from webhook payloads
+  function getInstallationIdForRepo(repo: string): number | null {
+    const row = db
+      .prepare<{ installation_id?: number }>(
+        "SELECT installation_id FROM review_deliveries WHERE repo = ? AND installation_id IS NOT NULL ORDER BY accepted_at DESC LIMIT 1",
+      )
+      .get(repo);
+    return row?.installation_id ?? null;
+  }
+
   const reviewRuntime = createReviewRuntime({
     config: CONFIG,
     defaultAgent: DEFAULT_AGENT,
     defaultCwd,
     reviewTimers,
+    githubApp: githubAppConfig,
+    getInstallationIdForRepo,
     db: db as unknown as Parameters<typeof createReviewRuntime>[0]["db"],
     stmts: stmts as unknown as Parameters<typeof createReviewRuntime>[0]["stmts"],
     loadTask: (id) => rowToTask(getTask(id)),
@@ -562,6 +582,7 @@ export default function setup(api: PluginApi) {
     recordTaskEvent,
     onTaskChanged,
     resolveReviewAgentId,
+    stderr: process.stderr,
   });
   const {
     getReviewState,
@@ -593,7 +614,7 @@ export default function setup(api: PluginApi) {
     }
 
     if (normalized && ["done", "error", "cancelled"].includes(normalized.status)) {
-      finalizeReviewTask(normalized);
+      void finalizeReviewTask(normalized);
     }
 
     // When a task becomes done, check for newly ready tasks
@@ -717,6 +738,7 @@ export default function setup(api: PluginApi) {
       branch?: string;
       pusher?: string;
       compareUrl?: string;
+      installationId?: number;
     };
     const { fromSha, toSha } = resolveReviewRange(reviewState, reviewRequest);
     const requestPlan = planReviewRequest({
@@ -813,6 +835,8 @@ export default function setup(api: PluginApi) {
       });
     }
 
+    const installationId =
+      typeof reviewRequest.installationId === "number" ? reviewRequest.installationId : null;
     saveReviewDelivery({
       delivery_key: deliveryKey,
       repo,
@@ -820,6 +844,7 @@ export default function setup(api: PluginApi) {
       task_id: taskId,
       status: responseStatus,
       accepted_at: now,
+      installation_id: installationId,
     });
     if (taskId) {
       recordTaskEvent(taskId, "review.request.accepted", {
