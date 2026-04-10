@@ -24,8 +24,12 @@ describe("thread reuse kickoff message", () => {
 });
 
 test("buildDiscordAgentTarget prefers thread ids over parent channel ids", () => {
-  expect(buildDiscordAgentTarget("1488655623087325327", "1488587493698703411")).toBe("channel:1488655623087325327");
-  expect(buildDiscordAgentTarget(undefined, "1488587493698703411")).toBe("channel:1488587493698703411");
+  expect(buildDiscordAgentTarget("1488655623087325327", "1488587493698703411")).toBe(
+    "channel:1488655623087325327",
+  );
+  expect(buildDiscordAgentTarget(undefined, "1488587493698703411")).toBe(
+    "channel:1488587493698703411",
+  );
   expect(buildDiscordAgentTarget(undefined, undefined)).toBeUndefined();
 });
 

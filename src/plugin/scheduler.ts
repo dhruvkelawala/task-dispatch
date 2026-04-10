@@ -56,9 +56,7 @@ function parseCronExpression(cron: string): {
   const month = parseCronField(fields[3]!, 1, 12);
   const dayOfWeekRaw = parseCronField(fields[4]!, 0, 7);
   const dayOfWeek =
-    dayOfWeekRaw === null
-      ? null
-      : new Set(Array.from(dayOfWeekRaw).map(normalizeDayOfWeek));
+    dayOfWeekRaw === null ? null : new Set(Array.from(dayOfWeekRaw).map(normalizeDayOfWeek));
 
   return { minute, hour, dayOfMonth, month, dayOfWeek };
 }

@@ -1,9 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import {
-  buildQAReviewPrompt,
-  extractCommitHash,
-  parseMaatVerdict,
-} from "../src/plugin/qa";
+import { buildQAReviewPrompt, extractCommitHash, parseMaatVerdict } from "../src/plugin/qa";
 
 describe("qa", () => {
   test("parseMaatVerdict parses approve verdict", () => {

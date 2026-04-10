@@ -13,8 +13,10 @@ afterEach(() => {
 describe("db", () => {
   test("tables exist after initDb()", () => {
     const db = initDb(dbPath);
-    const rows = db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all();
-    const names = new Set(rows.map((r: any) => r.name));
+    const rows = db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all() as Array<{
+      name: string;
+    }>;
+    const names = new Set(rows.map((row) => row.name));
     expect(names.has("tasks")).toBeTrue();
     expect(names.has("schedules")).toBeTrue();
     expect(names.has("comments")).toBeTrue();

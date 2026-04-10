@@ -4,7 +4,17 @@ export function taskNeedsAthena(task: Pick<Task, "title" | "description">): bool
   const text = `${task.title} ${task.description || ""}`.toLowerCase();
 
   // Skip Athena for test/infra/docs tasks — even if they mention UI keywords
-  const skipKeywords = ["test", "maestro", "e2e", "ci", "infra", "docs", "refactor", "migration", "stabilize"];
+  const skipKeywords = [
+    "test",
+    "maestro",
+    "e2e",
+    "ci",
+    "infra",
+    "docs",
+    "refactor",
+    "migration",
+    "stabilize",
+  ];
   if (skipKeywords.some((kw) => text.includes(kw))) return false;
 
   const uiKeywords = [
@@ -35,10 +45,13 @@ export function formatTaskPrompt(task: Partial<Task>): string {
 
   prompt += "\n## Instructions";
   if (taskNeedsAthena({ title: task.title || "", description: task.description || null })) {
-    prompt += "\n1. First, use the task tool with subagent: athena to get a UI/UX spec for this task. Wait for the spec, then implement following it closely.";
-    prompt += "\n2. Before committing, use the task tool with subagent: maat to review your code changes. Only commit after maat approves.";
+    prompt +=
+      "\n1. First, use the task tool with subagent: athena to get a UI/UX spec for this task. Wait for the spec, then implement following it closely.";
+    prompt +=
+      "\n2. Before committing, use the task tool with subagent: maat to review your code changes. Only commit after maat approves.";
   } else {
-    prompt += "\n1. Before committing, use the task tool with subagent: maat to review your code changes. Only commit after maat approves.";
+    prompt +=
+      "\n1. Before committing, use the task tool with subagent: maat to review your code changes. Only commit after maat approves.";
   }
   prompt += "\n3. Report: commit hash, files changed, build pass/fail.";
   return prompt;

@@ -1,7 +1,8 @@
 import { sendJson } from "./tasks";
+import type { HttpResponseLike } from "../runtime-types";
 
 export function handleHealthRoute(
-  res: any,
+  res: HttpResponseLike,
   payload: {
     activeSessions: number;
     maxConcurrentSessions: number;

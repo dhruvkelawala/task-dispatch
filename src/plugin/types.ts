@@ -82,7 +82,16 @@ export interface PluginConfig {
     telegramChatId?: string;
     defaultDiscordAccountId?: string;
   };
-  agents?: Record<string, { runtime?: string; channel?: string; accountId?: string }>;
+  agents?: Record<
+    string,
+    {
+      runtime?: string;
+      channel?: string;
+      accountId?: string;
+      model?: string;
+      name?: string;
+    }
+  >;
   projects?: Record<
     string,
     {
@@ -96,6 +105,7 @@ export interface PluginConfig {
       channel?: string;
       cwd?: string;
       defaultAgent?: string;
+      reviewAgent?: string;
     }
   >;
   channels?: {
@@ -131,7 +141,10 @@ export interface SubagentRuntime {
     lane: "subagent";
     model?: string;
   }) => Promise<{ runId?: string }>;
-  waitForRun?: (args: { runId: string; timeoutMs: number }) => Promise<{ status?: string; error?: string }>;
+  waitForRun?: (args: {
+    runId: string;
+    timeoutMs: number;
+  }) => Promise<{ status?: string; error?: string }>;
   getSessionMessages?: (args: {
     sessionKey: string;
     limit: number;

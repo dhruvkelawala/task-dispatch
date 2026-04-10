@@ -3,6 +3,7 @@ import crypto from "node:crypto";
 import {
   buildTaskDispatchReviewForwardRequest,
   forwardGitHubReview,
+  isGitHubPingEvent,
   isRepoAllowedForBridge,
   normalizeGitHubPushWebhook,
   verifyGitHubSignature,
@@ -79,6 +80,11 @@ describe("github webhook helpers", () => {
     ).toThrow("unsupported_branch");
   });
 
+  test("recognizes GitHub ping events", () => {
+    expect(isGitHubPingEvent("ping")).toBeTrue();
+    expect(isGitHubPingEvent("push")).toBeFalse();
+  });
+
   test("builds a task-dispatch forward request", async () => {
     const payload = normalizeGitHubPushWebhook({
       deliveryId: "delivery-123",
@@ -99,9 +105,7 @@ describe("github webhook helpers", () => {
 
     expect(request.url).toBe("http://127.0.0.1:18789/api/tasks/review");
     expect(request.init.method).toBe("POST");
-    expect((request.init.headers as Record<string, string>)["X-API-Key"]).toBe(
-      "secret-key",
-    );
+    expect((request.init.headers as Record<string, string>)["X-API-Key"]).toBe("secret-key");
     expect(JSON.parse(String(request.init.body))).toEqual(payload);
   });
 

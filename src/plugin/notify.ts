@@ -11,9 +11,7 @@ export function resolveBotToken(accountId: string): string | null {
     const { readFileSync } = require("node:fs") as {
       readFileSync: (path: string, enc: string) => string;
     };
-    const cfg = JSON.parse(
-      readFileSync(`${process.env.HOME}/.openclaw/openclaw.json`, "utf8"),
-    ) as {
+    const cfg = JSON.parse(readFileSync(`${process.env.HOME}/.openclaw/openclaw.json`, "utf8")) as {
       channels?: { discord?: { accounts?: Record<string, { token?: string }> } };
     };
     return cfg.channels?.discord?.accounts?.[accountId]?.token || null;

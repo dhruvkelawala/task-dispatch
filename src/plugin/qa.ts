@@ -15,7 +15,9 @@ export function collectStringValues(value: unknown, out: string[]): void {
   }
 }
 
-export function extractOutputFromMessages(messages: Array<{ role?: string; content?: unknown }>): string {
+export function extractOutputFromMessages(
+  messages: Array<{ role?: string; content?: unknown }>,
+): string {
   if (!Array.isArray(messages) || messages.length === 0) return "";
   for (let i = messages.length - 1; i >= 0; i -= 1) {
     const msg = messages[i];

@@ -36,17 +36,13 @@ describe("routes", () => {
     const getTask = (id: string) => db.prepare("SELECT * FROM tasks WHERE id = ?").get(id);
 
     const res = createRes();
-    await handleCreateTask(
-      { body: { title: "T", agent: "builder" } },
-      res,
-      {
-        db,
-        insert,
-        getTask,
-        defaultTaskTimeoutMs: 60_000,
-        triggerDispatch: () => {},
-      },
-    );
+    await handleCreateTask({ body: { title: "T", agent: "builder" } }, res, {
+      db,
+      insert,
+      getTask,
+      defaultTaskTimeoutMs: 60_000,
+      triggerDispatch: () => {},
+    });
 
     expect(res.status).toBe(201);
   });
@@ -60,17 +56,13 @@ describe("routes", () => {
     const getTask = (id: string) => db.prepare("SELECT * FROM tasks WHERE id = ?").get(id);
 
     const res = createRes();
-    await handleCreateTask(
-      { body: { agent: "builder" } },
-      res,
-      {
-        db,
-        insert,
-        getTask,
-        defaultTaskTimeoutMs: 60_000,
-        triggerDispatch: () => {},
-      },
-    );
+    await handleCreateTask({ body: { agent: "builder" } }, res, {
+      db,
+      insert,
+      getTask,
+      defaultTaskTimeoutMs: 60_000,
+      triggerDispatch: () => {},
+    });
     expect(res.status).toBe(400);
   });
 
@@ -79,7 +71,7 @@ describe("routes", () => {
     const now = Date.now();
     db.prepare(
       `INSERT INTO tasks (id, title, description, agent, runtime, project_id, channel_id, cwd, model, thinking, depends_on, chain_id, status, manual_complete, timeout_ms, review_attempts, qa_required, created_at, updated_at)
-      VALUES (@id, @title, @description, @agent, @runtime, @project_id, @channel_id, @cwd, @model, @thinking, @depends_on, @chain_id, @status, @manual_complete, @timeout_ms, @review_attempts, @qa_required, @created_at, @updated_at)`
+      VALUES (@id, @title, @description, @agent, @runtime, @project_id, @channel_id, @cwd, @model, @thinking, @depends_on, @chain_id, @status, @manual_complete, @timeout_ms, @review_attempts, @qa_required, @created_at, @updated_at)`,
     ).run({
       id: "task-1",
       title: "T",
@@ -103,16 +95,11 @@ describe("routes", () => {
     });
 
     const res = createRes();
-    await handleUpdateTask(
-      { body: { status: "ready" } },
-      res,
-      "task-1",
-      {
-        db,
-        getTask: (id: string) => db.prepare("SELECT * FROM tasks WHERE id = ?").get(id),
-        defaultTaskTimeoutMs: 60_000,
-      },
-    );
+    await handleUpdateTask({ body: { status: "ready" } }, res, "task-1", {
+      db,
+      getTask: (id: string) => db.prepare("SELECT * FROM tasks WHERE id = ?").get(id),
+      defaultTaskTimeoutMs: 60_000,
+    });
     expect(res.status).toBe(400);
   });
 });

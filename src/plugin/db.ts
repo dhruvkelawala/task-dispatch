@@ -2,6 +2,7 @@ import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { createRequire } from "node:module";
 import type { Comment, Schedule, Task, TaskStatus } from "./types";
+import type { DatabaseLike, JsonObject, PreparedStatementLike } from "./runtime-types";
 
 const require = createRequire(import.meta.url);
 
@@ -33,15 +34,31 @@ export function isValidTransition(from: TaskStatus, to: TaskStatus): boolean {
   return allowed ? allowed.includes(to) : false;
 }
 
-function createInMemoryDb(): any {
+type DbRowObject = Record<string, unknown>;
+
+function stringOrNull(value: unknown): string | null {
+  return typeof value === "string" ? value : null;
+}
+
+function numberOrNull(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function toRowObject(value: unknown): DbRowObject {
+  return typeof value === "object" && value !== null ? { ...(value as DbRowObject) } : {};
+}
+
+function createInMemoryDb(): DatabaseLike {
   const tables: {
-    tasks: Array<Record<string, any>>;
-    schedules: Array<Record<string, any>>;
-    comments: Array<Record<string, any>>;
-    task_events: Array<Record<string, any>>;
-    projects: Array<Record<string, any>>;
-    project_commits: Array<Record<string, any>>;
-    project_snapshots: Array<Record<string, any>>;
+    tasks: DbRowObject[];
+    schedules: DbRowObject[];
+    comments: DbRowObject[];
+    task_events: DbRowObject[];
+    projects: DbRowObject[];
+    project_commits: DbRowObject[];
+    project_snapshots: DbRowObject[];
+    review_state: DbRowObject[];
+    review_deliveries: DbRowObject[];
   } = {
     tasks: [],
     schedules: [],
@@ -50,16 +67,18 @@ function createInMemoryDb(): any {
     projects: [],
     project_commits: [],
     project_snapshots: [],
+    review_state: [],
+    review_deliveries: [],
   };
 
   function selectById(
     table: "tasks" | "schedules" | "comments",
     id: string,
-  ): Record<string, any> | undefined {
+  ): DbRowObject | undefined {
     return tables[table].find((row) => row.id === id);
   }
 
-  function runUpdate(sql: string, params: Record<string, any>): void {
+  function runUpdate(sql: string, params: DbRowObject): void {
     const row = selectById("tasks", String(params.id));
     if (!row) return;
     const setSql = sql.split("SET")[1]?.split("WHERE")[0] || "";
@@ -90,28 +109,63 @@ function createInMemoryDb(): any {
   return {
     pragma() {},
     exec() {},
-    prepare(sql: string) {
-      return {
-        run: (...args: any[]) => {
+    transaction<TArgs extends unknown[]>(fn: (...args: TArgs) => void) {
+      return (...args: TArgs) => fn(...args);
+    },
+    prepare<TResult = unknown>(sql: string) {
+      const statement: PreparedStatementLike<unknown> = {
+        run: (...args: unknown[]) => {
           if (sql.startsWith("INSERT INTO tasks")) {
-            const row = args[0] as Record<string, any>;
+            const row = toRowObject(args[0]);
             tables.tasks.push({ ...row });
             return;
           }
           if (sql.startsWith("UPDATE tasks SET")) {
-            runUpdate(sql, (args[0] || {}) as Record<string, any>);
+            runUpdate(sql, toRowObject(args[0]));
             return;
           }
           if (sql.startsWith("INSERT INTO comments")) {
-            tables.comments.push({ ...(args[0] || {}) });
+            tables.comments.push(toRowObject(args[0]));
             return;
           }
           if (sql.startsWith("INSERT INTO task_events")) {
-            tables.task_events.push({ ...(args[0] || {}) });
+            tables.task_events.push(toRowObject(args[0]));
             return;
           }
           if (sql.startsWith("INSERT INTO schedules")) {
-            tables.schedules.push({ ...(args[0] || {}) });
+            tables.schedules.push(toRowObject(args[0]));
+            return;
+          }
+          if (sql.startsWith("INSERT INTO review_state")) {
+            const row = toRowObject(args[0]);
+            tables.review_state = tables.review_state.filter((entry) => entry.repo !== row.repo);
+            tables.review_state.push(row);
+            return;
+          }
+          if (sql.startsWith("INSERT INTO review_deliveries")) {
+            const row = toRowObject(args[0]);
+            tables.review_deliveries = tables.review_deliveries.filter(
+              (entry) => entry.delivery_key !== row.delivery_key,
+            );
+            tables.review_deliveries.push(row);
+            return;
+          }
+          if (sql.startsWith("UPDATE review_state SET")) {
+            const params = toRowObject(args[0]);
+            const row = tables.review_state.find((entry) => entry.repo === String(params.repo));
+            if (row) {
+              Object.assign(row, params);
+            }
+            return;
+          }
+          if (sql.startsWith("UPDATE review_deliveries SET")) {
+            const params = toRowObject(args[0]);
+            const row = tables.review_deliveries.find(
+              (entry) => entry.delivery_key === String(params.delivery_key),
+            );
+            if (row) {
+              Object.assign(row, params);
+            }
             return;
           }
           if (sql.startsWith("DELETE FROM task_events WHERE task_id = ?")) {
@@ -129,13 +183,29 @@ function createInMemoryDb(): any {
             tables.tasks = tables.tasks.filter((row) => row.id !== id);
           }
         },
-        get: (...args: any[]) => {
+        get: (...args: unknown[]) => {
           if (sql.startsWith("SELECT * FROM tasks WHERE id = ?")) {
             return selectById("tasks", String(args[0]));
           }
+          if (sql.startsWith("SELECT * FROM review_state WHERE repo = ?")) {
+            return tables.review_state.find((row) => row.repo === String(args[0]));
+          }
+          if (sql.startsWith("SELECT * FROM review_state WHERE active_task_id = ?")) {
+            return tables.review_state.find((row) => row.active_task_id === String(args[0]));
+          }
+          if (sql.startsWith("SELECT * FROM review_deliveries WHERE delivery_key = ?")) {
+            return tables.review_deliveries.find((row) => row.delivery_key === String(args[0]));
+          }
+          if (sql.startsWith("SELECT * FROM review_deliveries WHERE repo = ? AND sha = ?")) {
+            return tables.review_deliveries.find(
+              (row) => row.repo === String(args[0]) && row.sha === String(args[1]),
+            );
+          }
           if (sql.includes("SELECT COUNT(*) as c FROM tasks WHERE id IN")) {
             const ids = args.map(String);
-            const c = tables.tasks.filter((row) => ids.includes(String(row.id)) && row.status === "done").length;
+            const c = tables.tasks.filter(
+              (row) => ids.includes(String(row.id)) && row.status === "done",
+            ).length;
             return { c };
           }
           if (sql.startsWith("SELECT COUNT(*) as c FROM tasks WHERE id = ?")) {
@@ -145,11 +215,13 @@ function createInMemoryDb(): any {
             return { c: tables.comments.filter((row) => row.task_id === String(args[0])).length };
           }
           if (sql.startsWith("SELECT COUNT(*) as c FROM task_events WHERE task_id = ?")) {
-            return { c: tables.task_events.filter((row) => row.task_id === String(args[0])).length };
+            return {
+              c: tables.task_events.filter((row) => row.task_id === String(args[0])).length,
+            };
           }
           return undefined;
         },
-        all: (...args: any[]) => {
+        all: (...args: unknown[]) => {
           if (sql.includes("sqlite_master")) {
             return [
               { name: "tasks" },
@@ -159,6 +231,8 @@ function createInMemoryDb(): any {
               { name: "projects" },
               { name: "project_commits" },
               { name: "project_snapshots" },
+              { name: "review_state" },
+              { name: "review_deliveries" },
             ];
           }
           if (sql.startsWith("SELECT * FROM tasks")) {
@@ -174,22 +248,25 @@ function createInMemoryDb(): any {
               .filter((row) => row.task_id === taskId)
               .sort((a, b) => {
                 const desc = sql.includes("ORDER BY created_at DESC");
-                return desc ? Number(b.created_at) - Number(a.created_at) : Number(a.created_at) - Number(b.created_at);
+                return desc
+                  ? Number(b.created_at) - Number(a.created_at)
+                  : Number(a.created_at) - Number(b.created_at);
               });
             return ordered.slice(0, limit);
           }
           return [];
         },
       };
+      return statement as PreparedStatementLike<TResult>;
     },
   };
 }
 
-export function initDb(dbPath: string): any {
+export function initDb(dbPath: string): DatabaseLike {
   mkdirSync(dirname(dbPath), { recursive: true });
-  let db: any;
+  let db: DatabaseLike;
   try {
-    const Database = require("better-sqlite3") as new (path: string) => any;
+    const Database = require("better-sqlite3") as new (path: string) => DatabaseLike;
     db = new Database(dbPath);
   } catch {
     db = createInMemoryDb();
@@ -312,6 +389,28 @@ export function initDb(dbPath: string): any {
       generated_at TEXT DEFAULT (datetime('now')),
       model TEXT
     );
+
+    CREATE TABLE IF NOT EXISTS review_state (
+      repo TEXT PRIMARY KEY,
+      last_reviewed_sha TEXT,
+      last_review_at INTEGER,
+      pending_from_sha TEXT,
+      pending_to_sha TEXT,
+      pending_task_id TEXT,
+      pending_updated_at INTEGER,
+      active_from_sha TEXT,
+      active_to_sha TEXT,
+      active_task_id TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS review_deliveries (
+      delivery_key TEXT PRIMARY KEY,
+      repo TEXT NOT NULL,
+      sha TEXT NOT NULL,
+      task_id TEXT,
+      status TEXT NOT NULL,
+      accepted_at INTEGER NOT NULL
+    );
   `);
 
   try {
@@ -332,8 +431,8 @@ export function initDb(dbPath: string): any {
   return db;
 }
 
-export function seedProjectsIfEmpty(db: any): void {
-  const row = db.prepare("SELECT COUNT(*) AS count FROM projects").get();
+export function seedProjectsIfEmpty(db: DatabaseLike): void {
+  const row = db.prepare<{ count: number }>("SELECT COUNT(*) AS count FROM projects").get();
   const count = Number(row?.count || 0);
   if (count > 0) return;
 
@@ -343,7 +442,7 @@ export function seedProjectsIfEmpty(db: any): void {
   `);
 
   if (typeof db.transaction === "function") {
-    const insertMany = db.transaction((rows: any[]) => {
+    const insertMany = db.transaction((rows: typeof PROJECT_SEED_ROWS) => {
       for (const project of rows) {
         insertProject.run(project);
       }
@@ -357,37 +456,37 @@ export function seedProjectsIfEmpty(db: any): void {
   }
 }
 
-type DbRow = Record<string, any> | null | undefined;
+export type DbRow = DbRowObject | null | undefined;
 
 export function rowToTask(row: DbRow): Task | null {
   if (!row) return null;
   return {
     id: String(row.id),
     title: String(row.title),
-    description: row.description ?? null,
+    description: stringOrNull(row.description),
     agent: String(row.agent),
-    runtime: row.runtime ?? null,
-    projectId: row.project_id ?? null,
-    channelId: row.channel_id ?? null,
-    cwd: row.cwd ?? null,
-    model: row.model ?? null,
-    thinking: row.thinking ?? null,
-    dependsOn: JSON.parse(row.depends_on || "[]") as string[],
-    chainId: row.chain_id ?? null,
+    runtime: stringOrNull(row.runtime),
+    projectId: stringOrNull(row.project_id),
+    channelId: stringOrNull(row.channel_id),
+    cwd: stringOrNull(row.cwd),
+    model: stringOrNull(row.model),
+    thinking: stringOrNull(row.thinking),
+    dependsOn: typeof row.depends_on === "string" ? (JSON.parse(row.depends_on) as string[]) : [],
+    chainId: stringOrNull(row.chain_id),
     status: row.status as TaskStatus,
     manualComplete: Boolean(row.manual_complete),
-    sessionKey: row.session_key ?? null,
-    runId: row.run_id ?? null,
-    timeoutMs: row.timeout_ms ?? null,
-    threadId: row.thread_id ?? null,
-    output: row.output ?? null,
+    sessionKey: stringOrNull(row.session_key),
+    runId: stringOrNull(row.run_id),
+    timeoutMs: numberOrNull(row.timeout_ms),
+    threadId: stringOrNull(row.thread_id),
+    output: stringOrNull(row.output),
     retries: Number(row.retries || 0),
     reviewAttempts: Number(row.review_attempts || 0),
     qaRequired: row.qa_required !== 0,
-    error: row.error ?? null,
+    error: stringOrNull(row.error),
     createdAt: Number(row.created_at),
     updatedAt: Number(row.updated_at),
-    completedAt: row.completed_at ?? null,
+    completedAt: numberOrNull(row.completed_at),
   };
 }
 
@@ -396,20 +495,20 @@ export function rowToSchedule(row: DbRow): Schedule | null {
   return {
     id: String(row.id),
     title: String(row.title),
-    description: row.description ?? null,
+    description: stringOrNull(row.description),
     agent: String(row.agent),
-    projectId: row.project_id ?? null,
-    cwd: row.cwd ?? null,
-    category: row.category ?? null,
+    projectId: stringOrNull(row.project_id),
+    cwd: stringOrNull(row.cwd),
+    category: stringOrNull(row.category),
     qaRequired: row.qa_required !== 0,
     cronExpression: String(row.cron),
-    nlExpression: row.nl_expression ?? null,
-    timeoutMs: row.timeout_ms ?? null,
+    nlExpression: stringOrNull(row.nl_expression),
+    timeoutMs: numberOrNull(row.timeout_ms),
     enabled: row.enabled !== 0,
-    lastRunAt: row.last_run_at ?? null,
-    nextRunAt: row.next_run_at ?? null,
-    createdAt: row.created_at ?? null,
-    updatedAt: row.updated_at ?? null,
+    lastRunAt: numberOrNull(row.last_run_at),
+    nextRunAt: numberOrNull(row.next_run_at),
+    createdAt: numberOrNull(row.created_at),
+    updatedAt: numberOrNull(row.updated_at),
   };
 }
 
@@ -424,27 +523,37 @@ export function rowToComment(row: DbRow): Comment | null {
   };
 }
 
-export function rowToTaskEvent(row: DbRow): { id: number; taskId: string; eventType: string; payload: any; createdAt: number } | null {
+export function rowToTaskEvent(row: DbRow): {
+  id: number;
+  taskId: string;
+  eventType: string;
+  payload: JsonObject | null;
+  createdAt: number;
+} | null {
   if (!row) return null;
   return {
     id: Number(row.id),
     taskId: String(row.task_id),
     eventType: String(row.event_type),
-    payload: row.payload ? JSON.parse(row.payload) : null,
+    payload: typeof row.payload === "string" ? (JSON.parse(row.payload) as JsonObject) : null,
     createdAt: Number(row.created_at),
   };
 }
 
-export function listTaskEvents(db: any, taskId: string, opts: { order?: "asc" | "desc"; limit?: number } = {}) {
+export function listTaskEvents(
+  db: DatabaseLike,
+  taskId: string,
+  opts: { order?: "asc" | "desc"; limit?: number } = {},
+) {
   const limit = Math.max(1, Math.min(Number(opts.limit || 100), 500));
   const order = String(opts.order || "desc").toLowerCase() === "asc" ? "ASC" : "DESC";
   return db
     .prepare(`SELECT * FROM task_events WHERE task_id = ? ORDER BY created_at ${order} LIMIT ?`)
     .all(taskId, limit)
-    .map(rowToTaskEvent);
+    .map((row) => rowToTaskEvent(row as DbRow));
 }
 
-export function deleteTaskCascade(db: any, taskId: string): void {
+export function deleteTaskCascade(db: DatabaseLike, taskId: string): void {
   db.prepare("DELETE FROM task_events WHERE task_id = ?").run(taskId);
   db.prepare("DELETE FROM comments WHERE task_id = ?").run(taskId);
   db.prepare("DELETE FROM tasks WHERE id = ?").run(taskId);
