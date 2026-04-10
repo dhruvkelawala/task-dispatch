@@ -141,6 +141,11 @@ export function buildReviewTaskDescription(params: {
     params.compareUrl ? `Compare URL: ${params.compareUrl}` : null,
     "",
     "Instructions:",
+    "0. FIRST: ensure the local repo is up to date. Run `git fetch origin && git checkout " +
+      (params.branch || "main") +
+      " && git pull origin " +
+      (params.branch || "main") +
+      "` before anything else. If the commit range is not resolvable after pulling, report reviewOutcome as failed_retryable.",
     `1. Run \`git log --oneline ${params.fromSha}..${params.toSha}\` and \`git diff ${params.fromSha}..${params.toSha}\`.`,
     "2. Review for bugs, edge cases, missing tests, security issues, architecture drift, and follow-up work.",
     "3. Classify each finding with category + severity.",
