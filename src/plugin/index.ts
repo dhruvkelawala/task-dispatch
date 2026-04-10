@@ -259,7 +259,7 @@ export default function setup(api: PluginApi) {
     db,
     stderr: process.stderr,
   });
-  const { createDiscordThread, postToThread, resolveBotToken } = discordRuntime;
+  const { createDiscordThread, postToThread, readThreadMessages, resolveBotToken } = discordRuntime;
   function resolveAccountId(agent: string): string {
     return AGENT_ACCOUNT_IDS[agent] || agent || DEFAULT_DISCORD_ACCOUNT_ID;
   }
@@ -325,6 +325,7 @@ export default function setup(api: PluginApi) {
     resolveAccountId,
     createDiscordThread,
     postToThread,
+    readThreadMessages,
     getActiveSessionCount,
     getTask: (id) => rowToTask(getTask(id) as Record<string, unknown> | null | undefined),
     onTaskChanged,

@@ -37,6 +37,7 @@ type DispatchRuntimeDeps = {
   resolveAccountId: (agent: string) => string;
   createDiscordThread: (task: Task) => Promise<string | null>;
   postToThread: (threadId: string | null, content: string, accountId: string) => Promise<void>;
+  readThreadMessages: (threadId: string, accountId: string, limit?: number) => Promise<string[]>;
   formatDiscordThreadUrl: (threadId: string | null | undefined) => string | null;
   operatorLabel: string;
   getActiveSessionCount: () => number;
@@ -544,6 +545,20 @@ export function createDispatchRuntime(deps: DispatchRuntimeDeps) {
         limit: 200,
       });
       text = extractOutputFromMessages(sessionMessages?.messages || []);
+    }
+
+    // ACP sessions don't store messages in the subagent message store.
+    // Fall back to reading the Discord thread for the agent's output.
+    if (!text && task.threadId) {
+      const accountId = deps.resolveAccountId(task.agent);
+      const threadMessages = await deps.readThreadMessages(task.threadId, accountId, 10);
+      // Find the longest bot message — that's likely the review output
+      text = threadMessages.reduce((best, msg) => (msg.length > best.length ? msg : best), "");
+      if (text) {
+        deps.stderr.write(
+          `[DISPATCH.ACP] Recovered ${text.length} chars from Discord thread for ${task.id}\n`,
+        );
+      }
     }
 
     deps.db

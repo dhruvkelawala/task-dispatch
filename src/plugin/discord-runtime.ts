@@ -163,9 +163,42 @@ export function createDiscordRuntime(deps: DiscordRuntimeDeps) {
     }
   }
 
+  async function readThreadMessages(
+    threadId: string,
+    accountId: string,
+    limit = 20,
+  ): Promise<string[]> {
+    const token = resolveBotToken(accountId);
+    if (!token) return [];
+
+    try {
+      const response = await fetch(
+        `https://discord.com/api/v10/channels/${threadId}/messages?limit=${limit}`,
+        {
+          headers: {
+            Authorization: `Bot ${token}`,
+            "User-Agent": "DiscordBot (https://openclaw.ai, 1.0)",
+          },
+        },
+      );
+      if (!response.ok) return [];
+      const messages = (await response.json()) as Array<{
+        content?: string;
+        author?: { bot?: boolean };
+      }>;
+      // Return bot messages newest-first (Discord returns newest first)
+      return messages
+        .filter((m) => m.author?.bot && typeof m.content === "string" && m.content.trim())
+        .map((m) => m.content!);
+    } catch {
+      return [];
+    }
+  }
+
   return {
     resolveBotToken,
     postToThread,
     createDiscordThread,
+    readThreadMessages,
   };
 }
