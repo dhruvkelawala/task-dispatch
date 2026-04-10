@@ -319,12 +319,14 @@ export function createDispatchRuntime(deps: DispatchRuntimeDeps) {
         agentId: resumeHarness,
         cwd: resolvedCwd,
         resumeSessionId: task.sessionKey,
-        thread: false,
-      } as unknown as Parameters<NonNullable<typeof acp.spawn>>[0],
+        mode: "session",
+        thread: true,
+      },
       {
         agentChannel: "discord",
         agentAccountId: accountId,
         agentTo: buildDiscordAgentTarget(task.threadId, channelId),
+        agentThreadId: task.threadId || undefined,
       },
     );
 
@@ -472,12 +474,14 @@ export function createDispatchRuntime(deps: DispatchRuntimeDeps) {
         label: `${task.title.slice(0, 32)}-${task.id.slice(0, 8)}-${Date.now()}`,
         agentId: harness,
         cwd: resolvedCwd,
-        thread: false,
+        mode: "session",
+        thread: true,
       },
       {
         agentChannel: "discord",
         agentAccountId: accountId,
         agentTo: buildDiscordAgentTarget(dispatchThreadId, channelId),
+        agentThreadId: dispatchThreadId,
       },
     );
     if (result?.status !== "accepted")

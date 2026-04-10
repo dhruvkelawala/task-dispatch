@@ -170,19 +170,25 @@ export interface AcpRuntime {
       label: string;
       agentId: string;
       cwd: string;
+      mode?: "run" | "session";
       thread: boolean;
+      resumeSessionId?: string;
     },
     routing: {
       agentChannel: string;
       agentAccountId: string;
       agentTo?: string;
+      agentThreadId?: string | number;
+      agentGroupId?: string;
     },
   ) => Promise<{
-    status?: string;
-    error?: string;
-    childSessionKey?: string;
-    runId?: string;
-  }>;
+      status?: string;
+      error?: string;
+      childSessionKey?: string;
+      runId?: string;
+      mode?: "run" | "session";
+      streamLogPath?: string;
+    }>;
 }
 
 export interface PluginApi {
