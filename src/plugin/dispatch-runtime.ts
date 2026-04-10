@@ -454,9 +454,13 @@ export function createDispatchRuntime(deps: DispatchRuntimeDeps) {
     const accountId = deps.resolveAccountId(task.agent);
     const existingThreadId =
       typeof task.threadId === "string" && task.threadId.trim() ? task.threadId.trim() : null;
-    const dispatchThreadId = existingThreadId || (await deps.createDiscordThread(task));
-    if (!dispatchThreadId)
-      throw new Error(`failed to create or resolve a Discord thread for task ${task.id}`);
+
+    // For ACP sessions, let ACP own thread creation/binding. Creating the
+    // Discord thread ourselves and then asking ACP to bind to that existing
+    // thread can fail with "Session binding adapter failed to bind target
+    // conversation". The supported ACP flow is: target the parent channel,
+    // request `thread: true`, and let ACP create/bind the child thread.
+    const dispatchThreadId = existingThreadId;
 
     deps.db
       .prepare(
@@ -480,8 +484,9 @@ export function createDispatchRuntime(deps: DispatchRuntimeDeps) {
       {
         agentChannel: "discord",
         agentAccountId: accountId,
-        agentTo: buildDiscordAgentTarget(dispatchThreadId, channelId),
-        agentThreadId: dispatchThreadId,
+        // Target the parent review channel; ACP will create/bind the child
+        // thread itself and deliver output there.
+        agentTo: channelId ? `channel:${channelId}` : undefined,
       },
     );
     if (result?.status !== "accepted")
@@ -494,19 +499,17 @@ export function createDispatchRuntime(deps: DispatchRuntimeDeps) {
 
     deps.db
       .prepare(
-        "UPDATE tasks SET session_key = @sessionKey, run_id = @runId, thread_id = @threadId, updated_at = @updated_at WHERE id = @id",
+        "UPDATE tasks SET session_key = @sessionKey, run_id = @runId, updated_at = @updated_at WHERE id = @id",
       )
       .run({
         id: task.id,
         sessionKey: childSessionKey,
         runId: childRunId,
-        threadId: dispatchThreadId,
         updated_at: Date.now(),
       });
-    task.threadId = dispatchThreadId;
     task.sessionKey = childSessionKey;
 
-    if (existingThreadId) {
+    if (existingThreadId && dispatchThreadId) {
       await deps
         .postToThread(
           dispatchThreadId,
@@ -553,6 +556,29 @@ export function createDispatchRuntime(deps: DispatchRuntimeDeps) {
 
     // ACP sessions don't store messages in the subagent message store.
     // Fall back to reading the Discord thread for the agent's output.
+    // First resolve the created/bound thread id from the binding store if ACP
+    // created one for us.
+    if (!task.threadId) {
+      try {
+        const { readFileSync } = require("node:fs") as typeof import("node:fs");
+        const bindingsPath = `${process.env.HOME}/.openclaw/discord/thread-bindings.json`;
+        const bindingsData = JSON.parse(readFileSync(bindingsPath, "utf8")) as {
+          bindings?: Record<string, { targetSessionKey?: string; threadId?: string }>;
+        };
+        for (const binding of Object.values(bindingsData.bindings || {})) {
+          if (binding.targetSessionKey === childSessionKey && binding.threadId) {
+            task.threadId = binding.threadId;
+            deps.db
+              .prepare("UPDATE tasks SET thread_id = @threadId, updated_at = @updated_at WHERE id = @id")
+              .run({ id: task.id, threadId: task.threadId, updated_at: Date.now() });
+            break;
+          }
+        }
+      } catch {
+        // best effort — if no binding file yet, output capture may still fail
+      }
+    }
+
     if (!text && task.threadId) {
       const accountId = deps.resolveAccountId(task.agent);
       const threadMessages = await deps.readThreadMessages(task.threadId, accountId, 10);
