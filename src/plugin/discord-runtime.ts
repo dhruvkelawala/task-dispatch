@@ -32,11 +32,26 @@ export function createDiscordRuntime(deps: DiscordRuntimeDeps) {
 
       // Fallback: use OpenClaw gateway config (api.config.channels.discord.accounts)
       const openclawAccounts = deps.openclawConfig?.channels?.discord?.accounts;
-      const fromOpenclawConfig =
-        openclawAccounts?.[accountId]?.token || openclawAccounts?.default?.token;
-      if (typeof fromOpenclawConfig === "string") return fromOpenclawConfig;
+      const rawToken = openclawAccounts?.[accountId]?.token || openclawAccounts?.default?.token;
+      // Token may be a plain string or a SecretRef object — extract the string value
+      if (typeof rawToken === "string") return rawToken;
+      if (rawToken && typeof rawToken === "object") {
+        const secretObj = rawToken as Record<string, unknown>;
+        // Handle SecretRef: { $secret: "value" } or { value: "..." }
+        const resolved = secretObj.$secret || secretObj.value || secretObj.resolved;
+        if (typeof resolved === "string") return resolved;
+      }
 
-      return null;
+      // Last resort: read directly from openclaw.json on disk
+      try {
+        const { readFileSync } = require("node:fs") as typeof import("node:fs");
+        const cfg = JSON.parse(
+          readFileSync(`${process.env.HOME}/.openclaw/openclaw.json`, "utf8"),
+        ) as { channels?: { discord?: { accounts?: Record<string, { token?: string }> } } };
+        return cfg.channels?.discord?.accounts?.[accountId]?.token || null;
+      } catch {
+        return null;
+      }
     } catch {
       return null;
     }
