@@ -76,7 +76,8 @@ export function createLifecycleRuntime(deps: {
 
   function registerCompletionHook(): void {
     deps.api.on("subagent_ended", (event) => {
-      const sessionKey = (event as { targetSessionKey?: string }).targetSessionKey;
+      const eventPayload = event as { targetSessionKey?: string; sessionKey?: string };
+      const sessionKey = eventPayload.targetSessionKey || eventPayload.sessionKey;
       if (!sessionKey) return;
       const task = deps.db
         .prepare<DbRow>(

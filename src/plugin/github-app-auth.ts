@@ -44,9 +44,7 @@ export async function getInstallationToken(
 
   if (!response.ok) {
     const body = await response.text();
-    throw new Error(
-      `Failed to get installation token: ${response.status} ${body.slice(0, 500)}`,
-    );
+    throw new Error(`Failed to get installation token: ${response.status} ${body.slice(0, 500)}`);
   }
 
   const data = (await response.json()) as { token?: string };

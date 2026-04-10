@@ -9,7 +9,11 @@ type DiscordRuntimeDeps = {
   resolveAccountId: (agent: string) => string;
   resolveChannel: (task: Partial<Task>) => string | null;
   formatDiscordThreadUrl: (threadId: string | null | undefined) => string | null;
-  recordTaskEvent: (taskId: string, eventType: string, payload?: Record<string, unknown> | null) => void;
+  recordTaskEvent: (
+    taskId: string,
+    eventType: string,
+    payload?: Record<string, unknown> | null,
+  ) => void;
   db: DatabaseLike;
   stderr: Pick<typeof process.stderr, "write">;
 };
@@ -41,12 +45,12 @@ export function createDiscordRuntime(deps: DiscordRuntimeDeps) {
   async function postToThread(
     threadId: string | null,
     content: string,
-    accountId?: string,
+    accountId: string,
   ): Promise<void> {
     if (!threadId) return;
 
     const token =
-      (accountId && resolveBotToken(accountId)) ||
+      resolveBotToken(accountId) ||
       resolveBotToken(deps.defaultDiscordAccountId) ||
       resolveBotToken("default");
     if (!token) return;

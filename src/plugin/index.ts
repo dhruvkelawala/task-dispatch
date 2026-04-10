@@ -243,7 +243,9 @@ export default function setup(api: PluginApi) {
 
   const discordRuntime = createDiscordRuntime({
     config: CONFIG,
-    openclawConfig: api.config as { channels?: { discord?: { accounts?: Record<string, { token?: string }> } } },
+    openclawConfig: api.config as {
+      channels?: { discord?: { accounts?: Record<string, { token?: string }> } };
+    },
     defaultDiscordAccountId: DEFAULT_DISCORD_ACCOUNT_ID,
     resolveAccountId,
     resolveChannel,
@@ -1017,9 +1019,6 @@ export default function setup(api: PluginApi) {
     recordTaskEvent,
     onTaskChanged,
     triggerDispatch,
-    resolveAccountId,
-    formatDiscordThreadUrl,
-    resolveBotToken,
     requireApiKey,
     sseClients,
     backgroundEnqueue: (kind, taskId) => backgroundJobs.enqueue({ kind, taskId }),

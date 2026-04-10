@@ -397,7 +397,6 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps) {
     parsedSummary: ParsedReviewSummary | null,
     now: number,
   ): void {
-
     const mergedFrom = reviewState.active_from_sha || reviewState.pending_from_sha;
     const mergedTo = reviewState.pending_to_sha || reviewState.active_to_sha;
     let pendingTaskId = reviewState.pending_task_id;

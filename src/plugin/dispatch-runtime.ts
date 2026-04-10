@@ -35,7 +35,7 @@ type DispatchRuntimeDeps = {
   resolveQaRequired: (task: Partial<Task>) => boolean;
   resolveAccountId: (agent: string) => string;
   createDiscordThread: (task: Task) => Promise<string | null>;
-  postToThread: (threadId: string | null, content: string, accountId?: string) => Promise<void>;
+  postToThread: (threadId: string | null, content: string, accountId: string) => Promise<void>;
   formatDiscordThreadUrl: (threadId: string | null | undefined) => string | null;
   operatorLabel: string;
   getActiveSessionCount: () => number;

@@ -15,6 +15,23 @@ export function collectStringValues(value: unknown, out: string[]): void {
   }
 }
 
+/**
+ * Strip subagent framing metadata from extracted output.
+ * Removes:
+ * - Leading "text\n" content-type marker
+ * - Trailing {"v":1,"id":"msg_...","phase":"final_answer"} envelope
+ */
+function stripSubagentFraming(text: string): string {
+  let result = text;
+  // Remove leading "text\n" content-type marker
+  if (result.startsWith("text\n")) {
+    result = result.slice(5);
+  }
+  // Remove trailing OpenClaw message envelope
+  result = result.replace(/\s*\{"v":\d+,"id":"msg_[^"]+","phase":"[^"]+"\}\s*$/, "");
+  return result.trim();
+}
+
 export function extractOutputFromMessages(
   messages: Array<{ role?: string; content?: unknown }>,
 ): string {
@@ -24,10 +41,12 @@ export function extractOutputFromMessages(
     if (!msg || msg.role !== "assistant") continue;
 
     const direct = msg.content;
-    if (typeof direct === "string" && direct.trim()) return direct;
+    if (typeof direct === "string" && direct.trim()) {
+      return stripSubagentFraming(direct);
+    }
     const strings: string[] = [];
     collectStringValues(direct, strings);
-    if (strings.length > 0) return strings.join("\n");
+    if (strings.length > 0) return stripSubagentFraming(strings.join("\n"));
   }
   return "";
 }

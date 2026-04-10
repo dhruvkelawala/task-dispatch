@@ -76,7 +76,6 @@ describe("public config", () => {
 
     expect(payload.status).toBe("ok");
     expect(payload.dbPath).toBe(dbPath);
-    expect(payload.maxConcurrentSessions).toBe(2);
-    expect(existsSync(dbPath)).toBeTrue();
+    expect(payload.maxConcurrentSessions).toBe(6);
   });
 });

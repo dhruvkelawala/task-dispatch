@@ -31,9 +31,6 @@ type TaskApiRuntimeDeps = {
   ) => void;
   onTaskChanged: (taskId: string) => void;
   triggerDispatch: (taskId: string) => void;
-  resolveAccountId: (agent: string) => string;
-  formatDiscordThreadUrl: (threadId: string | null | undefined) => string | null;
-  resolveBotToken: (accountId: string) => string | null;
   requireApiKey: (req: PluginHttpRequest, res: PluginHttpResponse) => boolean;
   sseClients: Set<SseClientLike>;
   backgroundEnqueue: (kind: "dispatch" | "resume" | "qa", taskId: string) => boolean;
