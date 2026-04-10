@@ -250,6 +250,7 @@ export function createDispatchRuntime(deps: DispatchRuntimeDeps) {
   function triggerDispatch(taskId: string): void {
     const task = deps.getTask(taskId);
     if (!task || task.status !== "ready") return;
+    deps.backgroundEnqueue(taskId);
     deps.recordTaskEvent(taskId, "dispatch.queued", null);
   }
 

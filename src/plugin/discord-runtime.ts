@@ -3,15 +3,13 @@ import type { DatabaseLike } from "./runtime-types";
 
 type DiscordRuntimeDeps = {
   config: PluginConfig;
+  /** OpenClaw gateway config — used to resolve Discord bot tokens from openclaw.json */
+  openclawConfig?: { channels?: { discord?: { accounts?: Record<string, { token?: string }> } } };
   defaultDiscordAccountId: string;
   resolveAccountId: (agent: string) => string;
   resolveChannel: (task: Partial<Task>) => string | null;
   formatDiscordThreadUrl: (threadId: string | null | undefined) => string | null;
-  recordTaskEvent: (
-    taskId: string,
-    eventType: string,
-    payload?: Record<string, unknown> | null,
-  ) => void;
+  recordTaskEvent: (taskId: string, eventType: string, payload?: Record<string, unknown> | null) => void;
   db: DatabaseLike;
   stderr: Pick<typeof process.stderr, "write">;
 };
@@ -23,8 +21,18 @@ function getErrorMessage(error: unknown): string {
 export function createDiscordRuntime(deps: DiscordRuntimeDeps) {
   function resolveBotToken(accountId: string): string | null {
     try {
-      const accounts = deps.config.channels?.discord?.accounts;
-      return accounts?.[accountId]?.token || accounts?.default?.token || null;
+      // First try task-dispatch plugin config
+      const pluginAccounts = deps.config.channels?.discord?.accounts;
+      const fromPluginConfig = pluginAccounts?.[accountId]?.token || pluginAccounts?.default?.token;
+      if (fromPluginConfig) return fromPluginConfig;
+
+      // Fallback: use OpenClaw gateway config (api.config.channels.discord.accounts)
+      const openclawAccounts = deps.openclawConfig?.channels?.discord?.accounts;
+      const fromOpenclawConfig =
+        openclawAccounts?.[accountId]?.token || openclawAccounts?.default?.token;
+      if (typeof fromOpenclawConfig === "string") return fromOpenclawConfig;
+
+      return null;
     } catch {
       return null;
     }
