@@ -241,6 +241,11 @@ export default function setup(api: PluginApi) {
     return (task.agent ? AGENT_RUNTIME[task.agent] : undefined) || "subagent";
   }
 
+  function resolveHarness(task: Partial<Task>): string {
+    const agentConfig = task.agent ? CONFIG.agents?.[task.agent] : undefined;
+    return agentConfig?.harness || "opencode";
+  }
+
   const discordRuntime = createDiscordRuntime({
     config: CONFIG,
     openclawConfig: api.config as {
@@ -313,6 +318,7 @@ export default function setup(api: PluginApi) {
     defaultDiscordAccountId: DEFAULT_DISCORD_ACCOUNT_ID,
     resolveCwd,
     resolveRuntime,
+    resolveHarness,
     resolveChannel,
     resolveTaskTimeoutMs,
     resolveQaRequired,

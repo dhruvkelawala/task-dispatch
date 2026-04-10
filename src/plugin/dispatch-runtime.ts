@@ -30,6 +30,7 @@ type DispatchRuntimeDeps = {
   defaultDiscordAccountId: string;
   resolveCwd: (task: Partial<Task>) => string | null;
   resolveRuntime: (task: Partial<Task>) => string;
+  resolveHarness: (task: Partial<Task>) => string;
   resolveChannel: (task: Partial<Task>) => string | null;
   resolveTaskTimeoutMs: (task: Partial<Task>) => number;
   resolveQaRequired: (task: Partial<Task>) => boolean;
@@ -263,7 +264,8 @@ export function createDispatchRuntime(deps: DispatchRuntimeDeps) {
     }
 
     const runtimeType = deps.resolveRuntime(task);
-    const acpBackend = runtimeType === "acp" ? "opencode" : task.agent;
+    const harness = deps.resolveHarness(task);
+    const acpBackend = runtimeType === "acp" ? harness : task.agent;
     const sessionKey = `agent:${acpBackend}:${runtimeType}:${crypto.randomUUID()}`;
     const cwd = deps.resolveCwd(task);
     deps.stderr.write(`[DISPATCH] ${runtimeType} spawn for ${task.id}\n`);
@@ -308,11 +310,12 @@ export function createDispatchRuntime(deps: DispatchRuntimeDeps) {
         .catch(() => {});
     }
 
+    const resumeHarness = deps.resolveHarness(task);
     const result = await acp.spawn(
       {
         task: "Continue where you left off. Your previous session was interrupted. Check git log and git status to see your progress, then complete the remaining work.",
         label: `resume-${task.id.slice(0, 8)}-${Date.now()}`,
-        agentId: "opencode",
+        agentId: resumeHarness,
         cwd: resolvedCwd,
         resumeSessionId: task.sessionKey,
         thread: false,
@@ -461,11 +464,12 @@ export function createDispatchRuntime(deps: DispatchRuntimeDeps) {
 
     let childSessionKey = sessionKey;
     let childRunId = "";
+    const harness = deps.resolveHarness(task);
     const result = await acp.spawn(
       {
         task: prompt,
         label: `${task.title.slice(0, 32)}-${task.id.slice(0, 8)}-${Date.now()}`,
-        agentId: "opencode",
+        agentId: harness,
         cwd: resolvedCwd,
         thread: false,
       },

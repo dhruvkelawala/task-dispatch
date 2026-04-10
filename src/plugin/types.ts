@@ -87,6 +87,8 @@ export interface PluginConfig {
     string,
     {
       runtime?: string;
+      /** ACP harness id: "opencode", "claude", "codex", "gemini", etc. */
+      harness?: string;
       channel?: string;
       accountId?: string;
       model?: string;
