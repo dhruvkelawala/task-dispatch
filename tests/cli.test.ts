@@ -3,8 +3,10 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+type CliTestHelpers = typeof import("../src/cli/index").__test;
+
 let cleanupPath = "";
-let cliTest: any;
+let cliTest: CliTestHelpers;
 
 beforeAll(async () => {
   const home = mkdtempSync(join(tmpdir(), "dispatch-cli-unit-home-"));
@@ -16,8 +18,18 @@ beforeAll(async () => {
     JSON.stringify(
       {
         projects: {
-          "web-app": { cwd: "/tmp/web-app", channel: "chan-web", defaultAgent: "builder", aliases: ["web"] },
-          "control-plane": { cwd: "/tmp/control", channel: "chan-control", defaultAgent: "builder", aliases: ["cp"] },
+          "web-app": {
+            cwd: "/tmp/web-app",
+            channel: "chan-web",
+            defaultAgent: "builder",
+            aliases: ["web"],
+          },
+          "control-plane": {
+            cwd: "/tmp/control",
+            channel: "chan-control",
+            defaultAgent: "builder",
+            aliases: ["cp"],
+          },
           sdk: { cwd: "/tmp/sdk", channel: "chan-sdk", defaultAgent: "reviewer", aliases: ["kit"] },
           cli: { cwd: "/tmp/cli", channel: "chan-cli", defaultAgent: "builder" },
         },
@@ -64,7 +76,8 @@ describe("cli helpers", () => {
   test("classifyTaskFailure detects QA model switch failures", () => {
     const result = cliTest.classifyTaskFailure({
       status: "error",
-      error: "QA review loop failed: LiveSessionModelSwitchError: Live session model switch requested: anthropic/claude-sonnet-4-6",
+      error:
+        "QA review loop failed: LiveSessionModelSwitchError: Live session model switch requested: anthropic/claude-sonnet-4-6",
     });
     expect(result.category).toBe("qa_model_switch");
     expect(result.nextStep).toContain("--no-qa");

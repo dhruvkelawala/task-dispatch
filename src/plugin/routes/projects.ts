@@ -1,5 +1,61 @@
 import { parseBody, sendError, sendJson } from "./tasks";
 import { fetchRepoCommits, summarizeProject } from "../summarize";
+import type {
+  DatabaseLike,
+  HttpRequestLike,
+  HttpResponseLike,
+  PluginRouteApiLike,
+  SseClientLike,
+} from "../runtime-types";
+
+type ProjectCommitRow = {
+  id: number;
+  project_id: string;
+  sha: string;
+  message: string | null;
+  author: string | null;
+  date: string | null;
+  branch: string | null;
+};
+
+type ProjectCommitPayload = {
+  projectId: string;
+  sha: string;
+  message: string | null;
+  author: string | null;
+  date: string | null;
+  branch: string | null;
+};
+
+type ProjectDetailsRow = {
+  id: string;
+  name: string;
+  repo: string | null;
+  branch: string | null;
+  priority: number | null;
+  status: string | null;
+  description: string | null;
+  cwd: string | null;
+  tags: string | null;
+  linked_tasks_count: number | null;
+  snapshot_id: number | null;
+  snapshot_summary: string | null;
+  snapshot_progress_pct: number | null;
+  snapshot_blockers: string | null;
+  snapshot_generated_at: string | null;
+  snapshot_model: string | null;
+  commit_sha: string | null;
+  commit_message: string | null;
+  commit_author: string | null;
+  commit_date: string | null;
+  commit_branch: string | null;
+  created_at: string | number | null;
+  updated_at: string | number | null;
+};
+
+function getErrorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
 
 function parseJsonArray(text: unknown): string[] {
   if (typeof text !== "string") return [];
@@ -11,7 +67,7 @@ function parseJsonArray(text: unknown): string[] {
   }
 }
 
-function rowToProjectCommit(row: any) {
+function rowToProjectCommit(row: ProjectCommitRow) {
   return {
     id: row.id,
     projectId: row.project_id,
@@ -23,7 +79,7 @@ function rowToProjectCommit(row: any) {
   };
 }
 
-function rowToProject(row: any) {
+function rowToProject(row: ProjectDetailsRow) {
   return {
     id: row.id,
     name: row.name,
@@ -59,7 +115,7 @@ function rowToProject(row: any) {
   };
 }
 
-function listProjectsWithDetails(db: any) {
+function listProjectsWithDetails(db: DatabaseLike): ProjectDetailsRow[] {
   const sql = `
       SELECT
         p.*,
@@ -98,10 +154,10 @@ function listProjectsWithDetails(db: any) {
       ORDER BY p.priority ASC, p.updated_at DESC
     `;
 
-  return db.prepare(sql).all();
+  return db.prepare<ProjectDetailsRow>(sql).all();
 }
 
-function getProjectWithDetails(db: any, id: string) {
+function getProjectWithDetails(db: DatabaseLike, id: string): ProjectDetailsRow | undefined {
   const sql = `
       SELECT
         p.*,
@@ -140,15 +196,22 @@ function getProjectWithDetails(db: any, id: string) {
       WHERE p.id = ?
     `;
 
-  return db.prepare(sql).get(id);
+  return db.prepare<ProjectDetailsRow>(sql).get(id);
 }
 
-export function registerProjectRoutes(api: any, ctx: { db: any; sseClients: Set<any>; requireApiKey: (req: any, res: any) => boolean }): void {
+export function registerProjectRoutes(
+  api: PluginRouteApiLike,
+  ctx: {
+    db: DatabaseLike;
+    sseClients: Set<SseClientLike>;
+    requireApiKey: (req: HttpRequestLike, res: HttpResponseLike) => boolean;
+  },
+): void {
   api.registerHttpRoute({
     path: "/api/projects",
     match: "prefix",
     auth: "plugin",
-    handler: async (req: any, res: any) => {
+    handler: async (req: HttpRequestLike, res: HttpResponseLike) => {
       try {
         const pathname = (req.url || "").split("?")[0] || "";
         const parts = pathname.split("/").filter(Boolean);
@@ -166,7 +229,7 @@ export function registerProjectRoutes(api: any, ctx: { db: any; sseClients: Set<
         }
 
         if (segments.length === 1) {
-          const id = segments[0];
+          const id = segments[0]!;
           if (method === "GET") {
             const row = getProjectWithDetails(ctx.db, id);
             if (!row) {
@@ -174,7 +237,9 @@ export function registerProjectRoutes(api: any, ctx: { db: any; sseClients: Set<
               return true;
             }
 
-            const tasks = ctx.db.prepare("SELECT * FROM tasks WHERE project_id = ? ORDER BY created_at DESC").all(id);
+            const tasks = ctx.db
+              .prepare("SELECT * FROM tasks WHERE project_id = ? ORDER BY created_at DESC")
+              .all(id);
             sendJson(res, {
               ...rowToProject(row),
               tasks,
@@ -216,9 +281,16 @@ export function registerProjectRoutes(api: any, ctx: { db: any; sseClients: Set<
             }
 
             if (setClauses.length > 1) {
-              ctx.db.prepare(`UPDATE projects SET ${setClauses.join(", ")} WHERE id = @id`).run(params);
+              ctx.db
+                .prepare(`UPDATE projects SET ${setClauses.join(", ")} WHERE id = @id`)
+                .run(params);
             }
-            const updated = rowToProject(getProjectWithDetails(ctx.db, id));
+            const updatedRow = getProjectWithDetails(ctx.db, id);
+            if (!updatedRow) {
+              sendError(res, 404, "Project not found");
+              return true;
+            }
+            const updated = rowToProject(updatedRow);
             sendJson(res, updated);
 
             const payload = { projectId: id, project: updated };
@@ -235,15 +307,19 @@ export function registerProjectRoutes(api: any, ctx: { db: any; sseClients: Set<
         }
 
         if (segments.length === 2 && segments[1] === "commits") {
-          const id = segments[0];
+          const id = segments[0]!;
           if (method === "GET") {
-            const project = ctx.db.prepare("SELECT id FROM projects WHERE id = ?").get(id);
+            const project = ctx.db
+              .prepare<{ id: string }>("SELECT id FROM projects WHERE id = ?")
+              .get(id);
             if (!project) {
               sendError(res, 404, "Project not found");
               return true;
             }
             const rows = ctx.db
-              .prepare("SELECT * FROM project_commits WHERE project_id = ? ORDER BY date DESC, id DESC LIMIT 20")
+              .prepare<ProjectCommitRow>(
+                "SELECT * FROM project_commits WHERE project_id = ? ORDER BY date DESC, id DESC LIMIT 20",
+              )
               .all(id);
             sendJson(res, rows.map(rowToProjectCommit));
             return true;
@@ -253,10 +329,14 @@ export function registerProjectRoutes(api: any, ctx: { db: any; sseClients: Set<
         }
 
         if (segments.length === 2 && segments[1] === "refresh") {
-          const id = segments[0];
+          const id = segments[0]!;
           if (method === "POST") {
             if (!ctx.requireApiKey(req, res)) return true;
-            const project = ctx.db.prepare("SELECT id, repo, branch FROM projects WHERE id = ?").get(id);
+            const project = ctx.db
+              .prepare<{ id: string; repo: string | null; branch: string | null }>(
+                "SELECT id, repo, branch FROM projects WHERE id = ?",
+              )
+              .get(id);
             if (!project) {
               sendError(res, 404, "Project not found");
               return true;
@@ -266,11 +346,11 @@ export function registerProjectRoutes(api: any, ctx: { db: any; sseClients: Set<
               return true;
             }
 
-            let commits: any[] = [];
+            let commits: Awaited<ReturnType<typeof fetchRepoCommits>> = [];
             try {
               commits = await fetchRepoCommits(project.repo, 10);
-            } catch (error: any) {
-              sendError(res, 502, `GitHub refresh failed: ${error?.message || String(error)}`);
+            } catch (error: unknown) {
+              sendError(res, 502, `GitHub refresh failed: ${getErrorMessage(error)}`);
               return true;
             }
 
@@ -279,8 +359,8 @@ export function registerProjectRoutes(api: any, ctx: { db: any; sseClients: Set<
               VALUES (@project_id, @sha, @message, @author, @date, @branch)
             `);
 
-            const newlyInserted: any[] = [];
-            const insertMany = ctx.db.transaction((rows: any[]) => {
+            const newlyInserted: ProjectCommitPayload[] = [];
+            const insertMany = ctx.db.transaction?.((rows: typeof commits) => {
               for (const entry of rows) {
                 const normalized = {
                   project_id: id,
@@ -291,8 +371,8 @@ export function registerProjectRoutes(api: any, ctx: { db: any; sseClients: Set<
                   branch: project.branch || "main",
                 };
 
-                const result = insertCommit.run(normalized);
-                if (result.changes > 0) {
+                const result = insertCommit.run(normalized) as { changes?: number } | undefined;
+                if ((result?.changes || 0) > 0) {
                   newlyInserted.push({
                     projectId: id,
                     sha: normalized.sha,
@@ -305,7 +385,21 @@ export function registerProjectRoutes(api: any, ctx: { db: any; sseClients: Set<
               }
             });
 
-            insertMany(commits);
+            if (insertMany) {
+              insertMany(commits);
+            } else {
+              for (const entry of commits) {
+                const normalized = {
+                  project_id: id,
+                  sha: entry.sha,
+                  message: entry.commit?.message ?? null,
+                  author: entry.commit?.author?.name ?? entry.author?.login ?? null,
+                  date: entry.commit?.author?.date ?? null,
+                  branch: project.branch || "main",
+                };
+                insertCommit.run(normalized);
+              }
+            }
             sendJson(res, { projectId: id, commits: newlyInserted });
 
             if (newlyInserted.length > 0) {
@@ -324,10 +418,14 @@ export function registerProjectRoutes(api: any, ctx: { db: any; sseClients: Set<
         }
 
         if (segments.length === 2 && segments[1] === "summarize") {
-          const id = segments[0];
+          const id = segments[0]!;
           if (method === "POST") {
             if (!ctx.requireApiKey(req, res)) return true;
-            const project = ctx.db.prepare("SELECT id, repo FROM projects WHERE id = ?").get(id);
+            const project = ctx.db
+              .prepare<{ id: string; repo: string | null }>(
+                "SELECT id, repo FROM projects WHERE id = ?",
+              )
+              .get(id);
             if (!project) {
               sendError(res, 404, "Project not found");
               return true;
@@ -340,8 +438,8 @@ export function registerProjectRoutes(api: any, ctx: { db: any; sseClients: Set<
             try {
               const snapshot = await summarizeProject(ctx.db, { id }, ctx.sseClients);
               sendJson(res, { projectId: id, snapshot });
-            } catch (error: any) {
-              sendError(res, 500, `Project summarize failed: ${error?.message || String(error)}`);
+            } catch (error: unknown) {
+              sendError(res, 500, `Project summarize failed: ${getErrorMessage(error)}`);
             }
             return true;
           }
@@ -351,8 +449,8 @@ export function registerProjectRoutes(api: any, ctx: { db: any; sseClients: Set<
 
         sendError(res, 404, "Not found");
         return true;
-      } catch (e: any) {
-        sendError(res, 500, e?.message || String(e));
+      } catch (error: unknown) {
+        sendError(res, 500, getErrorMessage(error));
         return true;
       }
     },

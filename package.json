@@ -8,8 +8,9 @@
     "build:cli": "bun build src/cli/index.ts --compile --outfile=build/dispatch",
     "build": "bun run build:plugin && bun run build:cli",
     "typecheck": "tsc --noEmit",
-    "lint": "oxlint src/",
-    "format": "oxfmt src/",
+    "lint": "oxlint -c .oxlintrc.json src tests",
+    "format": "oxfmt src tests",
+    "format:check": "oxfmt --check src tests",
     "test": "bun test tests/",
     "install:cli": "cp build/dispatch ~/.local/bin/dispatch"
   },

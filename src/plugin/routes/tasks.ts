@@ -2,40 +2,60 @@ import crypto from "node:crypto";
 import { isValidTransition, rowToTask } from "../db";
 import { normalizeTimeoutMs } from "../config";
 import type { Task, TaskStatus } from "../types";
+import type {
+  DatabaseLike,
+  HttpRequestLike,
+  HttpResponseLike,
+  JsonObject,
+  PreparedStatementLike,
+} from "../runtime-types";
 
-export function sendJson(res: any, payload: unknown, status = 200): void {
+export function sendJson(res: HttpResponseLike, payload: unknown, status = 200): void {
   res.writeHead(status, { "Content-Type": "application/json" });
   res.end(JSON.stringify(payload, null, 2));
 }
 
-export function sendError(res: any, status: number, message: string): void {
+export function sendError(res: HttpResponseLike, status: number, message: string): void {
   sendJson(res, { error: message }, status);
 }
 
-export async function parseBody(req: any): Promise<Record<string, any>> {
-  if (typeof req?.body === "object" && req.body !== null) return req.body;
-  return await new Promise((resolve, reject) => {
+export async function parseBody(req: HttpRequestLike): Promise<JsonObject> {
+  if (typeof req.body === "object" && req.body !== null) {
+    return req.body as JsonObject;
+  }
+  if (!req.on) {
+    return {};
+  }
+  const on = req.on.bind(req);
+  return await new Promise<JsonObject>((resolve, reject) => {
     let body = "";
-    req.on("data", (c: string) => (body += c));
-    req.on("end", () => {
+    on("data", (chunk: unknown) => {
+      body += typeof chunk === "string" ? chunk : String(chunk);
+    });
+    on("end", () => {
       if (!body) return resolve({});
       try {
-        resolve(JSON.parse(body));
+        const parsed = JSON.parse(body);
+        if (typeof parsed !== "object" || parsed === null) {
+          reject(new Error("JSON body must be an object"));
+          return;
+        }
+        resolve(parsed as JsonObject);
       } catch {
         reject(new Error("Invalid JSON body"));
       }
     });
-    req.on("error", reject);
+    on("error", reject);
   });
 }
 
 export async function handleCreateTask(
-  req: any,
-  res: any,
+  req: HttpRequestLike,
+  res: HttpResponseLike,
   ctx: {
-    db: any;
-    getTask: (id: string) => any;
-    insert: any;
+    db: DatabaseLike;
+    getTask: (id: string) => unknown;
+    insert: PreparedStatementLike;
     defaultTaskTimeoutMs: number;
     triggerDispatch: (taskId: string) => void;
   },
@@ -48,7 +68,7 @@ export async function handleCreateTask(
 
   const now = Date.now();
   const id = crypto.randomUUID();
-  const dependsOn = (body.dependsOn || []).filter(
+  const dependsOn = (Array.isArray(body.dependsOn) ? body.dependsOn : []).filter(
     (depId: unknown) => typeof depId === "string" && depId.trim().length > 0,
   );
 
@@ -58,7 +78,9 @@ export async function handleCreateTask(
   } else {
     const placeholders = dependsOn.map(() => "?").join(",");
     const doneCount = ctx.db
-      .prepare(`SELECT COUNT(*) as c FROM tasks WHERE id IN (${placeholders}) AND status = 'done'`)
+      .prepare<{ c: number }>(
+        `SELECT COUNT(*) as c FROM tasks WHERE id IN (${placeholders}) AND status = 'done'`,
+      )
       .get(...dependsOn);
     if (doneCount && doneCount.c === dependsOn.length) status = "ready";
   }
@@ -85,16 +107,20 @@ export async function handleCreateTask(
     updated_at: now,
   };
   ctx.insert.run(row);
-  const created = rowToTask(ctx.getTask(id));
+  const created = rowToTask(ctx.getTask(id) as Record<string, unknown> | null | undefined);
   sendJson(res, created, 201);
   if (status === "ready") ctx.triggerDispatch(id);
 }
 
 export async function handleUpdateTask(
-  req: any,
-  res: any,
+  req: HttpRequestLike,
+  res: HttpResponseLike,
   id: string,
-  ctx: { getTask: (id: string) => any; db: any; defaultTaskTimeoutMs: number },
+  ctx: {
+    getTask: (id: string) => unknown;
+    db: DatabaseLike;
+    defaultTaskTimeoutMs: number;
+  },
 ): Promise<void> {
   const existing = ctx.getTask(id);
   if (!existing) {
@@ -104,9 +130,11 @@ export async function handleUpdateTask(
   const body = await parseBody(req);
   const now = Date.now();
 
-  if (body.status && body.status !== existing.status) {
-    if (!isValidTransition(existing.status as TaskStatus, body.status as TaskStatus)) {
-      sendError(res, 400, `Invalid status transition: ${existing.status} → ${body.status}`);
+  const existingRow = existing as Record<string, unknown>;
+
+  if (body.status && body.status !== existingRow.status) {
+    if (!isValidTransition(existingRow.status as TaskStatus, body.status as TaskStatus)) {
+      sendError(res, 400, `Invalid status transition: ${existingRow.status} → ${body.status}`);
       return;
     }
   }
@@ -136,7 +164,7 @@ export async function handleUpdateTask(
   };
 
   const sets = ["updated_at = @updated_at"];
-  const params: Record<string, any> = { id, updated_at: now };
+  const params: Record<string, unknown> = { id, updated_at: now };
   for (const [apiField, dbCol] of Object.entries(updatableFields)) {
     if (body[apiField] !== undefined) {
       let value: unknown = body[apiField];
@@ -169,7 +197,7 @@ export async function handleUpdateTask(
   const sql = `UPDATE tasks SET ${sets.join(", ")} WHERE id = @id`;
   ctx.db.prepare(sql).run(params);
   const updated = ctx.getTask(id);
-  sendJson(res, rowToTask(updated));
+  sendJson(res, rowToTask(updated as Record<string, unknown> | null | undefined));
 }
 
 export function parsePath(url: string): { segments: string[] } {

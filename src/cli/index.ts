@@ -18,7 +18,10 @@ type DispatchConfig = {
       aliases?: string[];
     }
   >;
-  agents?: Record<string, { runtime?: string; model?: string; channel?: string; accountId?: string }>;
+  agents?: Record<
+    string,
+    { runtime?: string; model?: string; channel?: string; accountId?: string }
+  >;
   defaults?: {
     defaultAgent?: string;
     defaultCwd?: string;
@@ -54,7 +57,11 @@ function apiKey(required = false): string {
   return value;
 }
 
-async function doReq(method: string, path: string, body: unknown): Promise<{ data: string; status: number }> {
+async function doReq(
+  method: string,
+  path: string,
+  body: unknown,
+): Promise<{ data: string; status: number }> {
   const headers: Record<string, string> = {};
   const normalizedMethod = method.toUpperCase();
   const writeRequest = !["GET", "HEAD"].includes(normalizedMethod);
@@ -114,21 +121,24 @@ function availableProjectsText(): string {
   const entries = projectEntries();
   if (entries.length === 0) return "(no projects configured)";
   return entries
-    .map((entry) => `- ${entry.key} → ${entry.cwd}${entry.channel !== "-" ? ` | channel ${entry.channel}` : ""}`)
+    .map(
+      (entry) =>
+        `- ${entry.key} → ${entry.cwd}${entry.channel !== "-" ? ` | channel ${entry.channel}` : ""}`,
+    )
     .join("\n");
 }
 
 function levenshtein(a: string, b: string): number {
   const dp = Array.from({ length: a.length + 1 }, () => Array(b.length + 1).fill(0));
-  for (let i = 0; i <= a.length; i += 1) dp[i][0] = i;
-  for (let j = 0; j <= b.length; j += 1) dp[0][j] = j;
+  for (let i = 0; i <= a.length; i += 1) dp[i]![0] = i;
+  for (let j = 0; j <= b.length; j += 1) dp[0]![j] = j;
   for (let i = 1; i <= a.length; i += 1) {
     for (let j = 1; j <= b.length; j += 1) {
       const cost = a[i - 1] === b[j - 1] ? 0 : 1;
-      dp[i][j] = Math.min(dp[i - 1][j] + 1, dp[i][j - 1] + 1, dp[i - 1][j - 1] + cost);
+      dp[i]![j] = Math.min(dp[i - 1]![j]! + 1, dp[i]![j - 1]! + 1, dp[i - 1]![j - 1]! + cost);
     }
   }
-  return dp[a.length][b.length];
+  return dp[a.length]![b.length]!;
 }
 
 function suggestProjects(input: string): string[] {
@@ -152,8 +162,9 @@ function inferProjectFromCwd(cwd: string): ProjectEntry | null {
   const normalized = (cwd || "").trim().replace(/\/$/, "");
   if (!normalized) return null;
   return (
-    projectEntries().find((entry) => entry.cwd !== "-" && entry.cwd.replace(/\/$/, "") === normalized) ||
-    null
+    projectEntries().find(
+      (entry) => entry.cwd !== "-" && entry.cwd.replace(/\/$/, "") === normalized,
+    ) || null
   );
 }
 
@@ -163,10 +174,18 @@ async function fetchTasks(): Promise<Array<Record<string, unknown>>> {
   return JSON.parse(data) as Array<Record<string, unknown>>;
 }
 
-async function fetchTaskEvents(id: string, order: "asc" | "desc" = "desc", limit = 100): Promise<Array<Record<string, unknown>>> {
+async function fetchTaskEvents(
+  id: string,
+  order: "asc" | "desc" = "desc",
+  limit = 100,
+): Promise<Array<Record<string, unknown>>> {
   const resolvedId = await resolveTaskId(id);
   const qs = new URLSearchParams({ order, limit: String(limit) });
-  const { data, status } = await doReq("GET", `/api/tasks/${resolvedId}/events?${qs.toString()}`, null);
+  const { data, status } = await doReq(
+    "GET",
+    `/api/tasks/${resolvedId}/events?${qs.toString()}`,
+    null,
+  );
   if (status >= 400) fail(`HTTP ${status}: ${data}`);
   return JSON.parse(data) as Array<Record<string, unknown>>;
 }
@@ -180,7 +199,7 @@ async function resolveTaskId(input: string): Promise<string> {
   if (matches.length === 1) return String(matches[0]?.id || id);
   if (matches.length > 1) {
     fail(
-      `Ambiguous short task ID \"${id}\". Matches:\n${matches
+      `Ambiguous short task ID "${id}". Matches:\n${matches
         .map((task) => `- ${String(task.id || "")}  ${String(task.title || "")}`)
         .join("\n")}`,
     );
@@ -210,24 +229,28 @@ function formatTime(v: unknown): string {
   }
   if (typeof v === "number") {
     const ms = v > 1e12 ? v : v * 1000;
-    return new Date(ms).toLocaleString("en-GB", {
-      hour: "2-digit",
-      minute: "2-digit",
-      day: "2-digit",
-      month: "short",
-      hour12: false,
-    }).replace(",", "");
-  }
-  if (typeof v === "string") {
-    const d = new Date(v);
-    if (!Number.isNaN(d.getTime())) {
-      return d.toLocaleString("en-GB", {
+    return new Date(ms)
+      .toLocaleString("en-GB", {
         hour: "2-digit",
         minute: "2-digit",
         day: "2-digit",
         month: "short",
         hour12: false,
-      }).replace(",", "");
+      })
+      .replace(",", "");
+  }
+  if (typeof v === "string") {
+    const d = new Date(v);
+    if (!Number.isNaN(d.getTime())) {
+      return d
+        .toLocaleString("en-GB", {
+          hour: "2-digit",
+          minute: "2-digit",
+          day: "2-digit",
+          month: "short",
+          hour12: false,
+        })
+        .replace(",", "");
     }
     return v;
   }
@@ -305,30 +328,59 @@ function statusLabel(status: string): string {
   }
 }
 
-function classifyTaskFailure(task: Record<string, unknown>): { category: string; nextStep: string } {
+function classifyTaskFailure(task: Record<string, unknown>): {
+  category: string;
+  nextStep: string;
+} {
   const error = String(task.error || "");
   if (!error) {
     if (String(task.status || "") === "done") {
       return { category: "done", nextStep: "Inspect the thread or test the output locally." };
     }
     if (["ready", "dispatched", "in_progress", "review"].includes(String(task.status || ""))) {
-      return { category: "active", nextStep: "Use dispatch follow <id> to watch it progress live." };
+      return {
+        category: "active",
+        nextStep: "Use dispatch follow <id> to watch it progress live.",
+      };
     }
-    return { category: "unknown", nextStep: "Inspect the task history/logs if you need more detail." };
+    return {
+      category: "unknown",
+      nextStep: "Inspect the task history/logs if you need more detail.",
+    };
   }
   if (error.includes("LiveSessionModelSwitchError")) {
-    return { category: "qa_model_switch", nextStep: "Use dispatch retry <id> --no-qa or fix the QA runtime path first." };
+    return {
+      category: "qa_model_switch",
+      nextStep: "Use dispatch retry <id> --no-qa or fix the QA runtime path first.",
+    };
   }
   if (error.includes("produced nothing") || error.includes("no output")) {
-    return { category: "silent_failure", nextStep: "Retry with a fresh run and verify the model/runtime selection." };
+    return {
+      category: "silent_failure",
+      nextStep: "Retry with a fresh run and verify the model/runtime selection.",
+    };
   }
-  if (error.includes("thread binding") || error.includes("no thread binding") || error.includes("Discord thread")) {
-    return { category: "thread_binding", nextStep: "Check project/channel routing and Discord thread binding before retrying." };
+  if (
+    error.includes("thread binding") ||
+    error.includes("no thread binding") ||
+    error.includes("Discord thread")
+  ) {
+    return {
+      category: "thread_binding",
+      nextStep: "Check project/channel routing and Discord thread binding before retrying.",
+    };
   }
   if (String(task.status || "") === "blocked") {
-    return { category: "blocked", nextStep: "Human intervention is probably needed before another rerun." };
+    return {
+      category: "blocked",
+      nextStep: "Human intervention is probably needed before another rerun.",
+    };
   }
-  return { category: "generic_error", nextStep: "Use dispatch retry <id> for a fresh rerun, or fix the underlying issue first if it is systemic." };
+  return {
+    category: "generic_error",
+    nextStep:
+      "Use dispatch retry <id> for a fresh rerun, or fix the underlying issue first if it is systemic.",
+  };
 }
 
 async function askInteractive(question: string, defaultValue = ""): Promise<string> {
@@ -392,7 +444,7 @@ async function cmdCreate(args: string[]): Promise<void> {
         selectedProject = resolved;
         payload.cwd = resolved.cwd !== "-" ? resolved.cwd : undefined;
         payload.projectId = resolved.key;
-        if (resolved.defaultAgent) payload.agent = resolved.defaultAgent;
+        if (resolved.defaultAgent && !explicitAgent) payload.agent = resolved.defaultAgent;
         break;
       }
       case "-c":
@@ -453,7 +505,10 @@ async function cmdCreate(args: string[]): Promise<void> {
       case "--depends-on":
       case "--after": {
         i += 1;
-        const depIds = (args[i] || "").split(",").map((s) => s.trim()).filter(Boolean);
+        const depIds = (args[i] || "")
+          .split(",")
+          .map((s) => s.trim())
+          .filter(Boolean);
         if (depIds.length === 0) fail("--depends-on requires at least one task ID");
         const existing = (payload.dependsOn as string[] | undefined) || [];
         payload.dependsOn = [...existing, ...depIds];
@@ -512,13 +567,18 @@ async function cmdCreate(args: string[]): Promise<void> {
       }
     }
     if (!payload.projectId) {
-      process.stdout.write(`Projects: ${projectEntries().map((p) => p.key).join(", ")}\n`);
+      process.stdout.write(
+        `Projects: ${projectEntries()
+          .map((p) => p.key)
+          .join(", ")}\n`,
+      );
       const projectAnswer = await askInteractive("Project key");
       const resolved = resolveProject(projectAnswer);
       if (!resolved) fail(`Unknown project: ${projectAnswer}`);
       selectedProject = resolved;
       payload.projectId = resolved.key;
-      if (!payload.cwd || payload.cwd === "-") payload.cwd = resolved.cwd !== "-" ? resolved.cwd : payload.cwd;
+      if (!payload.cwd || payload.cwd === "-")
+        payload.cwd = resolved.cwd !== "-" ? resolved.cwd : payload.cwd;
       if (!explicitAgent && resolved.defaultAgent) payload.agent = resolved.defaultAgent;
     }
     if (!desc) desc = await askInteractive("Description (optional)");
@@ -528,7 +588,9 @@ async function cmdCreate(args: string[]): Promise<void> {
     payload.qaRequired = !["n", "no", "false", "0"].includes(qaAnswer.toLowerCase());
     const timeoutAnswer = await askInteractive("Timeout ms", String(payload.timeoutMs || ""));
     if (timeoutAnswer) payload.timeoutMs = Number(timeoutAnswer);
-    process.stdout.write(`\nCreate task?\nProject: ${String(payload.projectId)}\nCWD: ${String(payload.cwd || "-")}\nAgent: ${String(payload.agent || "-")}\nQA: ${payload.qaRequired ? "on" : "off"}\n`);
+    process.stdout.write(
+      `\nCreate task?\nProject: ${String(payload.projectId)}\nCWD: ${String(payload.cwd || "-")}\nAgent: ${String(payload.agent || "-")}\nQA: ${payload.qaRequired ? "on" : "off"}\n`,
+    );
     const confirm = await askInteractive("Proceed? yes/no", "yes");
     if (["n", "no", "false", "0"].includes(confirm.toLowerCase())) {
       process.stdout.write("Aborted.\n");
@@ -538,15 +600,15 @@ async function cmdCreate(args: string[]): Promise<void> {
 
   if (!title) {
     fail(
-      "Usage: dispatch create -t \"title\" -d \"description\" -p project [-a agent] [-c category] [--no-qa] [--timeout ms] [--from task-id]",
+      'Usage: dispatch create -t "title" -d "description" -p project [-a agent] [-c category] [--no-qa] [--timeout ms] [--from task-id]',
     );
   }
 
   if (!payload.projectId) {
     fail(
       "Error: --project (-p) is required. Tasks without a project land in the wrong channel.\n\n" +
-      `Available projects:\n${availableProjectsText()}\n\n` +
-      "Tip: run `dispatch projects` to inspect configured projects.",
+        `Available projects:\n${availableProjectsText()}\n\n` +
+        "Tip: run `dispatch projects` to inspect configured projects.",
     );
   }
 
@@ -588,7 +650,11 @@ async function cmdList(args: string[] = []): Promise<void> {
     const resolved = resolveProject(parsed.project);
     qs.set("projectId", resolved?.key || parsed.project);
   }
-  const { data, status } = await doReq("GET", `/api/tasks${qs.toString() ? `?${qs.toString()}` : ""}`, null);
+  const { data, status } = await doReq(
+    "GET",
+    `/api/tasks${qs.toString() ? `?${qs.toString()}` : ""}`,
+    null,
+  );
   if (status >= 400) fail(`HTTP ${status}: ${data}`);
   const tasks = JSON.parse(data) as Array<Record<string, unknown>>;
   if (tasks.length === 0) {
@@ -651,7 +717,9 @@ async function cmdGet(id: string): Promise<void> {
 async function cmdPrompt(args: string[]): Promise<void> {
   const id = args[0];
   if (!id || args.length < 2) {
-    fail("Usage: dispatch prompt <task-id> \"message\"\n       dispatch prompt <task-id> -f message.md");
+    fail(
+      'Usage: dispatch prompt <task-id> "message"\n       dispatch prompt <task-id> -f message.md',
+    );
   }
   let message = "";
   if (args[1] === "-f" && args[2]) {
@@ -673,11 +741,12 @@ async function cmdPrompt(args: string[]): Promise<void> {
     const parsed = JSON.parse(data) as Record<string, unknown>;
     runId = typeof parsed.runId === "string" ? parsed.runId : "";
     threadId = typeof parsed.threadId === "string" ? parsed.threadId : "";
-    threadUrl = typeof parsed.threadUrl === "string"
-      ? parsed.threadUrl
-      : threadId
-        ? `https://discord.com/channels/${discordGuildId}/${threadId}`
-        : "";
+    threadUrl =
+      typeof parsed.threadUrl === "string"
+        ? parsed.threadUrl
+        : threadId
+          ? formatThreadUrl(threadId)
+          : "";
   } catch {
     // Non-JSON response; best-effort output continues below.
   }
@@ -689,7 +758,7 @@ async function cmdPrompt(args: string[]): Promise<void> {
 
 async function cmdUpdate(args: string[]): Promise<void> {
   const id = args[0];
-  if (!id) fail("Usage: dispatch update <task-id> --status <status> [--error \"reason\"]");
+  if (!id) fail('Usage: dispatch update <task-id> --status <status> [--error "reason"]');
   const payload: Record<string, unknown> = {};
   for (let i = 1; i < args.length; i += 1) {
     if (args[i] === "--status" || args[i] === "-s") {
@@ -728,19 +797,29 @@ async function cmdHistory(args: string[] = []): Promise<void> {
     qs.set("projectId", resolved?.key || parsed.project);
   }
   if (typeof parsed.status === "string") qs.set("status", parsed.status);
-  const { data, status } = await doReq("GET", `/api/tasks${qs.toString() ? `?${qs.toString()}` : ""}`, null);
+  const { data, status } = await doReq(
+    "GET",
+    `/api/tasks${qs.toString() ? `?${qs.toString()}` : ""}`,
+    null,
+  );
   if (status >= 400) fail(`HTTP ${status}: ${data}`);
   const tasks = (JSON.parse(data) as Array<Record<string, unknown>>)
     .filter((task) => ["done", "error", "blocked"].includes(String(task.status || "")))
-    .sort((a, b) => Number(b.updatedAt || b.updated_at || 0) - Number(a.updatedAt || a.updated_at || 0));
+    .sort(
+      (a, b) => Number(b.updatedAt || b.updated_at || 0) - Number(a.updatedAt || a.updated_at || 0),
+    );
   if (tasks.length === 0) {
     process.stdout.write("No historical tasks found.\n");
     return;
   }
   for (const task of tasks.slice(0, Number(parsed.limit || 20))) {
     const threadId = String(task.threadId || task.thread_id || "");
-    process.stdout.write(`${short(String(task.id || ""))}  ${statusLabel(String(task.status || ""))}  ${String(task.projectId || task.project_id || "-")}  ${String(task.title || "")}\n`);
-    process.stdout.write(`  updated: ${formatTime(task.updatedAt || task.updated_at)} | agent: ${String(task.agent || "-")}\n`);
+    process.stdout.write(
+      `${short(String(task.id || ""))}  ${statusLabel(String(task.status || ""))}  ${String(task.projectId || task.project_id || "-")}  ${String(task.title || "")}\n`,
+    );
+    process.stdout.write(
+      `  updated: ${formatTime(task.updatedAt || task.updated_at)} | agent: ${String(task.agent || "-")}\n`,
+    );
     if (threadId) process.stdout.write(`  thread: ${formatThreadUrl(threadId)}\n`);
     if (task.error) process.stdout.write(`  error: ${truncate(String(task.error), 220)}\n`);
   }
@@ -750,17 +829,33 @@ async function cmdActive(args: string[] = []): Promise<void> {
   const parsed = parseArgs(args);
   const tasks = await fetchTasks();
   const active = tasks
-    .filter((task) => ["ready", "dispatched", "in_progress", "review"].includes(String(task.status || "")))
-    .filter((task) => (typeof parsed.project === "string" ? String(task.projectId || task.project_id || "") === (resolveProject(parsed.project)?.key || parsed.project) : true))
-    .sort((a, b) => Number(b.updatedAt || b.updated_at || 0) - Number(a.updatedAt || a.updated_at || 0));
+    .filter((task) =>
+      ["ready", "dispatched", "in_progress", "review"].includes(String(task.status || "")),
+    )
+    .filter((task) =>
+      typeof parsed.project === "string"
+        ? String(task.projectId || task.project_id || "") ===
+          (resolveProject(parsed.project)?.key || parsed.project)
+        : true,
+    )
+    .sort(
+      (a, b) => Number(b.updatedAt || b.updated_at || 0) - Number(a.updatedAt || a.updated_at || 0),
+    );
   if (active.length === 0) {
     process.stdout.write("No active tasks.\n");
     return;
   }
   for (const task of active) {
-    process.stdout.write(`${short(String(task.id || ""))}  ${statusLabel(String(task.status || ""))}  ${String(task.projectId || task.project_id || "-")}  ${String(task.title || "")}\n`);
-    process.stdout.write(`  updated: ${formatTime(task.updatedAt || task.updated_at)} | agent: ${String(task.agent || "-")}\n`);
-    if (task.threadId || task.thread_id) process.stdout.write(`  thread: ${formatThreadUrl(String(task.threadId || task.thread_id))}\n`);
+    process.stdout.write(
+      `${short(String(task.id || ""))}  ${statusLabel(String(task.status || ""))}  ${String(task.projectId || task.project_id || "-")}  ${String(task.title || "")}\n`,
+    );
+    process.stdout.write(
+      `  updated: ${formatTime(task.updatedAt || task.updated_at)} | agent: ${String(task.agent || "-")}\n`,
+    );
+    if (task.threadId || task.thread_id)
+      process.stdout.write(
+        `  thread: ${formatThreadUrl(String(task.threadId || task.thread_id))}\n`,
+      );
   }
 }
 
@@ -769,8 +864,15 @@ async function cmdRecentErrors(args: string[] = []): Promise<void> {
   const tasks = await fetchTasks();
   const errors = tasks
     .filter((task) => ["error", "blocked"].includes(String(task.status || "")))
-    .filter((task) => (typeof parsed.project === "string" ? String(task.projectId || task.project_id || "") === (resolveProject(parsed.project)?.key || parsed.project) : true))
-    .sort((a, b) => Number(b.updatedAt || b.updated_at || 0) - Number(a.updatedAt || a.updated_at || 0))
+    .filter((task) =>
+      typeof parsed.project === "string"
+        ? String(task.projectId || task.project_id || "") ===
+          (resolveProject(parsed.project)?.key || parsed.project)
+        : true,
+    )
+    .sort(
+      (a, b) => Number(b.updatedAt || b.updated_at || 0) - Number(a.updatedAt || a.updated_at || 0),
+    )
     .slice(0, Number(parsed.limit || 10));
   if (errors.length === 0) {
     process.stdout.write("No recent errors.\n");
@@ -778,7 +880,9 @@ async function cmdRecentErrors(args: string[] = []): Promise<void> {
   }
   for (const task of errors) {
     const classification = classifyTaskFailure(task);
-    process.stdout.write(`${short(String(task.id || ""))}  ${statusLabel(String(task.status || ""))}  ${String(task.projectId || task.project_id || "-")}  ${String(task.title || "")}\n`);
+    process.stdout.write(
+      `${short(String(task.id || ""))}  ${statusLabel(String(task.status || ""))}  ${String(task.projectId || task.project_id || "-")}  ${String(task.title || "")}\n`,
+    );
     process.stdout.write(`  category: ${classification.category}\n`);
     process.stdout.write(`  error: ${truncate(String(task.error || ""), 220)}\n`);
     process.stdout.write(`  next: ${classification.nextStep}\n`);
@@ -788,7 +892,8 @@ async function cmdRecentErrors(args: string[] = []): Promise<void> {
 async function cmdWatch(args: string[] = []): Promise<void> {
   const parsed = parseArgs(args);
   const intervalMs = Math.max(1000, Number(parsed.interval || 3) * 1000);
-  const projectFilter = typeof parsed.project === "string" ? (resolveProject(parsed.project)?.key || parsed.project) : "";
+  const projectFilter =
+    typeof parsed.project === "string" ? resolveProject(parsed.project)?.key || parsed.project : "";
   const once = Boolean(parsed.once);
 
   for (;;) {
@@ -797,21 +902,33 @@ async function cmdWatch(args: string[] = []): Promise<void> {
       ? tasks.filter((task) => String(task.projectId || task.project_id || "") === projectFilter)
       : tasks;
     const active = filtered
-      .filter((task) => ["ready", "dispatched", "in_progress", "review"].includes(String(task.status || "")))
-      .sort((a, b) => Number(b.updatedAt || b.updated_at || 0) - Number(a.updatedAt || a.updated_at || 0))
+      .filter((task) =>
+        ["ready", "dispatched", "in_progress", "review"].includes(String(task.status || "")),
+      )
+      .sort(
+        (a, b) =>
+          Number(b.updatedAt || b.updated_at || 0) - Number(a.updatedAt || a.updated_at || 0),
+      )
       .slice(0, 10);
     const errors = filtered
       .filter((task) => ["error", "blocked"].includes(String(task.status || "")))
-      .sort((a, b) => Number(b.updatedAt || b.updated_at || 0) - Number(a.updatedAt || a.updated_at || 0))
+      .sort(
+        (a, b) =>
+          Number(b.updatedAt || b.updated_at || 0) - Number(a.updatedAt || a.updated_at || 0),
+      )
       .slice(0, 5);
     process.stdout.write("\x1b[2J\x1b[H");
-    process.stdout.write(`dispatch watch${projectFilter ? ` — ${projectFilter}` : ""} (${new Date().toLocaleTimeString("en-GB")})\n\n`);
+    process.stdout.write(
+      `dispatch watch${projectFilter ? ` — ${projectFilter}` : ""} (${new Date().toLocaleTimeString("en-GB")})\n\n`,
+    );
     process.stdout.write("Active tasks:\n");
     if (active.length === 0) {
       process.stdout.write("  none\n");
     } else {
       for (const task of active) {
-        process.stdout.write(`  ${short(String(task.id || ""))}  ${statusLabel(String(task.status || ""))}  ${truncate(String(task.title || ""), 70)}\n`);
+        process.stdout.write(
+          `  ${short(String(task.id || ""))}  ${statusLabel(String(task.status || ""))}  ${truncate(String(task.title || ""), 70)}\n`,
+        );
       }
     }
     process.stdout.write("\nRecent errors:\n");
@@ -820,7 +937,9 @@ async function cmdWatch(args: string[] = []): Promise<void> {
     } else {
       for (const task of errors) {
         const classification = classifyTaskFailure(task);
-        process.stdout.write(`  ${short(String(task.id || ""))}  ${classification.category}  ${truncate(String(task.title || ""), 56)}\n`);
+        process.stdout.write(
+          `  ${short(String(task.id || ""))}  ${classification.category}  ${truncate(String(task.title || ""), 56)}\n`,
+        );
       }
     }
     if (once) break;
@@ -835,7 +954,9 @@ async function cmdLogs(id: string): Promise<void> {
     return;
   }
   for (const event of events) {
-    process.stdout.write(`[${formatTime(event.createdAt || event.created_at)}] ${String(event.eventType || event.event_type)}\n`);
+    process.stdout.write(
+      `[${formatTime(event.createdAt || event.created_at)}] ${String(event.eventType || event.event_type)}\n`,
+    );
     if (event.payload) process.stdout.write(`  ${JSON.stringify(event.payload)}\n`);
   }
 }
@@ -855,7 +976,9 @@ async function cmdTimeline(id: string): Promise<void> {
       payload.model ? `model=${String(payload.model)}` : "",
       payload.summary ? `summary=${String(payload.summary)}` : "",
     ].filter(Boolean);
-    process.stdout.write(`[${formatTime(event.createdAt || event.created_at)}] ${String(event.eventType || event.event_type)}${bits.length ? ` — ${bits.join(" | ")}` : ""}\n`);
+    process.stdout.write(
+      `[${formatTime(event.createdAt || event.created_at)}] ${String(event.eventType || event.event_type)}${bits.length ? ` — ${bits.join(" | ")}` : ""}\n`,
+    );
   }
 }
 
@@ -884,7 +1007,9 @@ async function cmdDoctor(): Promise<void> {
   process.stdout.write(`Projects configured: ${projectEntries().length}\n`);
   for (const project of projectEntries()) {
     const cwdOk = project.cwd === "-" ? "n/a" : existsSync(project.cwd) ? "ok" : "missing";
-    process.stdout.write(`- ${project.key}: cwd=${cwdOk} channel=${project.channel} agent=${project.defaultAgent}\n`);
+    process.stdout.write(
+      `- ${project.key}: cwd=${cwdOk} channel=${project.channel} agent=${project.defaultAgent}\n`,
+    );
   }
   const { data, status } = await doReq("GET", "/api/dispatch/health", null);
   if (status >= 400) fail(`Health check failed (${status}): ${data}`);
@@ -894,7 +1019,9 @@ async function cmdDoctor(): Promise<void> {
   if (recentErrors.length > 0) {
     process.stdout.write("Recent errors:\n");
     for (const task of recentErrors) {
-      process.stdout.write(`- ${short(String(task.id || ""))}: ${truncate(String(task.error || ""), 180)}\n`);
+      process.stdout.write(
+        `- ${short(String(task.id || ""))}: ${truncate(String(task.error || ""), 180)}\n`,
+      );
     }
   }
 }
@@ -909,7 +1036,9 @@ async function cmdFollow(id: string): Promise<void> {
     const task = JSON.parse(data) as Record<string, unknown>;
     const signature = `${String(task.status || "")}:${String(task.updatedAt || task.updated_at || "")}:${String(task.error || "")}`;
     if (signature !== lastSignature) {
-      process.stdout.write(`[${formatTime(task.updatedAt || task.updated_at)}] ${String(task.status || "")}\n`);
+      process.stdout.write(
+        `[${formatTime(task.updatedAt || task.updated_at)}] ${String(task.status || "")}\n`,
+      );
       if (task.error) process.stdout.write(`error: ${String(task.error)}\n`);
       const threadId = String(task.threadId || "");
       if (threadId) process.stdout.write(`thread: ${formatThreadUrl(threadId)}\n`);
@@ -929,10 +1058,13 @@ async function cmdExplain(id: string): Promise<void> {
   const { data, status } = await doReq("GET", `/api/tasks/${resolvedId}`, null);
   if (status >= 400) fail(`HTTP ${status}: ${data}`);
   const task = JSON.parse(data) as Record<string, unknown>;
-  process.stdout.write(`Task ${short(String(task.id || ""))} is \"${String(task.title || "")}.\"\n`);
-  process.stdout.write(`It belongs to project ${String(task.projectId || "unknown")} and runs as ${String(task.agent || "unknown")}.\n`);
+  process.stdout.write(`Task ${short(String(task.id || ""))} is "${String(task.title || "")}."\n`);
+  process.stdout.write(
+    `It belongs to project ${String(task.projectId || "unknown")} and runs as ${String(task.agent || "unknown")}.\n`,
+  );
   process.stdout.write(`Current status: ${String(task.status || "unknown")}.\n`);
-  if (task.threadId) process.stdout.write(`Discord thread: ${formatThreadUrl(String(task.threadId))}\n`);
+  if (task.threadId)
+    process.stdout.write(`Discord thread: ${formatThreadUrl(String(task.threadId))}\n`);
   if (task.error) process.stdout.write(`Failure reason: ${String(task.error)}\n`);
   process.stdout.write(`${explainNextStep(task)}\n`);
 }
@@ -956,7 +1088,7 @@ async function cmdRetry(args: string[]): Promise<void> {
     qaRequired: parsed["no-qa"] ? false : task.qaRequired !== false,
     model: task.model || null,
     thinking: task.thinking || null,
-    threadId: reuseThread ? (task.threadId || null) : null,
+    threadId: reuseThread ? task.threadId || null : null,
   };
   const create = await doReq("POST", "/api/tasks", payload);
   if (create.status >= 400) fail(`HTTP ${create.status}: ${create.data}`);
@@ -1017,7 +1149,7 @@ async function cmdInspect(id: string): Promise<void> {
   const { data, status } = await doReq("GET", `/api/tasks/${resolvedId}`, null);
   if (status >= 400) fail(`HTTP ${status}: ${data}`);
   const task = JSON.parse(data) as Record<string, unknown>;
-  process.stdout.write(`Task: ${String(task.title || "") }\n`);
+  process.stdout.write(`Task: ${String(task.title || "")}\n`);
   process.stdout.write(`ID: ${String(task.id || "")}\n`);
   process.stdout.write(`Status: ${String(task.status || "")}\n`);
   process.stdout.write(`Project: ${String(task.projectId || "-")}\n`);
@@ -1167,7 +1299,9 @@ async function cmdHeartbeat(argv: string[]): Promise<void> {
   } else {
     process.stderr.write(`Unknown heartbeat subcommand: ${sub}\n`);
     process.stderr.write(`Usage: dispatch heartbeat [log|list|health]\n`);
-    process.stderr.write(`  log   --agent ID --name NAME --status STATUS --action ACTION --detail TEXT --error TEXT\n`);
+    process.stderr.write(
+      `  log   --agent ID --name NAME --status STATUS --action ACTION --detail TEXT --error TEXT\n`,
+    );
     process.stderr.write(`  list  [--agent ID] [--limit N]\n`);
     process.stderr.write(`  health\n`);
     process.exit(1);

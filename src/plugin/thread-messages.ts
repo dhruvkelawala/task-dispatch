@@ -1,4 +1,7 @@
-export function buildExistingThreadDispatchMessage(task: { id?: string; title?: string; cwd?: string }, cwd?: string): string {
+export function buildExistingThreadDispatchMessage(
+  task: { id?: string; title?: string; cwd?: string | null },
+  cwd?: string | null,
+): string {
   const shortId = typeof task?.id === "string" ? task.id.slice(0, 8) : "task";
   const stamp = Date.now();
   const title = typeof task?.title === "string" && task.title.trim() ? task.title.trim() : "Task";
@@ -7,7 +10,10 @@ export function buildExistingThreadDispatchMessage(task: { id?: string; title?: 
   return `${header}\n${cwdLine}`;
 }
 
-export function buildDiscordAgentTarget(threadId?: string | null, channelId?: string | null): string | undefined {
+export function buildDiscordAgentTarget(
+  threadId?: string | null,
+  channelId?: string | null,
+): string | undefined {
   if (threadId && threadId.trim()) return `channel:${threadId}`;
   if (channelId && channelId.trim()) return `channel:${channelId}`;
   return undefined;

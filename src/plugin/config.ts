@@ -69,17 +69,11 @@ export function resolveChannel(
   );
 }
 
-export function resolveCwd(
-  task: Partial<Task>,
-  projectCwd: Record<string, string>,
-): string | null {
-  return task.cwd || (task.projectId ? projectCwd[task.projectId] ?? null : null);
+export function resolveCwd(task: Partial<Task>, projectCwd: Record<string, string>): string | null {
+  return task.cwd || (task.projectId ? (projectCwd[task.projectId] ?? null) : null);
 }
 
-export function resolveRuntime(
-  task: Partial<Task>,
-  agentRuntime: Record<string, string>,
-): string {
+export function resolveRuntime(task: Partial<Task>, agentRuntime: Record<string, string>): string {
   if (task.runtime) return task.runtime;
   return task.agent ? agentRuntime[task.agent] || "subagent" : "subagent";
 }

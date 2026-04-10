@@ -2,6 +2,7 @@ import { createServer } from "node:http";
 import { loadConfig } from "../plugin/config";
 import {
   forwardGitHubReview,
+  isGitHubPingEvent,
   isRepoAllowedForBridge,
   normalizeGitHubPushWebhook,
   verifyGitHubSignature,
@@ -22,8 +23,7 @@ function readBody(req: import("node:http").IncomingMessage): Promise<string> {
 const port = Number(process.env.GITHUB_REVIEW_BRIDGE_PORT || 8787);
 const secret = process.env.GITHUB_WEBHOOK_SECRET || "";
 const taskDispatchUrl = process.env.TASK_DISPATCH_URL || "http://127.0.0.1:18789";
-const taskDispatchApiKey =
-  process.env.TASK_DISPATCH_API_KEY || process.env.OPENCLAW_API_KEY || "";
+const taskDispatchApiKey = process.env.TASK_DISPATCH_API_KEY || process.env.OPENCLAW_API_KEY || "";
 const config = loadConfig();
 
 const server = createServer(async (req, res) => {
@@ -52,9 +52,17 @@ const server = createServer(async (req, res) => {
     const payload = JSON.parse(rawBody);
     const deliveryId = req.headers["x-github-delivery"];
     const eventName = req.headers["x-github-event"];
+    const normalizedEventName = Array.isArray(eventName) ? eventName[0] : eventName;
+
+    if (isGitHubPingEvent(normalizedEventName)) {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ok: true, event: "ping" }));
+      return;
+    }
+
     const normalized = normalizeGitHubPushWebhook({
       deliveryId: Array.isArray(deliveryId) ? deliveryId[0] : deliveryId,
-      eventName: Array.isArray(eventName) ? eventName[0] : eventName,
+      eventName: normalizedEventName,
       payload,
     });
 

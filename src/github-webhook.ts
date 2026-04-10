@@ -44,10 +44,7 @@ export function verifyGitHubSignature(params: {
   if (!params.signature256?.startsWith("sha256=")) {
     return false;
   }
-  const actual = crypto
-    .createHmac("sha256", params.secret)
-    .update(params.body)
-    .digest("hex");
+  const actual = crypto.createHmac("sha256", params.secret).update(params.body).digest("hex");
   const expected = params.signature256.slice("sha256=".length);
   if (actual.length !== expected.length) {
     return false;
@@ -91,10 +88,12 @@ export function normalizeGitHubPushWebhook(params: {
     compareUrl: params.payload.compare?.trim() || null,
     deliveryKey,
     installationId:
-      typeof params.payload.installation?.id === "number"
-        ? params.payload.installation.id
-        : null,
+      typeof params.payload.installation?.id === "number" ? params.payload.installation.id : null,
   };
+}
+
+export function isGitHubPingEvent(eventName?: string | null): boolean {
+  return eventName === "ping";
 }
 
 export function buildTaskDispatchReviewForwardRequest(
@@ -124,7 +123,7 @@ export function buildTaskDispatchReviewForwardRequest(
 export async function forwardGitHubReview(
   payload: NormalizedGitHubReviewPayload,
   config: ForwardReviewConfig & {
-    fetchImpl?: typeof fetch;
+    fetchImpl?: (input: string, init?: RequestInit) => Promise<Response>;
   },
 ): Promise<{ status: number; body: string }> {
   const fetchImpl = config.fetchImpl || fetch;
