@@ -17,6 +17,7 @@ import {
   resolveProjectIdForRepo,
   resolveReviewRange,
   REVIEW_DEBOUNCE_WINDOW_MS,
+  setReviewDebounceMs,
 } from "./review";
 // thread-messages helpers are used by extracted runtime modules
 import { getNextRunAt, parseNlExpressionToCron } from "./scheduler";
@@ -119,6 +120,10 @@ const defaultReviewTimeoutMs = normalizeTimeoutMs(DEFAULTS.reviewTimeoutMs, 3 * 
 const maxReviewCycles = Number.isFinite(DEFAULTS.maxReviewCycles)
   ? Math.max(1, Math.floor(DEFAULTS.maxReviewCycles ?? 3))
   : 3;
+
+if (DEFAULTS.reviewDebounceMs && Number.isFinite(DEFAULTS.reviewDebounceMs)) {
+  setReviewDebounceMs(Math.max(1000, Math.floor(DEFAULTS.reviewDebounceMs)));
+}
 // qaRequired is per-task (default true). Check via resolveQaRequired(task)
 function resolveQaRequired(task: Partial<Task>): boolean {
   if (typeof task.qaRequired === "boolean") return task.qaRequired;

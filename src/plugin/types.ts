@@ -75,6 +75,7 @@ export interface PluginConfig {
     taskTimeoutMs?: number;
     reviewTimeoutMs?: number;
     maxReviewCycles?: number;
+    reviewDebounceMs?: number;
   };
   notifications?: {
     operatorLabel?: string;

@@ -1,10 +1,13 @@
 import type { PluginConfig } from "./types";
 
-const DEFAULT_REVIEW_DEBOUNCE_MS = 5 * 60 * 1000;
+export const DEFAULT_REVIEW_DEBOUNCE_MS = 5 * 60 * 1000;
 
-export const REVIEW_DEBOUNCE_WINDOW_MS = Number(
-  process.env.REVIEW_DEBOUNCE_MS || DEFAULT_REVIEW_DEBOUNCE_MS,
-);
+// Resolved at runtime from config; this is the fallback default.
+export let REVIEW_DEBOUNCE_WINDOW_MS = DEFAULT_REVIEW_DEBOUNCE_MS;
+
+export function setReviewDebounceMs(ms: number): void {
+  REVIEW_DEBOUNCE_WINDOW_MS = ms;
+}
 
 export type ReviewRequest = {
   repo: string;
