@@ -1,6 +1,10 @@
 import type { PluginConfig } from "./types";
 
-export const REVIEW_DEBOUNCE_WINDOW_MS = 5 * 60 * 1000;
+const DEFAULT_REVIEW_DEBOUNCE_MS = 5 * 60 * 1000;
+
+export const REVIEW_DEBOUNCE_WINDOW_MS = Number(
+  process.env.REVIEW_DEBOUNCE_MS || DEFAULT_REVIEW_DEBOUNCE_MS,
+);
 
 export type ReviewRequest = {
   repo: string;

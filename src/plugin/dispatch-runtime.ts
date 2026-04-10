@@ -214,6 +214,7 @@ export function createDispatchRuntime(deps: DispatchRuntimeDeps) {
           await deps.postToThread(
             task.threadId,
             "⛔ **Task blocked** — review failed 3 times, needs human intervention.",
+            deps.resolveAccountId(task.agent),
           );
         }
         await deps.notifyMainSession(blockedTask || task, "blocked");
@@ -302,7 +303,7 @@ export function createDispatchRuntime(deps: DispatchRuntimeDeps) {
         .postToThread(
           task.threadId,
           "🔄 **Resuming session** — picking up where we left off...",
-          deps.defaultDiscordAccountId,
+          deps.resolveAccountId(task.agent),
         )
         .catch(() => {});
     }
@@ -365,6 +366,7 @@ export function createDispatchRuntime(deps: DispatchRuntimeDeps) {
       await deps.postToThread(
         task.threadId,
         `✅ **Resume completed**\n\n${summary}${text.length > 1500 ? "..." : ""}`,
+        deps.resolveAccountId(task.agent),
       );
     }
     deps.onTaskChanged(task.id);
@@ -550,6 +552,7 @@ export function createDispatchRuntime(deps: DispatchRuntimeDeps) {
       await deps.postToThread(
         task.threadId,
         `✅ **Task completed**\n\n**Output:**\n${summary}${text.length > 1500 ? "..." : ""}`,
+        deps.resolveAccountId(task.agent),
       );
     }
     deps.onTaskChanged(task.id);
@@ -686,6 +689,7 @@ export function createDispatchRuntime(deps: DispatchRuntimeDeps) {
       await deps.postToThread(
         task.threadId,
         `✅ **Task completed**\n\n**Output:**\n${summary}${output.length > 1500 ? "..." : ""}`,
+        deps.resolveAccountId(task.agent),
       );
     }
     deps.onTaskChanged(task.id);
