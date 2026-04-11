@@ -7,16 +7,108 @@ import {
   parseMaatVerdict,
   truncateForPrompt,
 } from "./qa";
-import {
-  buildDiscordAcpPromptContext,
-  buildDiscordAgentTarget,
-  buildExistingThreadDispatchMessage,
-} from "./thread-messages";
+import { buildDiscordAcpPromptContext, buildExistingThreadDispatchMessage } from "./thread-messages";
 import type { PluginApi, PluginConfig, Task } from "./types";
 import type { DatabaseLike } from "./runtime-types";
 
 function getErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+const ACP_STARTUP_COOLDOWN_MS = 60_000;
+let acpStartupGateResolved = false;
+let acpStartupGatePromise: Promise<void> | null = null;
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
+
+function waitForAcpStartupGate(): Promise<void> {
+  if (acpStartupGateResolved) return Promise.resolve();
+  if (!acpStartupGatePromise) {
+    acpStartupGatePromise = sleep(ACP_STARTUP_COOLDOWN_MS).then(() => {
+      acpStartupGateResolved = true;
+    });
+  }
+  return acpStartupGatePromise;
+}
+
+function sanitizeAcpThreadOutput(text: string): string {
+  return text
+    .split(/\r?\n/)
+    .map((line) => line.trimEnd())
+    .filter((line) => {
+      const trimmed = line.trim();
+      if (!trimmed) return false;
+      if (trimmed.startsWith("cwd:")) return false;
+      if (trimmed.startsWith("Background task done:")) return false;
+      if (trimmed.startsWith("⚙️") && trimmed.includes("session active")) return false;
+      return true;
+    })
+    .join("\n")
+    .trim();
+}
+
+function selectAcpOutputFromThreadMessages(messages: string[]): string {
+  for (const message of messages) {
+    const cleaned = sanitizeAcpThreadOutput(message);
+    if (cleaned) return cleaned;
+  }
+  return "";
+}
+
+async function resolveBoundThreadIdForSession(sessionKey: string): Promise<string | null> {
+  try {
+    const fs = await import("node:fs");
+    const path = await import("node:path");
+    const home = process.env.HOME || process.env.USERPROFILE || "";
+    const bindingsPath = path.join(home, ".openclaw", "discord", "thread-bindings.json");
+    const raw = fs.readFileSync(bindingsPath, "utf-8");
+    const data = JSON.parse(raw) as {
+      bindings?: Record<string, { targetSessionKey?: string; threadId?: string }>;
+    };
+    for (const entry of Object.values(data.bindings ?? {})) {
+      if (entry.targetSessionKey === sessionKey && entry.threadId) {
+        return entry.threadId;
+      }
+    }
+  } catch {
+    // best-effort
+  }
+  return null;
+}
+
+async function waitForBoundThreadIdForSession(
+  sessionKey: string,
+  timeoutMs: number,
+): Promise<string | null> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() <= deadline) {
+    const threadId = await resolveBoundThreadIdForSession(sessionKey);
+    if (threadId) return threadId;
+    if (Date.now() >= deadline) break;
+    await sleep(250);
+  }
+  return null;
+}
+
+async function waitForAcpThreadOutput(params: {
+  readThreadMessages: (threadId: string, accountId: string, limit?: number) => Promise<string[]>;
+  threadId: string;
+  accountId: string;
+  timeoutMs: number;
+}): Promise<string> {
+  const deadline = Date.now() + params.timeoutMs;
+  while (Date.now() <= deadline) {
+    const messages = await params.readThreadMessages(params.threadId, params.accountId, 10);
+    const text = selectAcpOutputFromThreadMessages(messages);
+    if (text) return text;
+    if (Date.now() >= deadline) break;
+    await sleep(250);
+  }
+  return "";
 }
 
 type DispatchRuntimeDeps = {
@@ -284,11 +376,14 @@ export function createDispatchRuntime(deps: DispatchRuntimeDeps) {
     const acp = deps.api.runtime?.acp;
     const subagent = deps.api.runtime?.subagent;
     if (!acp?.spawn || !subagent?.waitForRun) throw new Error("resume runtime not available");
+    const spawnAcp = acp.spawn;
+    const resumeSessionId = task.sessionKey;
+
+    await waitForAcpStartupGate();
 
     const resolvedCwd = task.cwd || deps.resolveCwd(task);
     if (!resolvedCwd) throw new Error("Task has no cwd");
     const accountId = deps.resolveAccountId(task.agent);
-    const channelId = deps.resolveChannel(task);
 
     deps.db
       .prepare(
@@ -312,21 +407,21 @@ export function createDispatchRuntime(deps: DispatchRuntimeDeps) {
     }
 
     const resumeHarness = deps.resolveHarness(task);
-    const result = await acp.spawn(
+    const resumeThreadId = task.threadId || undefined;
+    const result = await spawnAcp(
       {
         task: "Continue where you left off. Your previous session was interrupted. Check git log and git status to see your progress, then complete the remaining work.",
-        label: `resume-${task.id.slice(0, 8)}-${Date.now()}`,
         agentId: resumeHarness,
         cwd: resolvedCwd,
-        resumeSessionId: task.sessionKey,
+        resumeSessionId,
         mode: "session",
         thread: true,
       },
       {
         agentChannel: "discord",
         agentAccountId: accountId,
-        agentTo: buildDiscordAgentTarget(task.threadId, channelId),
-        agentThreadId: task.threadId || undefined,
+        agentTo: resumeThreadId ? `channel:${resumeThreadId}` : undefined,
+        agentThreadId: resumeThreadId,
       },
     );
 
@@ -335,6 +430,7 @@ export function createDispatchRuntime(deps: DispatchRuntimeDeps) {
         result?.error || `resume spawn failed with status=${result?.status || "unknown"}`,
       );
     }
+
     const childRunId = typeof result?.runId === "string" ? result.runId.trim() : "";
     const childSessionKey = result?.childSessionKey || task.sessionKey;
     if (!childRunId) throw new Error("resume spawn did not return runId");
@@ -447,6 +543,12 @@ export function createDispatchRuntime(deps: DispatchRuntimeDeps) {
         "api.runtime.acp.spawn not available — OpenClaw build with ACP plugin runtime required",
       );
     if (!subagent?.waitForRun) throw new Error("subagent.waitForRun not available");
+    const spawnAcp = acp.spawn;
+
+    // After a gateway restart, Discord's full child-thread binding adapter can
+    // take a while to register. A single startup cooldown is less noisy than
+    // speculative retries that create stray ACP sessions.
+    await waitForAcpStartupGate();
 
     const resolvedCwd = cwd || deps.defaultCwd;
     const prompt = formatTaskPrompt(task);
@@ -454,13 +556,6 @@ export function createDispatchRuntime(deps: DispatchRuntimeDeps) {
     const accountId = deps.resolveAccountId(task.agent);
     const existingThreadId =
       typeof task.threadId === "string" && task.threadId.trim() ? task.threadId.trim() : null;
-
-    // For ACP sessions, let ACP own thread creation/binding. Creating the
-    // Discord thread ourselves and then asking ACP to bind to that existing
-    // thread can fail with "Session binding adapter failed to bind target
-    // conversation". The supported ACP flow is: target the parent channel,
-    // request `thread: true`, and let ACP create/bind the child thread.
-    const dispatchThreadId = existingThreadId;
 
     deps.db
       .prepare(
@@ -472,53 +567,75 @@ export function createDispatchRuntime(deps: DispatchRuntimeDeps) {
     let childSessionKey = sessionKey;
     let childRunId = "";
     const harness = deps.resolveHarness(task);
-    const result = await acp.spawn(
+    // Let ACP own thread creation via "child" placement.  Pass the parent
+    // channel as agentTo so ACP creates a new thread inside it and binds the
+    // session to that thread.  If the task already has a thread (e.g. requeue),
+    // target that thread directly with agentThreadId so ACP binds to it.
+    const spawnCtx = existingThreadId
+      ? {
+          agentChannel: "discord",
+          agentAccountId: accountId,
+          agentTo: `channel:${existingThreadId}`,
+          agentThreadId: existingThreadId,
+        }
+      : {
+          agentChannel: "discord",
+          agentAccountId: accountId,
+          agentTo: channelId ? `channel:${channelId}` : undefined,
+          agentGroupId: channelId || undefined,
+        };
+    const result = await spawnAcp(
       {
         task: prompt,
-        label: `${task.title.slice(0, 32)}-${task.id.slice(0, 8)}-${Date.now()}`,
         agentId: harness,
         cwd: resolvedCwd,
         mode: "session",
         thread: true,
       },
-      {
-        agentChannel: "discord",
-        agentAccountId: accountId,
-        // Target the parent review channel; ACP will create/bind the child
-        // thread itself and deliver output there.
-        agentTo: channelId ? `channel:${channelId}` : undefined,
-      },
+      spawnCtx,
     );
-    if (result?.status !== "accepted")
-      throw new Error(
-        result?.error || `acp spawn failed with status=${result?.status || "unknown"}`,
-      );
+    if (result?.status !== "accepted") {
+      throw new Error(result?.error || `acp spawn failed with status=${result?.status || "unknown"}`);
+    }
     childSessionKey = result?.childSessionKey || sessionKey;
     childRunId = typeof result?.runId === "string" ? result.runId.trim() : "";
     if (!childRunId) throw new Error("acp spawn did not return runId");
 
+    // Resolve the thread ID: for existing threads we already know it; for new
+    // spawns ACP created the thread via "child" placement — read it from the
+    // thread-bindings.json file using the child session key.
+    let dispatchThreadId = existingThreadId;
+    if (!dispatchThreadId) {
+      dispatchThreadId = await waitForBoundThreadIdForSession(childSessionKey, 4000);
+      if (!dispatchThreadId) {
+        throw new Error("acp spawn accepted but no Discord child thread binding was created");
+      }
+    }
+
     deps.db
       .prepare(
-        "UPDATE tasks SET session_key = @sessionKey, run_id = @runId, updated_at = @updated_at WHERE id = @id",
+        "UPDATE tasks SET session_key = @sessionKey, run_id = @runId, thread_id = @threadId, updated_at = @updated_at WHERE id = @id",
       )
       .run({
         id: task.id,
         sessionKey: childSessionKey,
         runId: childRunId,
+        threadId: dispatchThreadId || null,
         updated_at: Date.now(),
       });
+    task.threadId = dispatchThreadId || null;
     task.sessionKey = childSessionKey;
 
-    if (existingThreadId && dispatchThreadId) {
+    if (existingThreadId) {
       await deps
         .postToThread(
-          dispatchThreadId,
+          existingThreadId,
           buildExistingThreadDispatchMessage(task, resolvedCwd ?? undefined),
           accountId,
         )
         .catch(() => {});
       deps.recordTaskEvent(task.id, "thread.reused.notified", {
-        threadId: dispatchThreadId,
+        threadId: existingThreadId,
         sessionKey: childSessionKey,
         runId: childRunId,
       });
@@ -552,6 +669,7 @@ export function createDispatchRuntime(deps: DispatchRuntimeDeps) {
         limit: 200,
       });
       text = extractOutputFromMessages(sessionMessages?.messages || []);
+      text = sanitizeAcpThreadOutput(text);
     }
 
     // ACP sessions don't store messages in the subagent message store.
@@ -569,7 +687,9 @@ export function createDispatchRuntime(deps: DispatchRuntimeDeps) {
           if (binding.targetSessionKey === childSessionKey && binding.threadId) {
             task.threadId = binding.threadId;
             deps.db
-              .prepare("UPDATE tasks SET thread_id = @threadId, updated_at = @updated_at WHERE id = @id")
+              .prepare(
+                "UPDATE tasks SET thread_id = @threadId, updated_at = @updated_at WHERE id = @id",
+              )
               .run({ id: task.id, threadId: task.threadId, updated_at: Date.now() });
             break;
           }
@@ -581,29 +701,25 @@ export function createDispatchRuntime(deps: DispatchRuntimeDeps) {
 
     if (!text && task.threadId) {
       const accountId = deps.resolveAccountId(task.agent);
-      const threadMessages = await deps.readThreadMessages(task.threadId, accountId, 10);
-      // Find the longest bot message — that's likely the review output
-      text = threadMessages.reduce((best, msg) => (msg.length > best.length ? msg : best), "");
+      text = await waitForAcpThreadOutput({
+        readThreadMessages: deps.readThreadMessages,
+        threadId: task.threadId,
+        accountId,
+        timeoutMs: 5000,
+      });
       if (text) {
         deps.stderr.write(
           `[DISPATCH.ACP] Recovered ${text.length} chars from Discord thread for ${task.id}\n`,
         );
       }
     }
+    text = sanitizeAcpThreadOutput(text);
 
     deps.db
       .prepare(
         "UPDATE tasks SET status = 'review', output = @output, completed_at = NULL, updated_at = @updated_at WHERE id = @id",
       )
       .run({ id: task.id, output: text.slice(0, 10000), updated_at: Date.now() });
-    if (task.threadId) {
-      const summary = text.slice(0, 1500);
-      await deps.postToThread(
-        task.threadId,
-        `✅ **Task completed**\n\n**Output:**\n${summary}${text.length > 1500 ? "..." : ""}`,
-        deps.resolveAccountId(task.agent),
-      );
-    }
     deps.onTaskChanged(task.id);
     const freshTask = deps.getTask(task.id);
     if (deps.resolveQaRequired(task)) {

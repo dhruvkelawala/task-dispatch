@@ -101,6 +101,10 @@ export async function handleCreateTask(
     status,
     manual_complete: body.manualComplete ? 1 : 0,
     timeout_ms: normalizeTimeoutMs(body.timeoutMs, ctx.defaultTaskTimeoutMs),
+    thread_id:
+      typeof body.threadId === "string" && body.threadId.trim().length > 0
+        ? body.threadId.trim()
+        : null,
     review_attempts: 0,
     qa_required: body.qaRequired === false ? 0 : 1,
     created_at: now,

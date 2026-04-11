@@ -167,7 +167,7 @@ export interface AcpRuntime {
   spawn?: (
     payload: {
       task: string;
-      label: string;
+      label?: string;
       agentId: string;
       cwd: string;
       mode?: "run" | "session";
