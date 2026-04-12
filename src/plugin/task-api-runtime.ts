@@ -36,6 +36,7 @@ type TaskApiRuntimeDeps = {
   backgroundEnqueue: (kind: "dispatch" | "resume" | "qa", taskId: string) => boolean;
   defaultTaskTimeoutMs: number;
   handleCreateReview: (req: PluginHttpRequest, res: PluginHttpResponse) => Promise<void>;
+  promptTaskSession: (task: Task, text: string) => Promise<{ runId: string }>;
   stderr: Pick<typeof process.stderr, "write">;
   stmts: {
     insert: unknown;
@@ -200,6 +201,41 @@ export function createTaskApiRuntime(deps: TaskApiRuntimeDeps) {
     };
     deps.stmts.insertComment.run(row);
     sendJson(res, rowToComment(row), 201);
+  }
+
+  async function handlePromptTask(
+    req: PluginHttpRequest,
+    res: PluginHttpResponse,
+    taskId: string,
+  ): Promise<void> {
+    const task = deps.rowToTask(deps.getTask(taskId));
+    if (!task) {
+      sendError(res, 404, "Task not found");
+      return;
+    }
+    if (!task.sessionKey) {
+      sendError(res, 400, "Task has no active session");
+      return;
+    }
+    if (!deps.api.runtime?.acp?.prompt) {
+      sendError(res, 500, "acp.prompt not available");
+      return;
+    }
+
+    const body = await parseBody(req);
+    const message = typeof body.message === "string" ? body.message.trim() : "";
+    if (!message) {
+      sendError(res, 400, "message is required");
+      return;
+    }
+
+    const { runId } = await deps.promptTaskSession(task, message);
+    deps.recordTaskEvent(task.id, "task.prompted", {
+      runId,
+      threadId: task.threadId || null,
+      sessionKey: task.sessionKey,
+    });
+    sendJson(res, { ok: true, taskId: task.id, runId });
   }
 
   function handleHealth(_req: PluginHttpRequest, res: PluginHttpResponse): void {
@@ -370,6 +406,12 @@ export function createTaskApiRuntime(deps: TaskApiRuntimeDeps) {
                 taskId: task.id,
               }),
             );
+            return true;
+          }
+
+          if (segments.length === 2 && segments[1] === "prompt" && method === "POST") {
+            if (!requireApiKey(req, res)) return true;
+            await handlePromptTask(req, res, segments[0]!);
             return true;
           }
 

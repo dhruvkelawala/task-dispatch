@@ -213,13 +213,11 @@ export function createDispatchRuntime(deps: DispatchRuntimeDeps) {
   }
 
   async function requestAgentFix(task: Task, reviewText: string): Promise<string> {
-    const acp = deps.api.runtime?.acp;
     const subagent = deps.api.runtime?.subagent;
-    if (!acp?.prompt || !subagent?.waitForRun) {
+    if (!subagent?.waitForRun) {
       throw new Error("agent fix runtime not available");
     }
 
-    const accountId = deps.resolveAccountId(task.agent);
     const prompt = [
       `@${task.agent}`,
       "",
@@ -230,13 +228,7 @@ export function createDispatchRuntime(deps: DispatchRuntimeDeps) {
       reviewText,
     ].join("\n");
 
-    const result = await acp.prompt({
-      sessionKey: task.sessionKey || "",
-      text: prompt,
-      ...buildDiscordAcpPromptContext(task.threadId, accountId),
-    });
-    const runId = typeof result?.runId === "string" ? result.runId.trim() : "";
-    if (!runId) throw new Error("acp.prompt did not return runId");
+    const { runId } = await promptTaskSession(task, prompt);
 
     const wait = await subagent.waitForRun({ runId, timeoutMs: deps.resolveTaskTimeoutMs(task) });
     const waitStatus = wait?.status || "timeout";
@@ -251,6 +243,26 @@ export function createDispatchRuntime(deps: DispatchRuntimeDeps) {
       limit: 200,
     });
     return extractOutputFromMessages(sessionMessages?.messages || []);
+  }
+
+  async function promptTaskSession(task: Task, text: string): Promise<{ runId: string }> {
+    const acp = deps.api.runtime?.acp;
+    if (!acp?.prompt) {
+      throw new Error("acp.prompt runtime not available");
+    }
+    if (!task.sessionKey) {
+      throw new Error("Task has no session to prompt");
+    }
+
+    const accountId = deps.resolveAccountId(task.agent);
+    const result = await acp.prompt({
+      sessionKey: task.sessionKey,
+      text,
+      ...buildDiscordAcpPromptContext(task.threadId, accountId),
+    });
+    const runId = typeof result?.runId === "string" ? result.runId.trim() : "";
+    if (!runId) throw new Error("acp.prompt did not return runId");
+    return { runId };
   }
 
   async function runMaatReviewLoop(taskId: string): Promise<void> {
@@ -921,6 +933,7 @@ export function createDispatchRuntime(deps: DispatchRuntimeDeps) {
 
   return {
     runMaatOneShotReview,
+    promptTaskSession,
     requestAgentFix,
     runMaatReviewLoop,
     triggerDispatch,

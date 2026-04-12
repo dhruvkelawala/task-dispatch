@@ -375,6 +375,7 @@ export default function setup(api: PluginApi) {
   const {
     triggerDispatch,
     dispatchTask,
+    promptTaskSession,
     resumeTask,
     runQueuedQaReview,
     notifyMainSession,
@@ -1073,6 +1074,7 @@ export default function setup(api: PluginApi) {
     backgroundEnqueue: (kind, taskId) => backgroundJobs.enqueue({ kind, taskId }),
     defaultTaskTimeoutMs,
     handleCreateReview,
+    promptTaskSession,
     stderr: process.stderr,
     stmts: {
       insert: stmts.insert,
