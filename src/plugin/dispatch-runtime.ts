@@ -10,7 +10,6 @@ import {
 
 import {
   buildDiscordAcpPromptContext,
-  buildDiscordAgentTarget,
   buildExistingThreadDispatchMessage,
 } from "./thread-messages";
 import type { PluginApi, PluginConfig, Task } from "./types";
@@ -50,6 +49,13 @@ export function sanitizeAcpThreadOutput(text: string): string {
       if (trimmed.startsWith("cwd:")) return false;
       if (trimmed.startsWith("Background task done:")) return false;
       if (trimmed.startsWith("⚙️") && trimmed.includes("session active")) return false;
+      if (trimmed.startsWith("🚀 **Task dispatched")) return false;
+      if (trimmed.startsWith("✅ **Task completed**")) return false;
+      if (trimmed.startsWith("🔄 **Resuming session**")) return false;
+      if (trimmed.startsWith("✅ **Resume completed**")) return false;
+      if (trimmed.startsWith("🔍 **QA in progress**")) return false;
+      if (trimmed.startsWith("🔎 **QA verdict**")) return false;
+      if (trimmed.startsWith("⛔ **Task blocked**")) return false;
       return true;
     })
     .join("\n")
@@ -111,6 +117,34 @@ async function waitForAcpThreadOutput(params: {
   while (Date.now() <= deadline) {
     const messages = await params.readThreadMessages(params.threadId, params.accountId, 20);
     const text = buildAcpOutputFromThreadMessages(messages);
+    if (text) return text;
+    if (Date.now() >= deadline) break;
+    await sleep(250);
+  }
+  return "";
+}
+
+async function waitForNewAcpThreadOutput(params: {
+  readThreadMessages: (threadId: string, accountId: string, limit?: number) => Promise<string[]>;
+  threadId: string;
+  accountId: string;
+  timeoutMs: number;
+  baselineMessages: string[];
+}): Promise<string> {
+  const baseline = new Set(
+    (params.baselineMessages || [])
+      .map((message) => sanitizeAcpThreadOutput(message))
+      .filter((message) => message.length > 0),
+  );
+  const deadline = Date.now() + params.timeoutMs;
+  while (Date.now() <= deadline) {
+    const messages = await params.readThreadMessages(params.threadId, params.accountId, 20);
+    const newMessages = (messages || []).filter((message) => {
+      const sanitized = sanitizeAcpThreadOutput(message);
+      if (!sanitized) return false;
+      return !baseline.has(sanitized);
+    });
+    const text = buildAcpOutputFromThreadMessages(newMessages);
     if (text) return text;
     if (Date.now() >= deadline) break;
     await sleep(250);
@@ -411,119 +445,152 @@ export function createDispatchRuntime(deps: DispatchRuntimeDeps) {
 
   async function resumeTask(taskId: string): Promise<void> {
     const task = deps.getTask(taskId);
-    if (!task || task.status !== "error" || !task.sessionKey) return;
-    const acp = deps.api.runtime?.acp;
-    const subagent = deps.api.runtime?.subagent;
-    if (!acp?.spawn || !subagent?.waitForRun) throw new Error("resume runtime not available");
-    const spawnAcp = acp.spawn;
-    const resumeSessionId = task.sessionKey;
+    if (!task || !task.sessionKey) return;
+    if (!["error", "dispatched", "in_progress"].includes(task.status)) return;
 
-    await waitForAcpStartupGate(deps.acpStartupCooldownMs);
+    const priorStatus = task.status;
 
-    const resolvedCwd = task.cwd || deps.resolveCwd(task);
-    if (!resolvedCwd) throw new Error("Task has no cwd");
-    const accountId = deps.resolveAccountId(task.agent);
-    const channelId = deps.resolveChannel(task);
+    try {
+      const subagent = deps.api.runtime?.subagent;
+      if (!subagent?.waitForRun) throw new Error("resume runtime not available");
 
-    deps.db
-      .prepare(
-        "UPDATE tasks SET status = 'in_progress', error = NULL, updated_at = @updated_at WHERE id = @id",
-      )
-      .run({ id: task.id, updated_at: Date.now() });
-    deps.recordTaskEvent(task.id, "task.resume_triggered", {
-      sessionKey: task.sessionKey,
-      threadId: task.threadId || null,
-    });
-    deps.onTaskChanged(task.id);
+      await waitForAcpStartupGate(deps.acpStartupCooldownMs);
+      const accountId = deps.resolveAccountId(task.agent);
+      const baselineThreadMessages =
+        task.threadId && deps.readThreadMessages
+          ? await deps.readThreadMessages(task.threadId, accountId, 20).catch(() => [])
+          : [];
 
-    if (task.threadId) {
-      await deps
-        .postToThread(
-          task.threadId,
-          "🔄 **Resuming session** — picking up where we left off...",
-          deps.resolveAccountId(task.agent),
-        )
-        .catch(() => {});
-    }
-
-    const resumeHarness = deps.resolveHarness(task);
-    const resumeThreadId = task.threadId || undefined;
-    const result = await spawnAcp(
-      {
-        task: "Continue where you left off. Your previous session was interrupted. Check git log and git status to see your progress, then complete the remaining work.",
-        agentId: resumeHarness,
-        cwd: resolvedCwd,
-        resumeSessionId,
-        mode: "session",
-        thread: true,
-      },
-      {
-        agentChannel: "discord",
-        agentAccountId: accountId,
-        agentTo: buildDiscordAgentTarget(resumeThreadId, channelId),
-        agentThreadId: resumeThreadId,
-      },
-    );
-
-    if (result?.status !== "accepted") {
-      throw new Error(
-        result?.error || `resume spawn failed with status=${result?.status || "unknown"}`,
-      );
-    }
-
-    const childRunId = typeof result?.runId === "string" ? result.runId.trim() : "";
-    const childSessionKey = result?.childSessionKey || task.sessionKey;
-    if (!childRunId) throw new Error("resume spawn did not return runId");
-
-    deps.db
-      .prepare(
-        "UPDATE tasks SET session_key = @sessionKey, run_id = @runId, updated_at = @updated_at WHERE id = @id",
-      )
-      .run({ id: task.id, sessionKey: childSessionKey, runId: childRunId, updated_at: Date.now() });
-
-    const wait = await subagent.waitForRun({
-      runId: childRunId,
-      timeoutMs: deps.resolveTaskTimeoutMs(task),
-    });
-    const waitStatus = wait?.status || "timeout";
-    if (waitStatus !== "ok") {
-      const waitError = wait?.error ? `: ${wait.error}` : "";
-      throw new Error(`resumed run failed (${waitStatus})${waitError}`);
-    }
-
-    let text = "";
-    if (subagent.getSessionMessages) {
-      const msgs = await subagent.getSessionMessages({ sessionKey: childSessionKey, limit: 200 });
-      text = extractOutputFromMessages(msgs?.messages || []);
-    }
-
-    deps.db
-      .prepare(
-        "UPDATE tasks SET status = 'review', output = @output, completed_at = NULL, updated_at = @updated_at WHERE id = @id",
-      )
-      .run({ id: task.id, output: text.slice(0, 10000), updated_at: Date.now() });
-
-    if (task.threadId) {
-      const summary = text.slice(0, 1500);
-      await deps.postToThread(
-        task.threadId,
-        `✅ **Resume completed**\n\n${summary}${text.length > 1500 ? "..." : ""}`,
-        deps.resolveAccountId(task.agent),
-      );
-    }
-    deps.onTaskChanged(task.id);
-    const freshTask = deps.getTask(task.id);
-    if (deps.resolveQaRequired(freshTask || task)) await runMaatReviewLoop(task.id);
-    else {
-      const doneNow = Date.now();
       deps.db
         .prepare(
-          "UPDATE tasks SET status = 'done', completed_at = @completed_at, updated_at = @updated_at WHERE id = @id",
+          "UPDATE tasks SET status = 'in_progress', error = NULL, updated_at = @updated_at WHERE id = @id",
         )
-        .run({ id: task.id, completed_at: doneNow, updated_at: doneNow });
-      await deps.notifyMainSession(freshTask || task, "done");
+        .run({ id: task.id, updated_at: Date.now() });
+      deps.recordTaskEvent(task.id, "task.resume_triggered", {
+        priorStatus,
+        sessionKey: task.sessionKey,
+        threadId: task.threadId || null,
+      });
       deps.onTaskChanged(task.id);
-      deps.triggerDependents(task.id);
+
+      if (task.threadId) {
+        await deps
+          .postToThread(
+            task.threadId,
+            "🔄 **Resuming session** — picking up where we left off...",
+            deps.resolveAccountId(task.agent),
+          )
+          .catch(() => {});
+      }
+
+      const resumeText =
+        "Gateway restart interrupted your previous turn. Continue the same task from where you left off, keep the original instructions, avoid redoing already-completed work, and post your final response in this thread.";
+      const { runId: childRunId } = await promptTaskSession(task, resumeText);
+
+      deps.db
+        .prepare(
+          "UPDATE tasks SET run_id = @runId, updated_at = @updated_at WHERE id = @id",
+        )
+        .run({
+          id: task.id,
+          runId: childRunId,
+          updated_at: Date.now(),
+        });
+
+      const wait = await subagent.waitForRun({
+        runId: childRunId,
+        timeoutMs: deps.resolveTaskTimeoutMs(task),
+      });
+      const waitStatus = wait?.status || "timeout";
+      if (waitStatus !== "ok") {
+        const waitError = wait?.error ? `: ${wait.error}` : "";
+        throw new Error(`resumed run failed (${waitStatus})${waitError}`);
+      }
+
+      let text = "";
+      if (subagent.getSessionMessages) {
+        const msgs = await subagent.getSessionMessages({ sessionKey: task.sessionKey, limit: 200 });
+        text = extractOutputFromMessages(msgs?.messages || []);
+      }
+      text = sanitizeAcpThreadOutput(text);
+
+      if (task.threadId) {
+        const threadText = await waitForNewAcpThreadOutput({
+          readThreadMessages: deps.readThreadMessages,
+          threadId: task.threadId,
+          accountId,
+          timeoutMs: 8000,
+          baselineMessages: baselineThreadMessages,
+        });
+        if (threadText) {
+          text =
+            !text || threadText.includes("```json") || threadText.length > text.length
+              ? threadText
+              : [text, threadText].filter(Boolean).join("\n\n");
+          deps.stderr.write(
+            `[DISPATCH.RESUME] Recovered ${threadText.length} chars from Discord thread for ${task.id}\n`,
+          );
+        }
+      }
+      text = sanitizeAcpThreadOutput(text);
+
+      deps.db
+        .prepare(
+          "UPDATE tasks SET status = 'review', output = @output, completed_at = NULL, updated_at = @updated_at WHERE id = @id",
+        )
+        .run({ id: task.id, output: text.slice(0, 10000), updated_at: Date.now() });
+
+      if (task.threadId) {
+        const summary = text.slice(0, 1500);
+        await deps.postToThread(
+          task.threadId,
+          `✅ **Resume completed**\n\n${summary}${text.length > 1500 ? "..." : ""}`,
+          deps.resolveAccountId(task.agent),
+        );
+      }
+      deps.onTaskChanged(task.id);
+      const freshTask = deps.getTask(task.id);
+      if (deps.resolveQaRequired(freshTask || task)) await runMaatReviewLoop(task.id);
+      else {
+        const doneNow = Date.now();
+        deps.db
+          .prepare(
+            "UPDATE tasks SET status = 'done', completed_at = @completed_at, updated_at = @updated_at WHERE id = @id",
+          )
+          .run({ id: task.id, completed_at: doneNow, updated_at: doneNow });
+        await deps.notifyMainSession(freshTask || task, "done");
+        deps.onTaskChanged(task.id);
+        deps.triggerDependents(task.id);
+      }
+    } catch (error) {
+      const message = getErrorMessage(error);
+      const currentTask = deps.getTask(task.id) || task;
+      deps.db
+        .prepare(
+          "UPDATE tasks SET status = 'error', error = @error, retries = retries + 1, updated_at = @updated_at WHERE id = @id",
+        )
+        .run({
+          id: task.id,
+          error: message,
+          updated_at: Date.now(),
+        });
+      deps.recordTaskEvent(task.id, "task.resume_failed", {
+        priorStatus,
+        error: message,
+        sessionKey: task.sessionKey,
+        threadId: task.threadId || null,
+      });
+      if (task.threadId) {
+        await deps
+          .postToThread(
+            task.threadId,
+            `❌ **Resume failed**\n\n${message}`,
+            deps.resolveAccountId(task.agent),
+          )
+          .catch(() => {});
+      }
+      deps.onTaskChanged(task.id);
+      await deps.notifyMainSession({ ...currentTask, error: message }, "error");
     }
   }
 

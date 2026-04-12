@@ -54,6 +54,7 @@ function createInMemoryDb(): DatabaseLike {
     schedules: DbRowObject[];
     comments: DbRowObject[];
     task_events: DbRowObject[];
+    plugin_state: DbRowObject[];
     projects: DbRowObject[];
     project_commits: DbRowObject[];
     project_snapshots: DbRowObject[];
@@ -64,6 +65,7 @@ function createInMemoryDb(): DatabaseLike {
     schedules: [],
     comments: [],
     task_events: [],
+    plugin_state: [],
     projects: [],
     project_commits: [],
     project_snapshots: [],
@@ -132,6 +134,12 @@ function createInMemoryDb(): DatabaseLike {
             tables.task_events.push(toRowObject(args[0]));
             return;
           }
+          if (sql.startsWith("INSERT INTO plugin_state")) {
+            const row = toRowObject(args[0]);
+            tables.plugin_state = tables.plugin_state.filter((entry) => entry.key !== row.key);
+            tables.plugin_state.push(row);
+            return;
+          }
           if (sql.startsWith("INSERT INTO schedules")) {
             tables.schedules.push(toRowObject(args[0]));
             return;
@@ -190,6 +198,10 @@ function createInMemoryDb(): DatabaseLike {
           if (sql.startsWith("SELECT * FROM review_state WHERE repo = ?")) {
             return tables.review_state.find((row) => row.repo === String(args[0]));
           }
+          if (sql.startsWith("SELECT value FROM plugin_state WHERE key = ?")) {
+            const row = tables.plugin_state.find((entry) => entry.key === String(args[0]));
+            return row ? { value: row.value } : undefined;
+          }
           if (sql.startsWith("SELECT * FROM review_state WHERE active_task_id = ?")) {
             return tables.review_state.find((row) => row.active_task_id === String(args[0]));
           }
@@ -228,6 +240,7 @@ function createInMemoryDb(): DatabaseLike {
               { name: "schedules" },
               { name: "comments" },
               { name: "task_events" },
+              { name: "plugin_state" },
               { name: "projects" },
               { name: "project_commits" },
               { name: "project_snapshots" },
@@ -354,6 +367,12 @@ export function initDb(dbPath: string): DatabaseLike {
 
     CREATE INDEX IF NOT EXISTS idx_task_events_task_created
       ON task_events(task_id, created_at);
+
+    CREATE TABLE IF NOT EXISTS plugin_state (
+      key TEXT PRIMARY KEY,
+      value TEXT,
+      updated_at INTEGER NOT NULL
+    );
 
     CREATE TABLE IF NOT EXISTS projects (
       id TEXT PRIMARY KEY,

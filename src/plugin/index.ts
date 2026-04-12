@@ -189,12 +189,64 @@ export default function setup(api: PluginApi) {
   const db = initDb(dbPath);
   seedProjectsIfEmpty(db);
 
-  // ---- Phase 5: Restart resilience — log stuck tasks (don't mark as error) ----
-  // Previously this marked all dispatched/in_progress/blocked tasks as 'error'
-  // on every plugin startup, causing false "Gateway restart" errors even when
-  // the gateway didn't actually restart (e.g., plugin hot-reload, config change).
-  // Now we just log them — if the ACP session is truly dead, the task timeout
-  // will catch it. If it's still alive, it'll complete normally.
+  function detectGatewayRuntimeState() {
+    const currentStartedAt = Date.now();
+    const currentPid = String(process.pid);
+    const previousPidResult = db
+      .prepare<{ value?: string }>("SELECT value FROM plugin_state WHERE key = ?")
+      .get("gateway.pid");
+    const previousStartedAtResult = db
+      .prepare<{ value?: string }>("SELECT value FROM plugin_state WHERE key = ?")
+      .get("gateway.started_at");
+    const previousPid =
+      typeof previousPidResult?.value === "string" && previousPidResult.value.trim()
+        ? previousPidResult.value.trim()
+        : null;
+    const previousStartedAt =
+      typeof previousStartedAtResult?.value === "string" && previousStartedAtResult.value.trim()
+        ? Number.parseInt(previousStartedAtResult.value, 10)
+        : null;
+    db.prepare(
+      `INSERT INTO plugin_state (key, value, updated_at)
+       VALUES (@key, @value, @updated_at)
+       ON CONFLICT(key) DO UPDATE SET
+         value = excluded.value,
+         updated_at = excluded.updated_at`,
+    ).run({
+      key: "gateway.pid",
+      value: currentPid,
+      updated_at: currentStartedAt,
+    });
+    db.prepare(
+      `INSERT INTO plugin_state (key, value, updated_at)
+       VALUES (@key, @value, @updated_at)
+       ON CONFLICT(key) DO UPDATE SET
+         value = excluded.value,
+         updated_at = excluded.updated_at`,
+    ).run({
+      key: "gateway.started_at",
+      value: String(currentStartedAt),
+      updated_at: currentStartedAt,
+    });
+    return {
+      currentPid,
+      currentStartedAt,
+      previousPid,
+      previousStartedAt: Number.isFinite(previousStartedAt) ? previousStartedAt : null,
+      isGatewayRestart: Boolean(previousPid && previousPid !== currentPid),
+    };
+  }
+
+  const gatewayRuntimeState = detectGatewayRuntimeState();
+  if (gatewayRuntimeState.isGatewayRestart) {
+    process.stderr.write(
+      `[STARTUP] Gateway restart detected (pid ${gatewayRuntimeState.previousPid} -> ${gatewayRuntimeState.currentPid})\n`,
+    );
+  }
+
+  // ---- Phase 5: Restart resilience — log active tasks and recover only after
+  // real gateway restarts. Plugin hot-reloads/config changes happen inside the
+  // same gateway process, so they must not trigger ACP auto-resume.
   const stuckTasks = db
     .prepare("SELECT * FROM tasks WHERE status IN ('dispatched', 'in_progress', 'blocked')")
     .all() as TaskRow[];
@@ -741,6 +793,73 @@ export default function setup(api: PluginApi) {
     void backgroundJobs.drainOnce();
   }, 100);
   backgroundJobWorker.unref?.();
+
+  function queueGatewayRestartResumes(): void {
+    if (!gatewayRuntimeState.isGatewayRestart) return;
+
+    const now = Date.now();
+    const interruptedRows = db
+      .prepare<Record<string, unknown>>(
+        "SELECT * FROM tasks WHERE status IN ('dispatched', 'in_progress') AND session_key IS NOT NULL",
+      )
+      .all();
+
+    const candidates: Task[] = [];
+    for (const row of interruptedRows) {
+      const task = rowToTask(row);
+      if (!task) continue;
+      if (resolveRuntime(task) !== "acp") continue;
+
+      const lastTouchedAt = task.updatedAt || task.createdAt || 0;
+      // Skip tasks that were already stale before the previous gateway session
+      // even started; they are not newly interrupted by the just-detected restart.
+      if (
+        gatewayRuntimeState.previousStartedAt &&
+        Number.isFinite(gatewayRuntimeState.previousStartedAt) &&
+        lastTouchedAt < gatewayRuntimeState.previousStartedAt
+      ) {
+        process.stderr.write(
+          `[STARTUP] Skipping pre-restart task ${task.id} status=${task.status} lastTouchedAt=${lastTouchedAt}\n`,
+        );
+        continue;
+      }
+      const maxResumeAgeMs = resolveTaskTimeoutMs(task);
+      if (now - lastTouchedAt > maxResumeAgeMs) {
+        process.stderr.write(
+          `[STARTUP] Skipping stale auto-resume for task ${task.id} status=${task.status} ageMs=${now - lastTouchedAt}\n`,
+        );
+        continue;
+      }
+
+      candidates.push(task);
+    }
+
+    if (candidates.length === 0) {
+      process.stderr.write("[STARTUP] No ACP tasks eligible for auto-resume after gateway restart\n");
+      return;
+    }
+
+    process.stderr.write(
+      `[STARTUP] Queueing ${candidates.length} ACP task(s) for auto-resume after gateway restart\n`,
+    );
+    for (const task of candidates) {
+      const queued = backgroundJobs.enqueue({ kind: "resume", taskId: task.id });
+      recordTaskEvent(task.id, queued ? "task.resume_queued" : "task.resume_already_queued", {
+        reason: "gateway_restart",
+        priorStatus: task.status,
+        previousGatewayPid: gatewayRuntimeState.previousPid,
+        currentGatewayPid: gatewayRuntimeState.currentPid,
+        sessionKey: task.sessionKey,
+        threadId: task.threadId || null,
+      });
+      process.stderr.write(
+        `[STARTUP] ${queued ? "Queued" : "Skipped"} auto-resume for task ${task.id} status=${task.status}\n`,
+      );
+    }
+  }
+
+  queueGatewayRestartResumes();
+
   for (const row of db
     .prepare<{ repo: string }>(
       "SELECT repo FROM review_state WHERE pending_task_id IS NOT NULL AND pending_updated_at IS NOT NULL",

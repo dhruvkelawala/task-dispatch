@@ -202,4 +202,150 @@ describe("dispatch-runtime", () => {
     expect(calls.recordTaskEvent?.some((args) => args[1] === "dispatch.failed")).toBeTrue();
     expect(calls.notifyMainSession).toHaveLength(1);
   });
+
+  test("resumeTask accepts dispatched ACP tasks and resumes the prior session", async () => {
+    const task = makeTask({
+      status: "dispatched",
+      agent: "zeus",
+      sessionKey: "session-1",
+      threadId: null,
+    });
+    const updates: string[] = [];
+    let promptPayload: { sessionKey?: string; text?: string } | null = null;
+    const { calls, deps } = makeDeps({
+      getTask: () => task,
+      api: {
+        runtime: {
+          acp: {
+            prompt: async (payload: { sessionKey: string; text: string }) => {
+              promptPayload = payload;
+              return {
+                runId: "run-2",
+              };
+            },
+          },
+          subagent: {
+            waitForRun: async () => ({ status: "ok" }),
+            getSessionMessages: async () => ({
+              messages: [{ role: "assistant", content: "RESUMED_OK" }],
+            }),
+          },
+        },
+      },
+      db: {
+        prepare: (sql: string) => ({
+          run: () => {
+            updates.push(sql);
+          },
+          get: () => null,
+          all: () => [],
+        }),
+        transaction: (fn: () => void) => fn,
+      },
+    });
+    const runtime = createDispatchRuntime(
+      deps as unknown as Parameters<typeof createDispatchRuntime>[0],
+    );
+
+    await runtime.resumeTask("task-1");
+
+    const resumedPrompt = (promptPayload as { sessionKey?: string; text?: string } | null) ?? null;
+    expect(resumedPrompt?.sessionKey).toBe("session-1");
+    expect(resumedPrompt?.text).toContain("Gateway restart interrupted your previous turn");
+    expect(updates.some((sql) => sql.includes("status = 'in_progress'"))).toBeTrue();
+    expect(updates.some((sql) => sql.includes("status = 'review'"))).toBeTrue();
+    expect(updates.some((sql) => sql.includes("status = 'done'"))).toBeTrue();
+    expect(calls.recordTaskEvent?.some((args) => args[1] === "task.resume_triggered")).toBeTrue();
+    expect(calls.notifyMainSession).toHaveLength(1);
+  });
+
+  test("resumeTask accepts in_progress ACP tasks and keeps status progression", async () => {
+    const task = makeTask({
+      status: "in_progress",
+      agent: "zeus",
+      sessionKey: "session-1",
+      threadId: null,
+    });
+    const updates: string[] = [];
+    const { calls, deps } = makeDeps({
+      getTask: () => task,
+      api: {
+        runtime: {
+          acp: {
+            prompt: async () => ({ runId: "run-3" }),
+          },
+          subagent: {
+            waitForRun: async () => ({ status: "ok" }),
+            getSessionMessages: async () => ({
+              messages: [{ role: "assistant", content: "IN_PROGRESS_RESUMED_OK" }],
+            }),
+          },
+        },
+      },
+      db: {
+        prepare: (sql: string) => ({
+          run: () => {
+            updates.push(sql);
+          },
+          get: () => null,
+          all: () => [],
+        }),
+        transaction: (fn: () => void) => fn,
+      },
+    });
+    const runtime = createDispatchRuntime(
+      deps as unknown as Parameters<typeof createDispatchRuntime>[0],
+    );
+
+    await runtime.resumeTask("task-1");
+
+    expect(updates.some((sql) => sql.includes("status = 'in_progress'"))).toBeTrue();
+    expect(updates.some((sql) => sql.includes("status = 'review'"))).toBeTrue();
+    expect(updates.some((sql) => sql.includes("status = 'done'"))).toBeTrue();
+    expect(calls.recordTaskEvent?.some((args) => args[1] === "task.resume_triggered")).toBeTrue();
+  });
+
+  test("resumeTask marks task error when resume fails", async () => {
+    const task = makeTask({
+      status: "dispatched",
+      agent: "zeus",
+      sessionKey: "session-1",
+      threadId: null,
+    });
+    const updates: string[] = [];
+    const { calls, deps } = makeDeps({
+      getTask: () => task,
+      api: {
+        runtime: {
+          acp: {
+            prompt: async () => {
+              throw new Error("resume failed");
+            },
+          },
+          subagent: {
+            waitForRun: async () => ({ status: "ok" }),
+          },
+        },
+      },
+      db: {
+        prepare: (sql: string) => ({
+          run: () => {
+            updates.push(sql);
+          },
+          get: () => null,
+          all: () => [],
+        }),
+        transaction: (fn: () => void) => fn,
+      },
+    });
+    const runtime = createDispatchRuntime(
+      deps as unknown as Parameters<typeof createDispatchRuntime>[0],
+    );
+
+    await runtime.resumeTask("task-1");
+
+    expect(updates.some((sql) => sql.includes("status = 'error'"))).toBeTrue();
+    expect(calls.recordTaskEvent?.some((args) => args[1] === "task.resume_failed")).toBeTrue();
+    expect(calls.notifyMainSession).toHaveLength(1);
+  });
 });
