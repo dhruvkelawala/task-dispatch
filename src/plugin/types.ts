@@ -77,6 +77,8 @@ export interface PluginConfig {
     maxReviewCycles?: number;
     reviewDebounceMs?: number;
     acpStartupCooldownMs?: number;
+    reviewThreadPollTimeoutMs?: number;
+    reviewThreadPollLimit?: number;
   };
   notifications?: {
     operatorLabel?: string;

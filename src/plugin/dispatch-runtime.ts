@@ -172,6 +172,8 @@ type DispatchRuntimeDeps = {
   defaultCwd: string;
   acpStartupCooldownMs: number;
   defaultReviewTimeoutMs: number;
+  reviewThreadPollTimeoutMs: number;
+  reviewThreadPollLimit: number;
   maxConcurrentSessions: number;
   maxReviewCycles: number;
   defaultDiscordAccountId: string;
@@ -827,8 +829,8 @@ export function createDispatchRuntime(deps: DispatchRuntimeDeps) {
         readThreadMessages: deps.readThreadMessages,
         threadId: task.threadId,
         accountId,
-        timeoutMs: isReviewTask ? 20_000 : 8_000,
-        limit: isReviewTask ? 50 : 20,
+        timeoutMs: isReviewTask ? deps.reviewThreadPollTimeoutMs : 8_000,
+        limit: isReviewTask ? deps.reviewThreadPollLimit : 20,
         validator: isReviewTask ? (candidate) => parseReviewSummary(candidate) !== null : undefined,
       });
       if (threadText) {

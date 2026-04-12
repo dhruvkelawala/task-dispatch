@@ -150,6 +150,10 @@ const defaultCwd = DEFAULTS.defaultCwd || `${HOME}/.openclaw/workspace`;
 const defaultTaskTimeoutMs = normalizeTimeoutMs(DEFAULTS.taskTimeoutMs, 10 * 60_000);
 const defaultReviewTimeoutMs = normalizeTimeoutMs(DEFAULTS.reviewTimeoutMs, 3 * 60_000);
 const defaultAcpStartupCooldownMs = normalizeTimeoutMs(DEFAULTS.acpStartupCooldownMs, 60 * 1000);
+const defaultReviewThreadPollTimeoutMs = normalizeTimeoutMs(DEFAULTS.reviewThreadPollTimeoutMs, 20_000);
+const defaultReviewThreadPollLimit = Number.isFinite(DEFAULTS.reviewThreadPollLimit)
+  ? Math.max(5, Math.floor(DEFAULTS.reviewThreadPollLimit ?? 50))
+  : 50;
 const maxReviewCycles = Number.isFinite(DEFAULTS.maxReviewCycles)
   ? Math.max(1, Math.floor(DEFAULTS.maxReviewCycles ?? 3))
   : 3;
@@ -398,6 +402,8 @@ export default function setup(api: PluginApi) {
     db,
     defaultCwd,
     acpStartupCooldownMs: defaultAcpStartupCooldownMs,
+    reviewThreadPollTimeoutMs: defaultReviewThreadPollTimeoutMs,
+    reviewThreadPollLimit: defaultReviewThreadPollLimit,
     defaultReviewTimeoutMs,
     maxConcurrentSessions,
     maxReviewCycles,
