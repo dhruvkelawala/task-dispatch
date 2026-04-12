@@ -151,6 +151,7 @@ export function buildReviewTaskDescription(params: {
     "OUTPUT RULES (strict):",
     "- Your ENTIRE thread output = 2-3 sentences + ONE json fence. Nothing else.",
     "- No bullet lists. No headers. No markdown formatting. No code blocks except the final JSON.",
+    "- No process narration. Do NOT say things like 'I'm reviewing', 'Sync is complete', 'Now I'm checking', 'I validated', or describe your workflow step-by-step.",
     "- Pattern: 'Reviewed [range]. [N] findings ([severities]). [one-line summary if needed].'",
     "- Then ONE ```json fence with the full summary. Do NOT split JSON across multiple fences or messages.",
     "- Think of yourself as a terse code reviewer, not an essay writer. Every extra word is waste.",
