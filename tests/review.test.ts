@@ -73,7 +73,7 @@ describe("review helpers", () => {
     expect(description).toContain("Range: aaa111..bbb222");
     expect(description).toContain("Required final machine-readable summary");
     expect(description).toContain("schemaVersion");
-    expect(description).toContain("Do not create or update GitHub issues directly");
+    expect(description).toContain("Do NOT create GitHub issues");
   });
 
   test("parseReviewSummary returns the last valid fenced JSON summary", () => {

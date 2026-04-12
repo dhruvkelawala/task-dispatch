@@ -141,19 +141,19 @@ export function buildReviewTaskDescription(params: {
     params.compareUrl ? `Compare URL: ${params.compareUrl}` : null,
     "",
     "Instructions:",
-    "0. FIRST: ensure the local repo is up to date. Run `git fetch origin && git checkout " +
-      (params.branch || "main") +
-      " && git pull origin " +
-      (params.branch || "main") +
-      "` before anything else. If the commit range is not resolvable after pulling, report reviewOutcome as failed_retryable.",
-    "0b. This is a read-only retrospective review. If `git status` shows unrelated local changes, ignore them and continue. Review only the requested commit range; do not stop just because the working tree is dirty.",
-    `1. Run \`git log --oneline ${params.fromSha}..${params.toSha}\` and \`git diff ${params.fromSha}..${params.toSha}\`.`,
-    "2. Review for bugs, edge cases, missing tests, security issues, architecture drift, and follow-up work.",
-    "3. Classify each finding with category + severity.",
-    "4. Do not create or update GitHub issues directly; the plugin handles GitHub mutations server-side.",
-    "5. Keep the final JSON compact. Do not include long markdown issue bodies in the JSON; the plugin expands issue details server-side.",
-    "6. In the Discord thread, post only a brief human-readable summary: 1 short paragraph plus up to 5 bullets. Do not paste long issue bodies there.",
-    "7. Finish with a final fenced JSON block that matches the required schema exactly.",
+    `0. Sync: \`git fetch origin && git checkout ${params.branch || "main"} && git pull origin ${params.branch || "main"}\`. If range unresolvable, reviewOutcome=failed_retryable.`,
+    "0b. Read-only review. Dirty working tree? Ignore it. Review only the requested range.",
+    `1. \`git log --oneline ${params.fromSha}..${params.toSha}\` and \`git diff ${params.fromSha}..${params.toSha}\`.`,
+    "2. Find: bugs, edge cases, missing tests, security issues, architecture drift.",
+    "3. Classify each: category + severity.",
+    "4. Do NOT create GitHub issues. Plugin does that server-side from your JSON.",
+    "",
+    "OUTPUT RULES (strict):",
+    "- Your ENTIRE thread output = 2-3 sentences + ONE json fence. Nothing else.",
+    "- No bullet lists. No headers. No markdown formatting. No code blocks except the final JSON.",
+    "- Pattern: 'Reviewed [range]. [N] findings ([severities]). [one-line summary if needed].'",
+    "- Then ONE ```json fence with the full summary. Do NOT split JSON across multiple fences or messages.",
+    "- Think of yourself as a terse code reviewer, not an essay writer. Every extra word is waste.",
     "",
     "Required final machine-readable summary:",
     "Return a final fenced JSON block with this exact top-level shape:",
@@ -178,10 +178,10 @@ export function buildReviewTaskDescription(params: {
       2,
     ),
     "```",
-    "For a clean review with no actionable findings, return findingsCount: 0 and findings: [].",
-    "The JSON must stay compact. Each finding should contain only: title, severity, category, file, optional line, and summary.",
-    "Do not include extra keys like issueBody, markdown sections, or long prose inside the JSON.",
-    "Do not add markdown issue-body sections such as `## Problem` / `## Why it matters` / `## Suggested fix` to the Discord summary or the JSON.",
+    "Clean review = findingsCount: 0, findings: [].",
+    "Each finding: title, severity, category, file, optional line, one-sentence summary. Nothing else.",
+    "BAD: headers, bullets, multiple json fences, long explanations, ## Problem sections.",
+    "GOOD: 'Reviewed 104b4c8. 2 findings (1 high, 1 medium).' then one json fence.",
   ].filter(Boolean);
   return details.join("\n");
 }
