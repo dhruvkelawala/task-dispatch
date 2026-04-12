@@ -476,21 +476,24 @@ export default function setup(api: PluginApi) {
         sha,
         task_id,
         status,
-        accepted_at
+        accepted_at,
+        installation_id
       ) VALUES (
         @delivery_key,
         @repo,
         @sha,
         @task_id,
         @status,
-        @accepted_at
+        @accepted_at,
+        @installation_id
       )
       ON CONFLICT(delivery_key) DO UPDATE SET
         repo = excluded.repo,
         sha = excluded.sha,
         task_id = excluded.task_id,
         status = excluded.status,
-        accepted_at = excluded.accepted_at
+        accepted_at = excluded.accepted_at,
+        installation_id = COALESCE(excluded.installation_id, review_deliveries.installation_id)
     `),
   };
 
