@@ -17,6 +17,7 @@ import {
 import {
   executePlannedReviewIssues,
   planReviewIssues,
+  type PlannedReviewIssue,
   type ReviewIssueWriteResult,
 } from "./review-issues";
 import {
@@ -101,10 +102,30 @@ type ReviewRuntimeDeps = {
   ) => void;
   onTaskChanged: (taskId: string) => void;
   resolveReviewAgentId: (config: PluginConfig, projectId: string, fallbackAgent: string) => string;
+  resolveAccountId?: (agent: string) => string;
+  postToThread?: (threadId: string | null, content: string, accountId: string) => Promise<void>;
   stderr: Pick<typeof process.stderr, "write">;
 };
 
 export function createReviewRuntime(deps: ReviewRuntimeDeps) {
+  function buildIssueSummaryForThread(params: {
+    issues: PlannedReviewIssue[];
+    issueOps: ReviewIssueWriteResult[];
+  }): string | null {
+    const lines = params.issues.flatMap((issue) => {
+      const op = params.issueOps.find((entry) => entry.fingerprint === issue.fingerprint);
+      if (!op || !op.issueUrl) return [];
+      const match = issue.title.match(/^\[ai-review\]\[(.+?)\]\[(.+?)\]\s+(.*)$/);
+      const severity = match?.[1] || issue.severity;
+      const title = match?.[3] || issue.title;
+      const label = op.operation === "created" ? "created" : "existing";
+      return [`- **${severity}** ${title} — ${label}: ${op.issueUrl}`];
+    });
+
+    if (lines.length === 0) return null;
+    return ["🔗 **GitHub issues**", ...lines].join("\n");
+  }
+
   function getReviewState(repo: string): ReviewStateRow {
     return (
       deps.stmts.getReviewStateByRepo.get(repo) || {
@@ -288,16 +309,16 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps) {
     task: Task,
     parsedSummary: ParsedReviewSummary,
     reviewState: ReviewStateRow,
-  ): Promise<ReviewIssueWriteResult[]> {
+  ): Promise<{ issueOps: ReviewIssueWriteResult[]; plannedIssues: PlannedReviewIssue[] }> {
     if (parsedSummary.findingsCount === 0 || parsedSummary.findings.length === 0) {
-      return [];
+      return { issueOps: [], plannedIssues: [] };
     }
 
     if (!deps.githubApp || !deps.getInstallationIdForRepo) {
       deps.stderr.write(
         `[ISSUE-WRITER] GitHub App not configured, skipping issue writing for ${task.id}\n`,
       );
-      return [];
+      return { issueOps: [], plannedIssues: [] };
     }
 
     const installationId = deps.getInstallationIdForRepo(reviewState.repo);
@@ -305,7 +326,7 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps) {
       deps.stderr.write(
         `[ISSUE-WRITER] No installation ID for repo ${reviewState.repo}, skipping\n`,
       );
-      return [];
+      return { issueOps: [], plannedIssues: [] };
     }
 
     const token = await getInstallationToken(deps.githubApp, installationId);
@@ -318,10 +339,10 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps) {
     });
 
     if (planned.length === 0) {
-      return [];
+      return { issueOps: [], plannedIssues: [] };
     }
 
-    return await executePlannedReviewIssues({
+    const issueOps = await executePlannedReviewIssues({
       token,
       repo: reviewState.repo,
       reviewRange,
@@ -331,6 +352,7 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps) {
       commentOnGitHubIssue,
       stderr: deps.stderr,
     });
+    return { issueOps, plannedIssues: planned };
   }
 
   async function finalizeReviewTask(task: Task): Promise<void> {
@@ -342,16 +364,43 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps) {
     const parsedSummary = parseReviewSummary(task.output || "");
     const now = Date.now();
 
+    if (task.status === "cancelled") {
+      return;
+    }
     if (task.status !== "done" || !parsedSummary) {
-      // Task failed or no valid summary — do not advance cursor
+      // Done with empty/unparseable output — advance cursor to prevent infinite retry
+      if (task.status === "done" && !parsedSummary) {
+        const nextCursor = reviewState.active_to_sha;
+        saveReviewState({
+          ...reviewState,
+          last_reviewed_sha: nextCursor,
+          last_review_at: now,
+          pending_from_sha: null,
+          pending_to_sha: null,
+          pending_task_id: null,
+          pending_updated_at: null,
+          active_from_sha: null,
+          active_to_sha: null,
+          active_task_id: null,
+        });
+        deps.recordTaskEvent(task.id, "review.cursor_advanced_empty_output", {
+          repo: reviewState.repo,
+          lastReviewedSha: nextCursor,
+        });
+        return;
+      }
+      // Task failed — do not advance cursor
       handleFailedReview(task, reviewState, parsedSummary, now);
       return;
     }
 
     // Execute server-side issue writing
     let issueOps: ReviewIssueWriteResult[] = [];
+    let plannedIssues: PlannedReviewIssue[] = [];
     try {
-      issueOps = await executeIssueWriting(task, parsedSummary, reviewState);
+      const result = await executeIssueWriting(task, parsedSummary, reviewState);
+      issueOps = result.issueOps;
+      plannedIssues = result.plannedIssues;
       deps.recordTaskEvent(task.id, "review.issues_written", {
         repo: reviewState.repo,
         issueOpsCount: issueOps.length,
@@ -368,10 +417,27 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps) {
       });
     }
 
-    // Attach issueOps to the parsed summary for cursor decision
+    if (task.threadId && deps.postToThread && deps.resolveAccountId) {
+      const issueSummary = buildIssueSummaryForThread({ issues: plannedIssues, issueOps });
+      if (issueSummary) {
+        await deps.postToThread(task.threadId, issueSummary, deps.resolveAccountId(task.agent));
+      }
+    }
+
+    // Attach issueOps to the parsed summary for cursor decision.
+    // When GitHub App is not configured, issue writing is skipped entirely —
+    // treat that as success (no failed_retryable ops) so the cursor advances.
+    const effectiveIssueOps: ReviewIssueWriteResult[] =
+      issueOps.length > 0
+        ? issueOps
+        : plannedIssues.map((p) => ({
+            fingerprint: p.fingerprint,
+            operation: "skipped_low_severity" as const,
+            reason: "github_app_not_configured",
+          }));
     const summaryWithOps: ParsedReviewSummary = {
       ...parsedSummary,
-      issueOps: issueOps.length > 0 ? issueOps : undefined,
+      issueOps: effectiveIssueOps.length > 0 ? effectiveIssueOps : undefined,
     };
 
     const succeeded = shouldAdvanceReviewCursor(summaryWithOps);
@@ -391,6 +457,8 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps) {
     handleFailedReview(task, reviewState, parsedSummary, now);
   }
 
+  const MAX_REVIEW_RETRIES = 2;
+
   function handleFailedReview(
     task: Task,
     reviewState: ReviewStateRow,
@@ -401,7 +469,9 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps) {
     const mergedTo = reviewState.pending_to_sha || reviewState.active_to_sha;
     let pendingTaskId = reviewState.pending_task_id;
 
-    if (!pendingTaskId && mergedFrom && mergedTo) {
+    // Only retry if we haven't exceeded the max retry count for this range.
+    const retryCount = (task.retries || 0) + (task.reviewAttempts || 0);
+    if (!pendingTaskId && mergedFrom && mergedTo && retryCount < MAX_REVIEW_RETRIES) {
       const projectId = resolveProjectIdForRepo(deps.config, reviewState.repo);
       if (projectId) {
         const retryTask = createPendingReviewTask(
@@ -420,6 +490,14 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps) {
         );
         pendingTaskId = retryTask.id;
       }
+    } else if (retryCount >= MAX_REVIEW_RETRIES) {
+      deps.stderr.write(
+        `[REVIEW] Max retries (${MAX_REVIEW_RETRIES}) exceeded for ${reviewState.repo}, not scheduling another retry\n`,
+      );
+      deps.recordTaskEvent(task.id, "review.max_retries_exceeded", {
+        repo: reviewState.repo,
+        retryCount,
+      });
     }
 
     if (pendingTaskId && mergedFrom && mergedTo) {

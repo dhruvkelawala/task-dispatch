@@ -124,6 +124,42 @@ describe("review helpers", () => {
     });
   });
 
+  test("parseReviewSummary rebuilds a final summary split across multiple json fences", () => {
+    const summary = parseReviewSummary(
+      [
+        "Narrative review text.",
+        "```json",
+        '{"schemaVersion":1,"reviewOutcome":"success","findingsCount":2,"findings":[{"title":"A","severity":"high","category":"bug","file":"a.ts","summary":"A"},',
+        "```",
+        "```json",
+        '{"title":"B","severity":"medium","category":"test","file":"b.ts","summary":"B"}]}',
+        "```",
+      ].join("\n"),
+    );
+
+    expect(summary).toEqual({
+      schemaVersion: 1,
+      reviewOutcome: "success",
+      findingsCount: 2,
+      findings: [
+        {
+          title: "A",
+          severity: "high",
+          category: "bug",
+          file: "a.ts",
+          summary: "A",
+        },
+        {
+          title: "B",
+          severity: "medium",
+          category: "test",
+          file: "b.ts",
+          summary: "B",
+        },
+      ],
+    });
+  });
+
   test("shouldAdvanceReviewCursor only advances on clean or post-issue-write success", () => {
     expect(
       shouldAdvanceReviewCursor({

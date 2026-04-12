@@ -76,6 +76,7 @@ export interface PluginConfig {
     reviewTimeoutMs?: number;
     maxReviewCycles?: number;
     reviewDebounceMs?: number;
+    acpStartupCooldownMs?: number;
   };
   notifications?: {
     operatorLabel?: string;

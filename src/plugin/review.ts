@@ -43,7 +43,7 @@ export type ParsedReviewSummary = {
     file: string;
     line?: number;
     summary: string;
-    issueBody: string;
+    issueBody?: string;
   }>;
   issueOps?: Array<{
     fingerprint?: string;
@@ -146,12 +146,13 @@ export function buildReviewTaskDescription(params: {
       " && git pull origin " +
       (params.branch || "main") +
       "` before anything else. If the commit range is not resolvable after pulling, report reviewOutcome as failed_retryable.",
+    "0b. This is a read-only retrospective review. If `git status` shows unrelated local changes, ignore them and continue. Review only the requested commit range; do not stop just because the working tree is dirty.",
     `1. Run \`git log --oneline ${params.fromSha}..${params.toSha}\` and \`git diff ${params.fromSha}..${params.toSha}\`.`,
     "2. Review for bugs, edge cases, missing tests, security issues, architecture drift, and follow-up work.",
     "3. Classify each finding with category + severity.",
     "4. Do not create or update GitHub issues directly; the plugin handles GitHub mutations server-side.",
-    "5. For each actionable finding, provide issue-ready content the plugin can post deterministically.",
-    "6. Always post one final human-readable summary in this Discord thread.",
+    "5. Keep the final JSON compact. Do not include long markdown issue bodies in the JSON; the plugin expands issue details server-side.",
+    "6. In the Discord thread, post only a brief human-readable summary: 1 short paragraph plus up to 5 bullets. Do not paste long issue bodies there.",
     "7. Finish with a final fenced JSON block that matches the required schema exactly.",
     "",
     "Required final machine-readable summary:",
@@ -170,7 +171,6 @@ export function buildReviewTaskDescription(params: {
             file: "src/routes/users.ts",
             line: 42,
             summary: "The route can be reached without authentication.",
-            issueBody: "## Problem\n...\n\n## Why it matters\n...\n\n## Suggested fix\n...",
           },
         ],
       },
@@ -179,6 +179,9 @@ export function buildReviewTaskDescription(params: {
     ),
     "```",
     "For a clean review with no actionable findings, return findingsCount: 0 and findings: [].",
+    "The JSON must stay compact. Each finding should contain only: title, severity, category, file, optional line, and summary.",
+    "Do not include extra keys like issueBody, markdown sections, or long prose inside the JSON.",
+    "Do not add markdown issue-body sections such as `## Problem` / `## Why it matters` / `## Suggested fix` to the Discord summary or the JSON.",
   ].filter(Boolean);
   return details.join("\n");
 }
@@ -238,9 +241,7 @@ export function parseReviewSummary(output: unknown): ParsedReviewSummary | null 
     return null;
   }
   const fencedJsonBlocks = Array.from(output.matchAll(/```json\s*([\s\S]*?)```/gi));
-  for (let idx = fencedJsonBlocks.length - 1; idx >= 0; idx -= 1) {
-    const jsonText = fencedJsonBlocks[idx]?.[1];
-    if (!jsonText) continue;
+  const tryParseSummary = (jsonText: string): ParsedReviewSummary | null => {
     try {
       const parsed = JSON.parse(jsonText) as ParsedReviewSummary;
       if (
@@ -253,7 +254,28 @@ export function parseReviewSummary(output: unknown): ParsedReviewSummary | null 
         return parsed;
       }
     } catch {
-      // Ignore malformed fences and keep scanning older blocks.
+      // Ignore malformed JSON and keep scanning.
+    }
+    return null;
+  };
+
+  for (let idx = fencedJsonBlocks.length - 1; idx >= 0; idx -= 1) {
+    const jsonText = fencedJsonBlocks[idx]?.[1];
+    if (!jsonText) continue;
+    const parsed = tryParseSummary(jsonText);
+    if (parsed) {
+      return parsed;
+    }
+  }
+
+  // Discord can split a long final JSON summary across multiple ` ```json `
+  // messages. If individual blocks are invalid, try joining suffixes of the
+  // final JSON block run and parse again.
+  const blockContents = fencedJsonBlocks.map((match) => match[1]).filter(Boolean) as string[];
+  for (let start = blockContents.length - 1; start >= 0; start -= 1) {
+    const parsed = tryParseSummary(blockContents.slice(start).join(""));
+    if (parsed) {
+      return parsed;
     }
   }
   return null;

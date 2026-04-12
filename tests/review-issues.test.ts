@@ -65,6 +65,23 @@ describe("review issue helpers", () => {
     expect(body).toContain("Review range: `abc123..def456`");
   });
 
+  test("buildReviewIssueBody falls back to a server-generated detailed body", () => {
+    const fingerprint = buildReviewFindingFingerprint({
+      repo: "org/web-app",
+      finding: { ...finding, issueBody: undefined },
+    });
+    const body = buildReviewIssueBody({
+      repo: "org/web-app",
+      reviewRange: "abc123..def456",
+      fingerprint,
+      finding: { ...finding, issueBody: undefined },
+    });
+
+    expect(body).toContain("## Problem");
+    expect(body).toContain("## Suggested fix");
+    expect(body).toContain("Inspect `src/routes/users.ts:42`");
+  });
+
   test("planReviewIssues filters by severity threshold and produces deterministic issue plans", () => {
     const planned = planReviewIssues({
       repo: "org/web-app",

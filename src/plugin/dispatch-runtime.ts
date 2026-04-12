@@ -7,7 +7,12 @@ import {
   parseMaatVerdict,
   truncateForPrompt,
 } from "./qa";
-import { buildDiscordAcpPromptContext, buildExistingThreadDispatchMessage } from "./thread-messages";
+import { parseReviewSummary } from "./review";
+import {
+  buildDiscordAcpPromptContext,
+  buildDiscordAgentTarget,
+  buildExistingThreadDispatchMessage,
+} from "./thread-messages";
 import type { PluginApi, PluginConfig, Task } from "./types";
 import type { DatabaseLike } from "./runtime-types";
 
@@ -15,7 +20,6 @@ function getErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-const ACP_STARTUP_COOLDOWN_MS = 60_000;
 let acpStartupGateResolved = false;
 let acpStartupGatePromise: Promise<void> | null = null;
 
@@ -25,17 +29,18 @@ function sleep(ms: number): Promise<void> {
   });
 }
 
-function waitForAcpStartupGate(): Promise<void> {
+function waitForAcpStartupGate(cooldownMs: number): Promise<void> {
+  if (cooldownMs <= 0) return Promise.resolve();
   if (acpStartupGateResolved) return Promise.resolve();
   if (!acpStartupGatePromise) {
-    acpStartupGatePromise = sleep(ACP_STARTUP_COOLDOWN_MS).then(() => {
+    acpStartupGatePromise = sleep(cooldownMs).then(() => {
       acpStartupGateResolved = true;
     });
   }
   return acpStartupGatePromise;
 }
 
-function sanitizeAcpThreadOutput(text: string): string {
+export function sanitizeAcpThreadOutput(text: string): string {
   return text
     .split(/\r?\n/)
     .map((line) => line.trimEnd())
@@ -51,12 +56,14 @@ function sanitizeAcpThreadOutput(text: string): string {
     .trim();
 }
 
-function selectAcpOutputFromThreadMessages(messages: string[]): string {
-  for (const message of messages) {
-    const cleaned = sanitizeAcpThreadOutput(message);
-    if (cleaned) return cleaned;
-  }
-  return "";
+export function buildAcpOutputFromThreadMessages(messages: string[]): string {
+  return messages
+    .slice()
+    .reverse()
+    .map((message) => sanitizeAcpThreadOutput(message))
+    .filter((message) => message.length > 0)
+    .join("\n\n")
+    .trim();
 }
 
 async function resolveBoundThreadIdForSession(sessionKey: string): Promise<string | null> {
@@ -99,12 +106,17 @@ async function waitForAcpThreadOutput(params: {
   threadId: string;
   accountId: string;
   timeoutMs: number;
+  requireJsonSummary?: boolean;
 }): Promise<string> {
   const deadline = Date.now() + params.timeoutMs;
   while (Date.now() <= deadline) {
-    const messages = await params.readThreadMessages(params.threadId, params.accountId, 10);
-    const text = selectAcpOutputFromThreadMessages(messages);
-    if (text) return text;
+    const messages = await params.readThreadMessages(params.threadId, params.accountId, 20);
+    const text = buildAcpOutputFromThreadMessages(messages);
+    if (text) {
+      if (!params.requireJsonSummary || parseReviewSummary(text)) {
+        return text;
+      }
+    }
     if (Date.now() >= deadline) break;
     await sleep(250);
   }
@@ -116,6 +128,7 @@ type DispatchRuntimeDeps = {
   config: PluginConfig;
   db: DatabaseLike;
   defaultCwd: string;
+  acpStartupCooldownMs: number;
   defaultReviewTimeoutMs: number;
   maxConcurrentSessions: number;
   maxReviewCycles: number;
@@ -356,17 +369,36 @@ export function createDispatchRuntime(deps: DispatchRuntimeDeps) {
       return;
     }
 
-    const runtimeType = deps.resolveRuntime(task);
-    const harness = deps.resolveHarness(task);
-    const acpBackend = runtimeType === "acp" ? harness : task.agent;
-    const sessionKey = `agent:${acpBackend}:${runtimeType}:${crypto.randomUUID()}`;
-    const cwd = deps.resolveCwd(task);
-    deps.stderr.write(`[DISPATCH] ${runtimeType} spawn for ${task.id}\n`);
+    try {
+      const runtimeType = deps.resolveRuntime(task);
+      const harness = deps.resolveHarness(task);
+      const acpBackend = runtimeType === "acp" ? harness : task.agent;
+      const sessionKey = `agent:${acpBackend}:${runtimeType}:${crypto.randomUUID()}`;
+      const cwd = deps.resolveCwd(task);
+      deps.stderr.write(`[DISPATCH] ${runtimeType} spawn for ${task.id}\n`);
 
-    if (runtimeType === "acp") {
-      await dispatchAcp(task, sessionKey, cwd);
-    } else {
-      await dispatchSubagent(task, sessionKey);
+      if (runtimeType === "acp") {
+        await dispatchAcp(task, sessionKey, cwd);
+      } else {
+        await dispatchSubagent(task, sessionKey);
+      }
+    } catch (error) {
+      const message = getErrorMessage(error);
+      const currentTask = deps.getTask(task.id) || task;
+      if (!["done", "cancelled", "error"].includes(currentTask.status)) {
+        deps.db
+          .prepare(
+            "UPDATE tasks SET status = 'error', error = @error, retries = retries + 1, updated_at = @updated_at WHERE id = @id",
+          )
+          .run({
+            id: task.id,
+            error: message,
+            updated_at: Date.now(),
+          });
+      }
+      deps.recordTaskEvent(task.id, "dispatch.failed", { error: message });
+      deps.onTaskChanged(task.id);
+      await deps.notifyMainSession({ ...currentTask, error: message }, "error");
     }
   }
 
@@ -379,11 +411,12 @@ export function createDispatchRuntime(deps: DispatchRuntimeDeps) {
     const spawnAcp = acp.spawn;
     const resumeSessionId = task.sessionKey;
 
-    await waitForAcpStartupGate();
+    await waitForAcpStartupGate(deps.acpStartupCooldownMs);
 
     const resolvedCwd = task.cwd || deps.resolveCwd(task);
     if (!resolvedCwd) throw new Error("Task has no cwd");
     const accountId = deps.resolveAccountId(task.agent);
+    const channelId = deps.resolveChannel(task);
 
     deps.db
       .prepare(
@@ -420,7 +453,7 @@ export function createDispatchRuntime(deps: DispatchRuntimeDeps) {
       {
         agentChannel: "discord",
         agentAccountId: accountId,
-        agentTo: resumeThreadId ? `channel:${resumeThreadId}` : undefined,
+        agentTo: buildDiscordAgentTarget(resumeThreadId, channelId),
         agentThreadId: resumeThreadId,
       },
     );
@@ -548,7 +581,7 @@ export function createDispatchRuntime(deps: DispatchRuntimeDeps) {
     // After a gateway restart, Discord's full child-thread binding adapter can
     // take a while to register. A single startup cooldown is less noisy than
     // speculative retries that create stray ACP sessions.
-    await waitForAcpStartupGate();
+    await waitForAcpStartupGate(deps.acpStartupCooldownMs);
 
     const resolvedCwd = cwd || deps.defaultCwd;
     const prompt = formatTaskPrompt(task);
@@ -601,6 +634,17 @@ export function createDispatchRuntime(deps: DispatchRuntimeDeps) {
     childRunId = typeof result?.runId === "string" ? result.runId.trim() : "";
     if (!childRunId) throw new Error("acp spawn did not return runId");
 
+    deps.db
+      .prepare(
+        "UPDATE tasks SET session_key = @sessionKey, run_id = @runId, updated_at = @updated_at WHERE id = @id",
+      )
+      .run({
+        id: task.id,
+        sessionKey: childSessionKey,
+        runId: childRunId,
+        updated_at: Date.now(),
+      });
+
     // Resolve the thread ID: for existing threads we already know it; for new
     // spawns ACP created the thread via "child" placement — read it from the
     // thread-bindings.json file using the child session key.
@@ -608,7 +652,9 @@ export function createDispatchRuntime(deps: DispatchRuntimeDeps) {
     if (!dispatchThreadId) {
       dispatchThreadId = await waitForBoundThreadIdForSession(childSessionKey, 4000);
       if (!dispatchThreadId) {
-        throw new Error("acp spawn accepted but no Discord child thread binding was created");
+        throw new Error(
+          "acp spawn accepted but no Discord child thread binding was created within 4s",
+        );
       }
     }
 
@@ -677,39 +723,31 @@ export function createDispatchRuntime(deps: DispatchRuntimeDeps) {
     // First resolve the created/bound thread id from the binding store if ACP
     // created one for us.
     if (!task.threadId) {
-      try {
-        const { readFileSync } = require("node:fs") as typeof import("node:fs");
-        const bindingsPath = `${process.env.HOME}/.openclaw/discord/thread-bindings.json`;
-        const bindingsData = JSON.parse(readFileSync(bindingsPath, "utf8")) as {
-          bindings?: Record<string, { targetSessionKey?: string; threadId?: string }>;
-        };
-        for (const binding of Object.values(bindingsData.bindings || {})) {
-          if (binding.targetSessionKey === childSessionKey && binding.threadId) {
-            task.threadId = binding.threadId;
-            deps.db
-              .prepare(
-                "UPDATE tasks SET thread_id = @threadId, updated_at = @updated_at WHERE id = @id",
-              )
-              .run({ id: task.id, threadId: task.threadId, updated_at: Date.now() });
-            break;
-          }
-        }
-      } catch {
-        // best effort — if no binding file yet, output capture may still fail
+      task.threadId = await resolveBoundThreadIdForSession(childSessionKey);
+      if (task.threadId) {
+        deps.db
+          .prepare(
+            "UPDATE tasks SET thread_id = @threadId, updated_at = @updated_at WHERE id = @id",
+          )
+          .run({ id: task.id, threadId: task.threadId, updated_at: Date.now() });
       }
     }
 
-    if (!text && task.threadId) {
+    if (task.threadId) {
       const accountId = deps.resolveAccountId(task.agent);
-      text = await waitForAcpThreadOutput({
+      const threadText = await waitForAcpThreadOutput({
         readThreadMessages: deps.readThreadMessages,
         threadId: task.threadId,
         accountId,
-        timeoutMs: 5000,
+        timeoutMs: 8000,
       });
-      if (text) {
+      if (threadText) {
+        text =
+          !text || threadText.includes("```json") || threadText.length > text.length
+            ? threadText
+            : [text, threadText].filter(Boolean).join("\n\n");
         deps.stderr.write(
-          `[DISPATCH.ACP] Recovered ${text.length} chars from Discord thread for ${task.id}\n`,
+          `[DISPATCH.ACP] Recovered ${threadText.length} chars from Discord thread for ${task.id}\n`,
         );
       }
     }
@@ -722,7 +760,7 @@ export function createDispatchRuntime(deps: DispatchRuntimeDeps) {
       .run({ id: task.id, output: text.slice(0, 10000), updated_at: Date.now() });
     deps.onTaskChanged(task.id);
     const freshTask = deps.getTask(task.id);
-    if (deps.resolveQaRequired(task)) {
+    if (deps.resolveQaRequired(freshTask || task)) {
       try {
         await runMaatReviewLoop(task.id);
       } catch (error) {

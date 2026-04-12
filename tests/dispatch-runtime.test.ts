@@ -1,5 +1,10 @@
 import { describe, expect, test } from "bun:test";
-import { createDispatchRuntime } from "../src/plugin/dispatch-runtime";
+import {
+  buildAcpOutputFromThreadMessages,
+  createDispatchRuntime,
+  sanitizeAcpThreadOutput,
+} from "../src/plugin/dispatch-runtime";
+import { parseReviewSummary } from "../src/plugin/review";
 import type { Task } from "../src/plugin/types";
 
 function makeTask(overrides: Partial<Task> = {}): Task {
@@ -54,6 +59,7 @@ function makeDeps(overrides: Record<string, unknown> = {}) {
         transaction: (fn: () => void) => fn,
       },
       defaultCwd: "/tmp",
+      acpStartupCooldownMs: 0,
       defaultReviewTimeoutMs: 60000,
       maxConcurrentSessions: 6,
       maxReviewCycles: 3,
@@ -66,6 +72,7 @@ function makeDeps(overrides: Record<string, unknown> = {}) {
       resolveAccountId: (agent: string) => agent,
       createDiscordThread: track("createDiscordThread") as unknown as () => Promise<string | null>,
       postToThread: track("postToThread") as unknown as () => Promise<void>,
+      readThreadMessages: track("readThreadMessages") as unknown as () => Promise<string[]>,
       formatDiscordThreadUrl: () => null,
       operatorLabel: "operator",
       getActiveSessionCount: () => 0,
@@ -83,6 +90,38 @@ function makeDeps(overrides: Record<string, unknown> = {}) {
 }
 
 describe("dispatch-runtime", () => {
+  test("sanitizeAcpThreadOutput removes ACP boilerplate lines", () => {
+    expect(
+      sanitizeAcpThreadOutput(
+        [
+          "⚙️ codex session active (idle auto-unfocus after 24h inactivity). Messages here go directly to this session.",
+          "cwd: /tmp/test",
+          "Background task done: ACP background task (run abc123).",
+          "REAL_OUTPUT",
+        ].join("\n"),
+      ),
+    ).toBe("REAL_OUTPUT");
+  });
+
+  test("buildAcpOutputFromThreadMessages rebuilds chronological multi-message output", () => {
+    const rebuilt = buildAcpOutputFromThreadMessages([
+      // newest first, matching Discord API order
+      '  ]\n}\n```',
+      '```json\n{\n  "schemaVersion": 1,\n  "reviewOutcome": "success",\n  "findingsCount": 0,\n  "findings": [',
+      "Review summary line",
+      "Background task done: ACP background task (run abc123).",
+      "⚙️ codex session active (idle auto-unfocus after 24h inactivity). Messages here go directly to this session.\ncwd: /tmp/test",
+    ]);
+
+    expect(rebuilt).toContain("Review summary line");
+    expect(parseReviewSummary(rebuilt)).toEqual({
+      schemaVersion: 1,
+      reviewOutcome: "success",
+      findingsCount: 0,
+      findings: [],
+    });
+  });
+
   test("triggerDispatch enqueues background job for ready tasks", () => {
     const { calls, deps } = makeDeps();
     const runtime = createDispatchRuntime(
@@ -120,5 +159,47 @@ describe("dispatch-runtime", () => {
     runtime.triggerDispatch("task-1");
 
     expect(calls.backgroundEnqueue).toHaveLength(0);
+  });
+
+  test("dispatchTask marks task error when ACP spawn fails", async () => {
+    const task = makeTask({ status: "ready", agent: "nemesis" });
+    const updates: Array<Record<string, unknown>> = [];
+    const { calls, deps } = makeDeps({
+      getTask: () => task,
+      resolveRuntime: () => "acp",
+      resolveHarness: () => "codex",
+      api: {
+        runtime: {
+          acp: {
+            spawn: async () => ({ status: "rejected", error: "spawn failed" }),
+          },
+          subagent: {
+            waitForRun: async () => ({ status: "ok" }),
+          },
+        },
+      },
+      db: {
+        prepare: (sql: string) => ({
+          run: (params: Record<string, unknown>) => {
+            if (sql.includes("UPDATE tasks SET status = 'error'")) {
+              updates.push(params);
+            }
+          },
+          get: () => null,
+          all: () => [],
+        }),
+        transaction: (fn: () => void) => fn,
+      },
+    });
+    const runtime = createDispatchRuntime(
+      deps as unknown as Parameters<typeof createDispatchRuntime>[0],
+    );
+
+    await runtime.dispatchTask(task);
+
+    expect(updates).toHaveLength(1);
+    expect(updates[0]?.error).toBe("spawn failed");
+    expect(calls.recordTaskEvent?.some((args) => args[1] === "dispatch.failed")).toBeTrue();
+    expect(calls.notifyMainSession).toHaveLength(1);
   });
 });

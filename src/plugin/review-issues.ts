@@ -48,6 +48,18 @@ export function buildReviewIssueBody(params: {
     typeof params.finding.line === "number"
       ? `${params.finding.file}:${params.finding.line}`
       : params.finding.file;
+  const detailedBody =
+    params.finding.issueBody?.trim() ||
+    [
+      "## Problem",
+      params.finding.summary,
+      "",
+      "## Why it matters",
+      `This ${params.finding.severity} ${params.finding.category} issue was found during post-merge review and should be investigated.`,
+      "",
+      "## Suggested fix",
+      `Inspect \`${location}\` and add the smallest targeted fix plus regression coverage where appropriate.`,
+    ].join("\n");
   return [
     "## Summary",
     params.finding.summary,
@@ -61,7 +73,7 @@ export function buildReviewIssueBody(params: {
     "## Location",
     `\`${location}\``,
     "",
-    params.finding.issueBody.trim(),
+    detailedBody,
     "",
     "---",
     `Fingerprint: \`${params.fingerprint}\``,

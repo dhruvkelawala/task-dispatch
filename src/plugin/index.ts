@@ -43,6 +43,38 @@ type TaskRow = Record<string, unknown> & {
 
 const require = createRequire(import.meta.url);
 
+function loadLocalEnvOverrides(): Record<string, string> {
+  try {
+    const { readFileSync, existsSync } = require("node:fs") as typeof import("node:fs");
+    const home = process.env.HOME || "";
+    const envPath = [`${home}/.openclaw/extensions/task-dispatch/.env`].find((candidate) =>
+      existsSync(candidate),
+    );
+    if (!envPath) return {};
+    const content = readFileSync(envPath, "utf8");
+    return Object.fromEntries(
+      content
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .filter((line) => line && !line.startsWith("#") && line.includes("="))
+        .map((line) => {
+          const idx = line.indexOf("=");
+          const key = line.slice(0, idx).trim();
+          const rawValue = line.slice(idx + 1).trim();
+          const value =
+            rawValue.startsWith('"') && rawValue.endsWith('"')
+              ? rawValue.slice(1, -1)
+              : rawValue.startsWith("'") && rawValue.endsWith("'")
+                ? rawValue.slice(1, -1)
+                : rawValue;
+          return [key, value];
+        }),
+    );
+  } catch {
+    return {};
+  }
+}
+
 function titleFromProjectId(projectId: string): string {
   return String(projectId || "project")
     .split(/[-_]/g)
@@ -117,6 +149,7 @@ const maxConcurrentSessions = DEFAULTS.maxConcurrentSessions || 6;
 const defaultCwd = DEFAULTS.defaultCwd || `${HOME}/.openclaw/workspace`;
 const defaultTaskTimeoutMs = normalizeTimeoutMs(DEFAULTS.taskTimeoutMs, 10 * 60_000);
 const defaultReviewTimeoutMs = normalizeTimeoutMs(DEFAULTS.reviewTimeoutMs, 3 * 60_000);
+const defaultAcpStartupCooldownMs = normalizeTimeoutMs(DEFAULTS.acpStartupCooldownMs, 60 * 1000);
 const maxReviewCycles = Number.isFinite(DEFAULTS.maxReviewCycles)
   ? Math.max(1, Math.floor(DEFAULTS.maxReviewCycles ?? 3))
   : 3;
@@ -312,6 +345,7 @@ export default function setup(api: PluginApi) {
     config: CONFIG,
     db,
     defaultCwd,
+    acpStartupCooldownMs: defaultAcpStartupCooldownMs,
     defaultReviewTimeoutMs,
     maxConcurrentSessions,
     maxReviewCycles,
@@ -565,9 +599,12 @@ export default function setup(api: PluginApi) {
     return created;
   }
 
-  // GitHub App config for issue writing (loaded from env or .env)
-  const githubAppId = process.env.GITHUB_APP_ID || "";
-  const githubAppPrivateKeyPath = process.env.GITHUB_APP_PRIVATE_KEY_PATH || "";
+  // GitHub App config for issue writing (loaded from process env first, then
+  // local plugin .env for dev installs)
+  const localEnv = loadLocalEnvOverrides();
+  const githubAppId = process.env.GITHUB_APP_ID || localEnv.GITHUB_APP_ID || "";
+  const githubAppPrivateKeyPath =
+    process.env.GITHUB_APP_PRIVATE_KEY_PATH || localEnv.GITHUB_APP_PRIVATE_KEY_PATH || "";
   const githubAppConfig =
     githubAppId && githubAppPrivateKeyPath
       ? { appId: githubAppId, privateKeyPath: githubAppPrivateKeyPath }
@@ -597,6 +634,8 @@ export default function setup(api: PluginApi) {
     recordTaskEvent,
     onTaskChanged,
     resolveReviewAgentId,
+    resolveAccountId,
+    postToThread,
     stderr: process.stderr,
   });
   const {
@@ -629,7 +668,7 @@ export default function setup(api: PluginApi) {
     }
 
     if (normalized && ["done", "error", "cancelled"].includes(normalized.status)) {
-      void finalizeReviewTask(normalized);
+      if (normalized.status !== "cancelled") void finalizeReviewTask(normalized);
     }
 
     // When a task becomes done, check for newly ready tasks
