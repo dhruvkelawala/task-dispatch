@@ -131,8 +131,8 @@ describe("review-runtime", () => {
     expect(cursorEvents).toHaveLength(1);
   });
 
-  test("finalizeReviewTask advances cursor with empty-output event when output has no valid JSON", async () => {
-    const task = makeTask({ output: "Some random text without JSON" });
+  test("finalizeReviewTask advances cursor with empty-output event when output is missing", async () => {
+    const task = makeTask({ output: null });
 
     const { calls, deps } = makeDeps();
     const runtime = createReviewRuntime(
@@ -145,6 +145,30 @@ describe("review-runtime", () => {
       (args) => args[1] === "review.cursor_advanced_empty_output",
     );
     expect(advancedEmptyEvents).toHaveLength(1);
+  });
+
+  test("finalizeReviewTask does not advance cursor for non-empty invalid output and schedules retry", async () => {
+    const task = makeTask({ output: "Reviewed range. Incomplete json follows\n```json\n{\n" });
+
+    const { calls, savedStates, deps } = makeDeps();
+    const runtime = createReviewRuntime(
+      deps as unknown as Parameters<typeof createReviewRuntime>[0],
+    );
+
+    await runtime.finalizeReviewTask(task);
+
+    const advancedEmptyEvents = (calls.recordTaskEvent || []).filter(
+      (args) => args[1] === "review.cursor_advanced_empty_output",
+    );
+    expect(advancedEmptyEvents).toHaveLength(0);
+
+    const notAdvancedEvents = (calls.recordTaskEvent || []).filter(
+      (args) => args[1] === "review.cursor_not_advanced",
+    );
+    expect(notAdvancedEvents).toHaveLength(1);
+    expect(savedStates.length).toBeGreaterThan(0);
+    const lastState = savedStates[savedStates.length - 1]!;
+    expect(lastState.pending_task_id).toBe("retry-task");
   });
 
   test("finalizeReviewTask does not advance cursor for error status tasks", async () => {

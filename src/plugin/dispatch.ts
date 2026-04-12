@@ -47,12 +47,11 @@ export function formatTaskPrompt(task: Partial<Task>): string {
   if (taskNeedsAthena({ title: task.title || "", description: task.description || null })) {
     prompt +=
       "\n1. First, use the task tool with subagent: athena to get a UI/UX spec for this task. Wait for the spec, then implement following it closely.";
-    prompt +=
-      "\n2. Before committing, use the task tool with subagent: maat to review your code changes. Only commit after maat approves.";
+    prompt += "\n2. Complete only the requested work.";
+    prompt += "\n3. Report the outcome concisely, including any important verification you ran.";
   } else {
-    prompt +=
-      "\n1. Before committing, use the task tool with subagent: maat to review your code changes. Only commit after maat approves.";
+    prompt += "\n1. Complete only the requested work.";
+    prompt += "\n2. Report the outcome concisely, including any important verification you ran.";
   }
-  prompt += "\n3. Report: commit hash, files changed, build pass/fail.";
   return prompt;
 }

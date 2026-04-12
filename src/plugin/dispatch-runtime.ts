@@ -7,6 +7,7 @@ import {
   parseMaatVerdict,
   truncateForPrompt,
 } from "./qa";
+import { parseReviewSummary } from "./review";
 
 import {
   buildDiscordAcpPromptContext,
@@ -112,16 +113,28 @@ async function waitForAcpThreadOutput(params: {
   threadId: string;
   accountId: string;
   timeoutMs: number;
+  limit?: number;
+  validator?: (text: string) => boolean;
 }): Promise<string> {
   const deadline = Date.now() + params.timeoutMs;
+  let lastText = "";
   while (Date.now() <= deadline) {
-    const messages = await params.readThreadMessages(params.threadId, params.accountId, 20);
+    const messages = await params.readThreadMessages(
+      params.threadId,
+      params.accountId,
+      params.limit ?? 20,
+    );
     const text = buildAcpOutputFromThreadMessages(messages);
-    if (text) return text;
+    if (text) {
+      lastText = text;
+      if (!params.validator || params.validator(text)) {
+        return text;
+      }
+    }
     if (Date.now() >= deadline) break;
     await sleep(250);
   }
-  return "";
+  return lastText;
 }
 
 async function waitForNewAcpThreadOutput(params: {
@@ -651,6 +664,7 @@ export function createDispatchRuntime(deps: DispatchRuntimeDeps) {
       );
     if (!subagent?.waitForRun) throw new Error("subagent.waitForRun not available");
     const spawnAcp = acp.spawn;
+    const isReviewTask = task.chainId?.startsWith("review:") || false;
 
     // After a gateway restart, Discord's full child-thread binding adapter can
     // take a while to register. A single startup cooldown is less noisy than
@@ -813,7 +827,9 @@ export function createDispatchRuntime(deps: DispatchRuntimeDeps) {
         readThreadMessages: deps.readThreadMessages,
         threadId: task.threadId,
         accountId,
-        timeoutMs: 8000,
+        timeoutMs: isReviewTask ? 20_000 : 8_000,
+        limit: isReviewTask ? 50 : 20,
+        validator: isReviewTask ? (candidate) => parseReviewSummary(candidate) !== null : undefined,
       });
       if (threadText) {
         text =
@@ -826,6 +842,29 @@ export function createDispatchRuntime(deps: DispatchRuntimeDeps) {
       }
     }
     text = sanitizeAcpThreadOutput(text);
+
+    if (isReviewTask && (!text || !parseReviewSummary(text))) {
+      const error = text
+        ? "Review summary missing or incomplete JSON block"
+        : "Review produced no recoverable output";
+      deps.db
+        .prepare(
+          "UPDATE tasks SET status = 'error', output = @output, error = @error, retries = retries + 1, updated_at = @updated_at WHERE id = @id",
+        )
+        .run({
+          id: task.id,
+          output: text.slice(0, 10000),
+          error,
+          updated_at: Date.now(),
+        });
+      deps.recordTaskEvent(task.id, "review.output_invalid", {
+        reason: error,
+        hasOutput: Boolean(text),
+      });
+      deps.onTaskChanged(task.id);
+      await deps.notifyMainSession({ ...task, output: text, error }, "error");
+      return;
+    }
 
     deps.db
       .prepare(

@@ -203,6 +203,57 @@ describe("dispatch-runtime", () => {
     expect(calls.notifyMainSession).toHaveLength(1);
   });
 
+  test("dispatchTask marks review task error when ACP output has incomplete JSON", async () => {
+    const task = makeTask({
+      status: "ready",
+      agent: "nemesis",
+      chainId: "review:org/web-app",
+      threadId: "thread-1",
+    });
+    const updates: Array<{ sql: string; params: Record<string, unknown> }> = [];
+    const { calls, deps } = makeDeps({
+      getTask: () => task,
+      resolveRuntime: () => "acp",
+      resolveHarness: () => "claude",
+      readThreadMessages: async () => [
+        "```json\n{\n  \"schemaVersion\": 1,\n  \"reviewOutcome\": \"success\",\n",
+        "Reviewed range. 1 finding.",
+      ],
+      api: {
+        runtime: {
+          acp: {
+            spawn: async () => ({
+              status: "accepted",
+              childSessionKey: "agent:claude:acp:test",
+              runId: "run-1",
+            }),
+          },
+          subagent: {
+            waitForRun: async () => ({ status: "ok" }),
+            getSessionMessages: async () => ({ messages: [] }),
+          },
+        },
+      },
+      db: {
+        prepare: (sql: string) => ({
+          run: (params: Record<string, unknown>) => {
+            updates.push({ sql, params });
+          },
+          get: () => null,
+          all: () => [],
+        }),
+        transaction: (fn: () => void) => fn,
+      },
+    });
+    const runtime = createDispatchRuntime(
+      deps as unknown as Parameters<typeof createDispatchRuntime>[0],
+    );
+
+    await runtime.dispatchTask(task);
+
+    expect(updates.some((entry) => entry.sql.includes("status = 'error'"))).toBeTrue();
+  });
+
   test("resumeTask accepts dispatched ACP tasks and resumes the prior session", async () => {
     const task = makeTask({
       status: "dispatched",

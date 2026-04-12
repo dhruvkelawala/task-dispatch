@@ -364,12 +364,16 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps) {
     const parsedSummary = parseReviewSummary(task.output || "");
     const now = Date.now();
 
+    const hasOutput = typeof task.output === "string" && task.output.trim().length > 0;
+
     if (task.status === "cancelled") {
       return;
     }
     if (task.status !== "done" || !parsedSummary) {
-      // Done with empty/unparseable output — advance cursor to prevent infinite retry
-      if (task.status === "done" && !parsedSummary) {
+      // Done with truly empty output — advance cursor to prevent infinite retry.
+      // Done with non-empty but invalid output should retry (up to capped retries)
+      // because we may have lost a partial JSON summary.
+      if (task.status === "done" && !parsedSummary && !hasOutput) {
         const nextCursor = reviewState.active_to_sha;
         saveReviewState({
           ...reviewState,
@@ -470,7 +474,7 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps) {
     let pendingTaskId = reviewState.pending_task_id;
 
     // Only retry if we haven't exceeded the max retry count for this range.
-    const retryCount = (task.retries || 0) + (task.reviewAttempts || 0);
+    const retryCount = (task.reviewAttempts || 0) + 1;
     if (!pendingTaskId && mergedFrom && mergedTo && retryCount < MAX_REVIEW_RETRIES) {
       const projectId = resolveProjectIdForRepo(deps.config, reviewState.repo);
       if (projectId) {
@@ -489,6 +493,11 @@ export function createReviewRuntime(deps: ReviewRuntimeDeps) {
           mergedTo,
         );
         pendingTaskId = retryTask.id;
+        deps.db
+          .prepare(
+            "UPDATE tasks SET review_attempts = @attempts, updated_at = @updated_at WHERE id = @id",
+          )
+          .run({ id: retryTask.id, attempts: retryCount, updated_at: now });
       }
     } else if (retryCount >= MAX_REVIEW_RETRIES) {
       deps.stderr.write(
