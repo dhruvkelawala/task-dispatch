@@ -7,7 +7,7 @@ import {
   parseMaatVerdict,
   truncateForPrompt,
 } from "./qa";
-import { parseReviewSummary } from "./review";
+
 import {
   buildDiscordAcpPromptContext,
   buildDiscordAgentTarget,
@@ -106,17 +106,12 @@ async function waitForAcpThreadOutput(params: {
   threadId: string;
   accountId: string;
   timeoutMs: number;
-  requireJsonSummary?: boolean;
 }): Promise<string> {
   const deadline = Date.now() + params.timeoutMs;
   while (Date.now() <= deadline) {
     const messages = await params.readThreadMessages(params.threadId, params.accountId, 20);
     const text = buildAcpOutputFromThreadMessages(messages);
-    if (text) {
-      if (!params.requireJsonSummary || parseReviewSummary(text)) {
-        return text;
-      }
-    }
+    if (text) return text;
     if (Date.now() >= deadline) break;
     await sleep(250);
   }
