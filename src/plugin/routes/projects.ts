@@ -53,6 +53,16 @@ type ProjectDetailsRow = {
   updated_at: string | number | null;
 };
 
+type ProjectSnapshotRow = {
+  id: number;
+  project_id: string;
+  summary: string | null;
+  progress_pct: number | null;
+  blockers: string | null;
+  generated_at: string;
+  model: string | null;
+};
+
 function getErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
@@ -112,6 +122,18 @@ function rowToProject(row: ProjectDetailsRow) {
       : null,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
+  };
+}
+
+function rowToProjectSnapshot(row: ProjectSnapshotRow) {
+  return {
+    id: row.id,
+    projectId: row.project_id,
+    summary: row.summary,
+    progressPct: row.progress_pct,
+    blockers: parseJsonArray(row.blockers),
+    generatedAt: row.generated_at,
+    model: row.model,
   };
 }
 
@@ -303,6 +325,67 @@ export function registerProjectRoutes(
             return true;
           }
           sendError(res, 405, `Method ${method} not allowed on /api/projects/:id`);
+          return true;
+        }
+
+        if (segments.length === 2 && segments[1] === "snapshots") {
+          const id = segments[0]!;
+          if (method === "POST") {
+            if (!ctx.requireApiKey(req, res)) return true;
+
+            const project = ctx.db
+              .prepare<{ id: string }>("SELECT id FROM projects WHERE id = ?")
+              .get(id);
+            if (!project) {
+              sendError(res, 404, "Project not found");
+              return true;
+            }
+
+            const body = await parseBody(req);
+            const summary = typeof body.summary === "string" ? body.summary.trim() : "";
+            const rawProgressPct = Number(body.progress_pct);
+            const blockers = Array.isArray(body.blockers)
+              ? body.blockers
+                  .filter((item: unknown) => typeof item === "string")
+                  .map((item: string) => item.trim())
+                  .filter(Boolean)
+              : null;
+            const model = typeof body.model === "string" ? body.model.trim() : "";
+
+            if (!summary || !Number.isFinite(rawProgressPct) || blockers === null || !model) {
+              sendError(
+                res,
+                400,
+                "summary, progress_pct, blockers, and model are required",
+              );
+              return true;
+            }
+
+            const insertResult = ctx.db
+              .prepare(
+                `INSERT INTO project_snapshots (project_id, summary, progress_pct, blockers, model)
+                 VALUES (?, ?, ?, ?, ?)`,
+              )
+              .run(
+                id,
+                summary,
+                Math.max(0, Math.min(100, Math.round(rawProgressPct))),
+                JSON.stringify(blockers),
+                model,
+              ) as { lastInsertRowid: number | bigint };
+
+            const snapshotRow = ctx.db
+              .prepare<ProjectSnapshotRow>(
+                `SELECT id, project_id, summary, progress_pct, blockers, generated_at, model
+                 FROM project_snapshots
+                 WHERE id = ?`,
+              )
+              .get(insertResult.lastInsertRowid);
+
+            sendJson(res, rowToProjectSnapshot(snapshotRow), 201);
+            return true;
+          }
+          sendError(res, 405, `Method ${method} not allowed on /api/projects/:id/snapshots`);
           return true;
         }
 
