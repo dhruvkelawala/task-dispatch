@@ -71,8 +71,14 @@ function makeDeps(overrides: Record<string, unknown> = {}) {
       resolveQaRequired: () => false,
       resolveAccountId: (agent: string) => agent,
       createDiscordThread: track("createDiscordThread") as unknown as () => Promise<string | null>,
-      postToThread: track("postToThread") as unknown as () => Promise<void>,
-      readThreadMessages: track("readThreadMessages") as unknown as () => Promise<string[]>,
+      postToThread: ((...args: unknown[]) => {
+        (calls.postToThread ??= []).push(args);
+        return Promise.resolve();
+      }) as unknown as () => Promise<void>,
+      readThreadMessages: ((...args: unknown[]) => {
+        (calls.readThreadMessages ??= []).push(args);
+        return Promise.resolve([]);
+      }) as unknown as () => Promise<string[]>,
       formatDiscordThreadUrl: () => null,
       operatorLabel: "operator",
       getActiveSessionCount: () => 0,
@@ -219,6 +225,7 @@ describe("dispatch-runtime", () => {
         "```json\n{\n  \"schemaVersion\": 1,\n  \"reviewOutcome\": \"success\",\n",
         "Reviewed range. 1 finding.",
       ],
+      resolveTaskTimeoutMs: () => 500,
       api: {
         runtime: {
           acp: {
@@ -227,10 +234,6 @@ describe("dispatch-runtime", () => {
               childSessionKey: "agent:claude:acp:test",
               runId: "run-1",
             }),
-          },
-          subagent: {
-            waitForRun: async () => ({ status: "ok" }),
-            getSessionMessages: async () => ({ messages: [] }),
           },
         },
       },
@@ -259,12 +262,14 @@ describe("dispatch-runtime", () => {
       status: "dispatched",
       agent: "zeus",
       sessionKey: "session-1",
-      threadId: null,
+      threadId: "thread-resume-1",
     });
     const updates: string[] = [];
     let promptPayload: { sessionKey?: string; text?: string } | null = null;
     const { calls, deps } = makeDeps({
       getTask: () => task,
+      readThreadMessages: async () => ["RESUMED_OK"],
+      resolveTaskTimeoutMs: () => 500,
       api: {
         runtime: {
           acp: {
@@ -274,12 +279,6 @@ describe("dispatch-runtime", () => {
                 runId: "run-2",
               };
             },
-          },
-          subagent: {
-            waitForRun: async () => ({ status: "ok" }),
-            getSessionMessages: async () => ({
-              messages: [{ role: "assistant", content: "RESUMED_OK" }],
-            }),
           },
         },
       },
@@ -315,21 +314,17 @@ describe("dispatch-runtime", () => {
       status: "in_progress",
       agent: "zeus",
       sessionKey: "session-1",
-      threadId: null,
+      threadId: "thread-resume-2",
     });
     const updates: string[] = [];
     const { calls, deps } = makeDeps({
       getTask: () => task,
+      readThreadMessages: async () => ["IN_PROGRESS_RESUMED_OK"],
+      resolveTaskTimeoutMs: () => 500,
       api: {
         runtime: {
           acp: {
             prompt: async () => ({ runId: "run-3" }),
-          },
-          subagent: {
-            waitForRun: async () => ({ status: "ok" }),
-            getSessionMessages: async () => ({
-              messages: [{ role: "assistant", content: "IN_PROGRESS_RESUMED_OK" }],
-            }),
           },
         },
       },

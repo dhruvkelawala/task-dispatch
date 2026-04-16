@@ -115,24 +115,30 @@ async function waitForAcpThreadOutput(params: {
   timeoutMs: number;
   limit?: number;
   validator?: (text: string) => boolean;
+  pollIntervalMs?: number;
 }): Promise<string> {
   const deadline = Date.now() + params.timeoutMs;
+  const interval = params.pollIntervalMs ?? 250;
   let lastText = "";
   while (Date.now() <= deadline) {
-    const messages = await params.readThreadMessages(
-      params.threadId,
-      params.accountId,
-      params.limit ?? 20,
-    );
-    const text = buildAcpOutputFromThreadMessages(messages);
-    if (text) {
-      lastText = text;
-      if (!params.validator || params.validator(text)) {
-        return text;
+    try {
+      const messages = await params.readThreadMessages(
+        params.threadId,
+        params.accountId,
+        params.limit ?? 20,
+      );
+      const text = buildAcpOutputFromThreadMessages(messages);
+      if (text) {
+        lastText = text;
+        if (!params.validator || params.validator(text)) {
+          return text;
+        }
       }
+    } catch {
+      // Discord API may transiently fail; keep polling
     }
     if (Date.now() >= deadline) break;
-    await sleep(250);
+    await sleep(interval);
   }
   return lastText;
 }
@@ -466,9 +472,6 @@ export function createDispatchRuntime(deps: DispatchRuntimeDeps) {
     const priorStatus = task.status;
 
     try {
-      const subagent = deps.api.runtime?.subagent;
-      if (!subagent?.waitForRun) throw new Error("resume runtime not available");
-
       await waitForAcpStartupGate(deps.acpStartupCooldownMs);
       const accountId = deps.resolveAccountId(task.agent);
       const baselineThreadMessages =
@@ -512,40 +515,33 @@ export function createDispatchRuntime(deps: DispatchRuntimeDeps) {
           updated_at: Date.now(),
         });
 
-      const wait = await subagent.waitForRun({
-        runId: childRunId,
-        timeoutMs: deps.resolveTaskTimeoutMs(task),
-      });
-      const waitStatus = wait?.status || "timeout";
-      if (waitStatus !== "ok") {
-        const waitError = wait?.error ? `: ${wait.error}` : "";
-        throw new Error(`resumed run failed (${waitStatus})${waitError}`);
-      }
-
+      // Poll Discord thread for output instead of using subagent.waitForRun()
+      // which requires gateway request context.
       let text = "";
-      if (subagent.getSessionMessages) {
-        const msgs = await subagent.getSessionMessages({ sessionKey: task.sessionKey, limit: 200 });
-        text = extractOutputFromMessages(msgs?.messages || []);
-      }
-      text = sanitizeAcpThreadOutput(text);
-
       if (task.threadId) {
-        const threadText = await waitForNewAcpThreadOutput({
+        const resumeTimeoutMs = deps.resolveTaskTimeoutMs(task);
+        const threadText = await waitForAcpThreadOutput({
           readThreadMessages: deps.readThreadMessages,
           threadId: task.threadId,
           accountId,
-          timeoutMs: 8000,
-          baselineMessages: baselineThreadMessages,
+          timeoutMs: resumeTimeoutMs,
+          limit: 20,
+          validator: (candidate) => {
+            const cleaned = sanitizeAcpThreadOutput(candidate);
+            return cleaned.length > 0 && cleaned !== sanitizeAcpThreadOutput(
+              baselineThreadMessages.join("\n"),
+            );
+          },
+          pollIntervalMs: Math.min(5_000, Math.floor(resumeTimeoutMs / 4)),
         });
         if (threadText) {
-          text =
-            !text || threadText.includes("```json") || threadText.length > text.length
-              ? threadText
-              : [text, threadText].filter(Boolean).join("\n\n");
+          text = threadText;
           deps.stderr.write(
             `[DISPATCH.RESUME] Recovered ${threadText.length} chars from Discord thread for ${task.id}\n`,
           );
         }
+      } else {
+        await sleep(deps.resolveTaskTimeoutMs(task));
       }
       text = sanitizeAcpThreadOutput(text);
 
@@ -659,12 +655,10 @@ export function createDispatchRuntime(deps: DispatchRuntimeDeps) {
 
   async function dispatchAcp(task: Task, sessionKey: string, cwd: string | null): Promise<void> {
     const acp = deps.api.runtime?.acp;
-    const subagent = deps.api.runtime?.subagent;
     if (!acp?.spawn)
       throw new Error(
         "api.runtime.acp.spawn not available — OpenClaw build with ACP plugin runtime required",
       );
-    if (!subagent?.waitForRun) throw new Error("subagent.waitForRun not available");
     const spawnAcp = acp.spawn;
     const isReviewTask = task.chainId?.startsWith("review:") || false;
 
@@ -777,41 +771,10 @@ export function createDispatchRuntime(deps: DispatchRuntimeDeps) {
       });
     }
 
-    const wait = await subagent.waitForRun({
-      runId: childRunId,
-      timeoutMs: deps.resolveTaskTimeoutMs(task),
-    });
-    const waitStatus = wait?.status || "timeout";
-    const waitError = wait?.error || "";
-    if (waitStatus !== "ok") {
-      const error =
-        waitStatus === "timeout"
-          ? "ACP run timed out while waiting for completion"
-          : `ACP run failed${waitError ? `: ${waitError}` : ""}`;
-      deps.db
-        .prepare(
-          "UPDATE tasks SET status = 'error', error = @error, retries = retries + 1, updated_at = @updated_at WHERE id = @id",
-        )
-        .run({ id: task.id, error, updated_at: Date.now() });
-      deps.onTaskChanged(task.id);
-      await deps.notifyMainSession({ ...task, error }, "error");
-      return;
-    }
-
-    let text = "";
-    if (subagent.getSessionMessages) {
-      const sessionMessages = await subagent.getSessionMessages({
-        sessionKey: childSessionKey,
-        limit: 200,
-      });
-      text = extractOutputFromMessages(sessionMessages?.messages || []);
-      text = sanitizeAcpThreadOutput(text);
-    }
-
-    // ACP sessions don't store messages in the subagent message store.
-    // Fall back to reading the Discord thread for the agent's output.
-    // First resolve the created/bound thread id from the binding store if ACP
-    // created one for us.
+    // ACP sessions don't use subagent message store and subagent.waitForRun()
+    // requires gateway request context (unavailable in background jobs like
+    // webhook-triggered reviews). Instead, poll the Discord thread for output.
+    // Resolve the thread id from the binding store if ACP created one for us.
     if (!task.threadId) {
       task.threadId = await resolveBoundThreadIdForSession(childSessionKey);
       if (task.threadId) {
@@ -823,25 +786,32 @@ export function createDispatchRuntime(deps: DispatchRuntimeDeps) {
       }
     }
 
+    let text = "";
     if (task.threadId) {
-      const accountId = deps.resolveAccountId(task.agent);
-      const threadText = await waitForAcpThreadOutput({
+      const pollAccountId = deps.resolveAccountId(task.agent);
+      const pollTimeoutMs = deps.resolveTaskTimeoutMs(task);
+      const pollLimit = isReviewTask ? deps.reviewThreadPollLimit : 20;
+      const validator = isReviewTask
+        ? (candidate: string) => parseReviewSummary(candidate) !== null
+        : (candidate: string) => candidate.length > 0;
+
+      text = await waitForAcpThreadOutput({
         readThreadMessages: deps.readThreadMessages,
         threadId: task.threadId,
-        accountId,
-        timeoutMs: isReviewTask ? deps.reviewThreadPollTimeoutMs : 8_000,
-        limit: isReviewTask ? deps.reviewThreadPollLimit : 20,
-        validator: isReviewTask ? (candidate) => parseReviewSummary(candidate) !== null : undefined,
+        accountId: pollAccountId,
+        timeoutMs: pollTimeoutMs,
+        limit: pollLimit,
+        validator,
+        pollIntervalMs: Math.min(5_000, Math.floor(pollTimeoutMs / 4)),
       });
-      if (threadText) {
-        text =
-          !text || threadText.includes("```json") || threadText.length > text.length
-            ? threadText
-            : [text, threadText].filter(Boolean).join("\n\n");
+      if (text) {
         deps.stderr.write(
-          `[DISPATCH.ACP] Recovered ${threadText.length} chars from Discord thread for ${task.id}\n`,
+          `[DISPATCH.ACP] Recovered ${text.length} chars from Discord thread for ${task.id}\n`,
         );
       }
+    } else {
+      // No thread — wait the full timeout then check once
+      await sleep(deps.resolveTaskTimeoutMs(task));
     }
     text = sanitizeAcpThreadOutput(text);
 
