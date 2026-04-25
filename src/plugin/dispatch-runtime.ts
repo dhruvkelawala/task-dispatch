@@ -1,4 +1,7 @@
 import crypto from "node:crypto";
+import { getAcpSessionManager } from "openclaw/plugin-sdk/acp-runtime";
+import { getSessionBindingService } from "openclaw/plugin-sdk/conversation-binding-runtime";
+import type { OpenClawConfig } from "openclaw/plugin-sdk/config-runtime";
 import { formatTaskPrompt } from "./dispatch";
 import {
   buildQAReviewPrompt,
@@ -9,10 +12,7 @@ import {
 } from "./qa";
 import { parseReviewSummary } from "./review";
 
-import {
-  buildDiscordAcpPromptContext,
-  buildExistingThreadDispatchMessage,
-} from "./thread-messages";
+import { buildExistingThreadDispatchMessage } from "./thread-messages";
 import type { PluginApi, PluginConfig, Task } from "./types";
 import type { DatabaseLike } from "./runtime-types";
 
@@ -207,10 +207,115 @@ type DispatchRuntimeDeps = {
   triggerDependents: (taskId: string) => void;
   notifyMainSession: (task: Task, status: string) => Promise<void>;
   backgroundEnqueue: (taskId: string) => void;
+  getAcpSessionManager?: () => {
+    initializeSession: (input: {
+      cfg: OpenClawConfig;
+      sessionKey: string;
+      agent: string;
+      mode: "persistent" | "oneshot";
+      resumeSessionId?: string;
+      cwd?: string;
+      backendId?: string;
+    }) => Promise<unknown>;
+    runTurn: (input: {
+      cfg: OpenClawConfig;
+      sessionKey: string;
+      text: string;
+      mode: "prompt" | "steer";
+      requestId: string;
+    }) => Promise<void>;
+  };
+  getSessionBindingService?: () => {
+    bind: (input: {
+      targetSessionKey: string;
+      targetKind: "session";
+      conversation: {
+        channel: string;
+        accountId: string;
+        conversationId: string;
+        parentConversationId?: string;
+      };
+      placement?: "current" | "child";
+      metadata?: Record<string, unknown>;
+    }) => Promise<{
+      conversation: {
+        conversationId: string;
+      };
+    }>;
+  };
   stderr: Pick<typeof process.stderr, "write">;
 };
 
 export function createDispatchRuntime(deps: DispatchRuntimeDeps) {
+  function requireOpenClawConfig(): OpenClawConfig {
+    const cfg = deps.api.config as OpenClawConfig | undefined;
+    if (!cfg) {
+      throw new Error("OpenClaw runtime config not available");
+    }
+    return cfg;
+  }
+
+  function acpManager() {
+    return deps.getAcpSessionManager?.() ?? getAcpSessionManager();
+  }
+
+  function bindingService() {
+    return deps.getSessionBindingService?.() ?? getSessionBindingService();
+  }
+
+  async function startAcpPromptTurn(params: {
+    sessionKey: string;
+    text: string;
+  }): Promise<{ runId: string; completion: Promise<void> }> {
+    const runId = crypto.randomUUID();
+    const completion = acpManager().runTurn({
+      cfg: requireOpenClawConfig(),
+      sessionKey: params.sessionKey,
+      text: params.text,
+      mode: "prompt",
+      requestId: runId,
+    });
+    return { runId, completion };
+  }
+
+  async function runAcpTurnWithThreadOutput(params: {
+    sessionKey: string;
+    text: string;
+    threadId: string | null;
+    accountId: string;
+    timeoutMs: number;
+    limit?: number;
+    validator?: (text: string) => boolean;
+    pollIntervalMs?: number;
+    baselineMessages?: string[];
+  }): Promise<{ runId: string; text: string }> {
+    const { runId, completion } = await startAcpPromptTurn({
+      sessionKey: params.sessionKey,
+      text: params.text,
+    });
+    const textPromise = params.threadId
+      ? params.baselineMessages
+        ? waitForNewAcpThreadOutput({
+            readThreadMessages: deps.readThreadMessages,
+            threadId: params.threadId,
+            accountId: params.accountId,
+            timeoutMs: params.timeoutMs,
+            baselineMessages: params.baselineMessages,
+          })
+        : waitForAcpThreadOutput({
+            readThreadMessages: deps.readThreadMessages,
+            threadId: params.threadId,
+            accountId: params.accountId,
+            timeoutMs: params.timeoutMs,
+            limit: params.limit,
+            validator: params.validator,
+            pollIntervalMs: params.pollIntervalMs,
+          })
+      : Promise.resolve("");
+    const [text] = await Promise.all([textPromise, completion]);
+    return { runId, text: sanitizeAcpThreadOutput(text) };
+  }
+
   async function runMaatOneShotReview(task: Task) {
     const subagent = deps.api.runtime?.subagent;
     if (!subagent?.run || !subagent.waitForRun || !subagent.getSessionMessages) {
@@ -268,11 +373,6 @@ export function createDispatchRuntime(deps: DispatchRuntimeDeps) {
   }
 
   async function requestAgentFix(task: Task, reviewText: string): Promise<string> {
-    const subagent = deps.api.runtime?.subagent;
-    if (!subagent?.waitForRun) {
-      throw new Error("agent fix runtime not available");
-    }
-
     const prompt = [
       `@${task.agent}`,
       "",
@@ -283,40 +383,39 @@ export function createDispatchRuntime(deps: DispatchRuntimeDeps) {
       reviewText,
     ].join("\n");
 
-    const { runId } = await promptTaskSession(task, prompt);
-
-    const wait = await subagent.waitForRun({ runId, timeoutMs: deps.resolveTaskTimeoutMs(task) });
-    const waitStatus = wait?.status || "timeout";
-    if (waitStatus !== "ok") {
-      const waitError = wait?.error ? `: ${wait.error}` : "";
-      throw new Error(`revision run failed (${waitStatus})${waitError}`);
-    }
-
-    if (!subagent.getSessionMessages || !task.sessionKey) return "";
-    const sessionMessages = await subagent.getSessionMessages({
-      sessionKey: task.sessionKey,
-      limit: 200,
-    });
-    return extractOutputFromMessages(sessionMessages?.messages || []);
-  }
-
-  async function promptTaskSession(task: Task, text: string): Promise<{ runId: string }> {
-    const acp = deps.api.runtime?.acp;
-    if (!acp?.prompt) {
-      throw new Error("acp.prompt runtime not available");
-    }
     if (!task.sessionKey) {
       throw new Error("Task has no session to prompt");
     }
 
     const accountId = deps.resolveAccountId(task.agent);
-    const result = await acp.prompt({
+    const baselineThreadMessages = task.threadId
+      ? await deps.readThreadMessages(task.threadId, accountId, 20).catch(() => [])
+      : [];
+    const { text } = await runAcpTurnWithThreadOutput({
+      sessionKey: task.sessionKey,
+      text: prompt,
+      threadId: task.threadId,
+      accountId,
+      timeoutMs: deps.resolveTaskTimeoutMs(task),
+      baselineMessages: baselineThreadMessages,
+    });
+    return text;
+  }
+
+  async function promptTaskSession(task: Task, text: string): Promise<{ runId: string }> {
+    if (!task.sessionKey) {
+      throw new Error("Task has no session to prompt");
+    }
+
+    const { runId, completion } = await startAcpPromptTurn({
       sessionKey: task.sessionKey,
       text,
-      ...buildDiscordAcpPromptContext(task.threadId, accountId),
     });
-    const runId = typeof result?.runId === "string" ? result.runId.trim() : "";
-    if (!runId) throw new Error("acp.prompt did not return runId");
+    void completion.catch((error) => {
+      deps.stderr.write(
+        `[ACP.PROMPT] session=${task.sessionKey} failed: ${getErrorMessage(error)}\n`,
+      );
+    });
     return { runId };
   }
 
@@ -503,7 +602,23 @@ export function createDispatchRuntime(deps: DispatchRuntimeDeps) {
 
       const resumeText =
         "Gateway restart interrupted your previous turn. Continue the same task from where you left off, keep the original instructions, avoid redoing already-completed work, and post your final response in this thread.";
-      const { runId: childRunId } = await promptTaskSession(task, resumeText);
+      const resumeTimeoutMs = deps.resolveTaskTimeoutMs(task);
+      const { runId: childRunId, text } = await runAcpTurnWithThreadOutput({
+        sessionKey: task.sessionKey,
+        text: resumeText,
+        threadId: task.threadId,
+        accountId,
+        timeoutMs: resumeTimeoutMs,
+        limit: 20,
+        validator: (candidate) => {
+          const cleaned = sanitizeAcpThreadOutput(candidate);
+          return cleaned.length > 0 && cleaned !== sanitizeAcpThreadOutput(
+            baselineThreadMessages.join("\n"),
+          );
+        },
+        pollIntervalMs: Math.min(5_000, Math.floor(resumeTimeoutMs / 4)),
+        baselineMessages: baselineThreadMessages,
+      });
 
       deps.db
         .prepare(
@@ -514,36 +629,11 @@ export function createDispatchRuntime(deps: DispatchRuntimeDeps) {
           runId: childRunId,
           updated_at: Date.now(),
         });
-
-      // Poll Discord thread for output instead of using subagent.waitForRun()
-      // which requires gateway request context.
-      let text = "";
-      if (task.threadId) {
-        const resumeTimeoutMs = deps.resolveTaskTimeoutMs(task);
-        const threadText = await waitForAcpThreadOutput({
-          readThreadMessages: deps.readThreadMessages,
-          threadId: task.threadId,
-          accountId,
-          timeoutMs: resumeTimeoutMs,
-          limit: 20,
-          validator: (candidate) => {
-            const cleaned = sanitizeAcpThreadOutput(candidate);
-            return cleaned.length > 0 && cleaned !== sanitizeAcpThreadOutput(
-              baselineThreadMessages.join("\n"),
-            );
-          },
-          pollIntervalMs: Math.min(5_000, Math.floor(resumeTimeoutMs / 4)),
-        });
-        if (threadText) {
-          text = threadText;
-          deps.stderr.write(
-            `[DISPATCH.RESUME] Recovered ${threadText.length} chars from Discord thread for ${task.id}\n`,
-          );
-        }
-      } else {
-        await sleep(deps.resolveTaskTimeoutMs(task));
+      if (text) {
+        deps.stderr.write(
+          `[DISPATCH.RESUME] Recovered ${text.length} chars from Discord thread for ${task.id}\n`,
+        );
       }
-      text = sanitizeAcpThreadOutput(text);
 
       deps.db
         .prepare(
@@ -623,11 +713,6 @@ export function createDispatchRuntime(deps: DispatchRuntimeDeps) {
   }
 
   async function notifyMainSession(task: Task, status: string): Promise<void> {
-    const prompt = deps.api.runtime?.acp?.prompt;
-    if (!prompt) {
-      deps.stderr.write(`[NOTIFY-SESSION] api.runtime.acp.prompt not available\n`);
-      return;
-    }
     const sessionKey = deps.config.notifications?.operatorSessionKey;
     if (!sessionKey) return;
     const threadLink = task.threadId ? deps.formatDiscordThreadUrl(task.threadId) || "" : "";
@@ -647,19 +732,18 @@ export function createDispatchRuntime(deps: DispatchRuntimeDeps) {
     ]
       .filter(Boolean)
       .join("\n");
-    await prompt({ sessionKey, text });
+    const { completion } = await startAcpPromptTurn({ sessionKey, text });
+    void completion.catch((error) => {
+      deps.stderr.write(
+        `[NOTIFY-SESSION] Failed prompting operator session: ${getErrorMessage(error)}\n`,
+      );
+    });
     deps.stderr.write(
       `[NOTIFY-SESSION] Prompted operator session (${status}) for task ${task.id.slice(0, 8)}\n`,
     );
   }
 
   async function dispatchAcp(task: Task, sessionKey: string, cwd: string | null): Promise<void> {
-    const acp = deps.api.runtime?.acp;
-    if (!acp?.spawn)
-      throw new Error(
-        "api.runtime.acp.spawn not available — OpenClaw build with ACP plugin runtime required",
-      );
-    const spawnAcp = acp.spawn;
     const isReviewTask = task.chainId?.startsWith("review:") || false;
 
     // After a gateway restart, Discord's full child-thread binding adapter can
@@ -682,41 +766,16 @@ export function createDispatchRuntime(deps: DispatchRuntimeDeps) {
     deps.onTaskChanged(task.id);
 
     let childSessionKey = sessionKey;
-    let childRunId = "";
     const harness = deps.resolveHarness(task);
-    // Let ACP own thread creation via "child" placement.  Pass the parent
-    // channel as agentTo so ACP creates a new thread inside it and binds the
-    // session to that thread.  If the task already has a thread (e.g. requeue),
-    // target that thread directly with agentThreadId so ACP binds to it.
-    const spawnCtx = existingThreadId
-      ? {
-          agentChannel: "discord",
-          agentAccountId: accountId,
-          agentTo: `channel:${existingThreadId}`,
-          agentThreadId: existingThreadId,
-        }
-      : {
-          agentChannel: "discord",
-          agentAccountId: accountId,
-          agentTo: channelId ? `channel:${channelId}` : undefined,
-          agentGroupId: channelId || undefined,
-        };
-    const result = await spawnAcp(
-      {
-        task: prompt,
-        agentId: harness,
-        cwd: resolvedCwd,
-        mode: "session",
-        thread: true,
-      },
-      spawnCtx,
-    );
-    if (result?.status !== "accepted") {
-      throw new Error(result?.error || `acp spawn failed with status=${result?.status || "unknown"}`);
-    }
-    childSessionKey = result?.childSessionKey || sessionKey;
-    childRunId = typeof result?.runId === "string" ? result.runId.trim() : "";
-    if (!childRunId) throw new Error("acp spawn did not return runId");
+    const cfg = requireOpenClawConfig();
+    await acpManager().initializeSession({
+      cfg,
+      sessionKey: childSessionKey,
+      agent: harness,
+      mode: "persistent",
+      cwd: resolvedCwd,
+      backendId: cfg.acp?.backend,
+    });
 
     deps.db
       .prepare(
@@ -725,21 +784,28 @@ export function createDispatchRuntime(deps: DispatchRuntimeDeps) {
       .run({
         id: task.id,
         sessionKey: childSessionKey,
-        runId: childRunId,
+        runId: null,
         updated_at: Date.now(),
       });
 
-    // Resolve the thread ID: for existing threads we already know it; for new
-    // spawns ACP created the thread via "child" placement — read it from the
-    // thread-bindings.json file using the child session key.
-    let dispatchThreadId = existingThreadId;
+    const binding = await bindingService().bind({
+      targetSessionKey: childSessionKey,
+      targetKind: "session",
+      conversation: {
+        channel: "discord",
+        accountId,
+        conversationId: existingThreadId || channelId || "",
+      },
+      placement: existingThreadId ? "current" : "child",
+      metadata: {
+        agentId: harness,
+        label: task.title,
+        boundBy: "task-dispatch",
+      },
+    });
+    const dispatchThreadId = binding.conversation.conversationId?.trim() || null;
     if (!dispatchThreadId) {
-      dispatchThreadId = await waitForBoundThreadIdForSession(childSessionKey, 4000);
-      if (!dispatchThreadId) {
-        throw new Error(
-          "acp spawn accepted but no Discord child thread binding was created within 4s",
-        );
-      }
+      throw new Error("ACP session initialized but Discord thread binding did not return a thread id");
     }
 
     deps.db
@@ -749,7 +815,7 @@ export function createDispatchRuntime(deps: DispatchRuntimeDeps) {
       .run({
         id: task.id,
         sessionKey: childSessionKey,
-        runId: childRunId,
+        runId: null,
         threadId: dispatchThreadId || null,
         updated_at: Date.now(),
       });
@@ -767,53 +833,35 @@ export function createDispatchRuntime(deps: DispatchRuntimeDeps) {
       deps.recordTaskEvent(task.id, "thread.reused.notified", {
         threadId: existingThreadId,
         sessionKey: childSessionKey,
+        runId: null,
+      });
+    }
+
+    const pollTimeoutMs = deps.resolveTaskTimeoutMs(task);
+    const pollLimit = isReviewTask ? deps.reviewThreadPollLimit : 20;
+    const validator = isReviewTask
+      ? (candidate: string) => parseReviewSummary(candidate) !== null
+      : (candidate: string) => candidate.length > 0;
+    const { runId: childRunId, text } = await runAcpTurnWithThreadOutput({
+      sessionKey: childSessionKey,
+      text: prompt,
+      threadId: task.threadId,
+      accountId,
+      timeoutMs: pollTimeoutMs,
+      limit: pollLimit,
+      validator,
+      pollIntervalMs: Math.min(5_000, Math.floor(pollTimeoutMs / 4)),
+    });
+    deps.db
+      .prepare("UPDATE tasks SET run_id = @runId, updated_at = @updated_at WHERE id = @id")
+      .run({
+        id: task.id,
         runId: childRunId,
+        updated_at: Date.now(),
       });
+    if (text) {
+      deps.stderr.write(`[DISPATCH.ACP] Recovered ${text.length} chars from Discord thread for ${task.id}\n`);
     }
-
-    // ACP sessions don't use subagent message store and subagent.waitForRun()
-    // requires gateway request context (unavailable in background jobs like
-    // webhook-triggered reviews). Instead, poll the Discord thread for output.
-    // Resolve the thread id from the binding store if ACP created one for us.
-    if (!task.threadId) {
-      task.threadId = await resolveBoundThreadIdForSession(childSessionKey);
-      if (task.threadId) {
-        deps.db
-          .prepare(
-            "UPDATE tasks SET thread_id = @threadId, updated_at = @updated_at WHERE id = @id",
-          )
-          .run({ id: task.id, threadId: task.threadId, updated_at: Date.now() });
-      }
-    }
-
-    let text = "";
-    if (task.threadId) {
-      const pollAccountId = deps.resolveAccountId(task.agent);
-      const pollTimeoutMs = deps.resolveTaskTimeoutMs(task);
-      const pollLimit = isReviewTask ? deps.reviewThreadPollLimit : 20;
-      const validator = isReviewTask
-        ? (candidate: string) => parseReviewSummary(candidate) !== null
-        : (candidate: string) => candidate.length > 0;
-
-      text = await waitForAcpThreadOutput({
-        readThreadMessages: deps.readThreadMessages,
-        threadId: task.threadId,
-        accountId: pollAccountId,
-        timeoutMs: pollTimeoutMs,
-        limit: pollLimit,
-        validator,
-        pollIntervalMs: Math.min(5_000, Math.floor(pollTimeoutMs / 4)),
-      });
-      if (text) {
-        deps.stderr.write(
-          `[DISPATCH.ACP] Recovered ${text.length} chars from Discord thread for ${task.id}\n`,
-        );
-      }
-    } else {
-      // No thread — wait the full timeout then check once
-      await sleep(deps.resolveTaskTimeoutMs(task));
-    }
-    text = sanitizeAcpThreadOutput(text);
 
     if (isReviewTask && (!text || !parseReviewSummary(text))) {
       const error = text

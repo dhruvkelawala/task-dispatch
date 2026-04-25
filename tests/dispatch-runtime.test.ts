@@ -52,7 +52,7 @@ function makeDeps(overrides: Record<string, unknown> = {}) {
   return {
     calls,
     deps: {
-      api: { runtime: {} },
+      api: { config: { acp: { backend: "acpx" } }, runtime: {} },
       config: {},
       db: {
         prepare: () => ({ run: () => {}, get: () => null, all: () => [] }),
@@ -89,6 +89,13 @@ function makeDeps(overrides: Record<string, unknown> = {}) {
       triggerDependents: track("triggerDependents") as unknown as () => void,
       notifyMainSession: track("notifyMainSession") as unknown as () => Promise<void>,
       backgroundEnqueue: track("backgroundEnqueue") as unknown as () => void,
+      getAcpSessionManager: () => ({
+        initializeSession: async () => undefined,
+        runTurn: async () => undefined,
+      }),
+      getSessionBindingService: () => ({
+        bind: async () => ({ conversation: { conversationId: "thread-created" } }),
+      }),
       stderr: { write: () => true },
       ...overrides,
     },
@@ -174,16 +181,12 @@ describe("dispatch-runtime", () => {
       getTask: () => task,
       resolveRuntime: () => "acp",
       resolveHarness: () => "codex",
-      api: {
-        runtime: {
-          acp: {
-            spawn: async () => ({ status: "rejected", error: "spawn failed" }),
-          },
-          subagent: {
-            waitForRun: async () => ({ status: "ok" }),
-          },
+      getAcpSessionManager: () => ({
+        initializeSession: async () => {
+          throw new Error("spawn failed");
         },
-      },
+        runTurn: async () => undefined,
+      }),
       db: {
         prepare: (sql: string) => ({
           run: (params: Record<string, unknown>) => {
@@ -226,17 +229,6 @@ describe("dispatch-runtime", () => {
         "Reviewed range. 1 finding.",
       ],
       resolveTaskTimeoutMs: () => 500,
-      api: {
-        runtime: {
-          acp: {
-            spawn: async () => ({
-              status: "accepted",
-              childSessionKey: "agent:claude:acp:test",
-              runId: "run-1",
-            }),
-          },
-        },
-      },
       db: {
         prepare: (sql: string) => ({
           run: (params: Record<string, unknown>) => {
@@ -270,18 +262,12 @@ describe("dispatch-runtime", () => {
       getTask: () => task,
       readThreadMessages: async () => ["RESUMED_OK"],
       resolveTaskTimeoutMs: () => 500,
-      api: {
-        runtime: {
-          acp: {
-            prompt: async (payload: { sessionKey: string; text: string }) => {
-              promptPayload = payload;
-              return {
-                runId: "run-2",
-              };
-            },
-          },
+      getAcpSessionManager: () => ({
+        initializeSession: async () => undefined,
+        runTurn: async (payload: { sessionKey: string; text: string }) => {
+          promptPayload = payload;
         },
-      },
+      }),
       db: {
         prepare: (sql: string) => ({
           run: () => {
@@ -321,13 +307,6 @@ describe("dispatch-runtime", () => {
       getTask: () => task,
       readThreadMessages: async () => ["IN_PROGRESS_RESUMED_OK"],
       resolveTaskTimeoutMs: () => 500,
-      api: {
-        runtime: {
-          acp: {
-            prompt: async () => ({ runId: "run-3" }),
-          },
-        },
-      },
       db: {
         prepare: (sql: string) => ({
           run: () => {
@@ -361,18 +340,12 @@ describe("dispatch-runtime", () => {
     const updates: string[] = [];
     const { calls, deps } = makeDeps({
       getTask: () => task,
-      api: {
-        runtime: {
-          acp: {
-            prompt: async () => {
-              throw new Error("resume failed");
-            },
-          },
-          subagent: {
-            waitForRun: async () => ({ status: "ok" }),
-          },
+      getAcpSessionManager: () => ({
+        initializeSession: async () => undefined,
+        runTurn: async () => {
+          throw new Error("resume failed");
         },
-      },
+      }),
       db: {
         prepare: (sql: string) => ({
           run: () => {

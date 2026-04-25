@@ -217,11 +217,6 @@ export function createTaskApiRuntime(deps: TaskApiRuntimeDeps) {
       sendError(res, 400, "Task has no active session");
       return;
     }
-    if (!deps.api.runtime?.acp?.prompt) {
-      sendError(res, 500, "acp.prompt not available");
-      return;
-    }
-
     const body = await parseBody(req);
     const message = typeof body.message === "string" ? body.message.trim() : "";
     if (!message) {
@@ -244,7 +239,7 @@ export function createTaskApiRuntime(deps: TaskApiRuntimeDeps) {
       timestamp: Date.now(),
       activeSessions: deps.getActiveSessionCount(),
       maxConcurrentSessions: deps.maxConcurrentSessions,
-      acpRuntimeAvailable: Boolean(deps.api.runtime?.acp),
+      acpRuntimeAvailable: Boolean(deps.api.config),
       dbPath: deps.dbPath,
     });
   }
@@ -352,10 +347,6 @@ export function createTaskApiRuntime(deps: TaskApiRuntimeDeps) {
             }
             if (!task.sessionKey) {
               sendError(res, 400, "Task has no session to resume");
-              return true;
-            }
-            if (!deps.api.runtime?.acp?.spawn) {
-              sendError(res, 500, "acp.spawn not available");
               return true;
             }
             const queued = deps.backgroundEnqueue("resume", task.id);
