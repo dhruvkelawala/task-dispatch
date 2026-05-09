@@ -4,6 +4,9 @@
   "version": "0.1.0",
   "description": "Local task store with automated ACP/subagent dispatch",
   "entryPoint": "index.mjs",
+  "activation": {
+    "onStartup": true
+  },
   "configSchema": {
     "type": "object",
     "properties": {

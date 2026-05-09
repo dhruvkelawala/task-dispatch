@@ -176,9 +176,8 @@ function resolveChannel(task: Partial<Task>): string | null {
   if (task.projectId && PROJECT_CHANNELS[task.projectId]) {
     return PROJECT_CHANNELS[task.projectId] ?? null;
   }
-  if (task.agent && AGENT_DEFAULT_CHANNELS[task.agent]) {
-    return AGENT_DEFAULT_CHANNELS[task.agent] ?? null;
-  }
+  const agentChannel = task.agent ? AGENT_DEFAULT_CHANNELS[task.agent] : undefined;
+  if (agentChannel) return agentChannel;
   return null;
 }
 
@@ -371,6 +370,16 @@ export default function setup(api: PluginApi) {
   const backgroundJobs = createBackgroundJobQueue({
     // Keep background work on a startup-owned worker so plugin-auth HTTP routes
     // do not leak their empty runtime scopes into api.runtime.subagent helpers.
+    // Jobs are intentionally non-serial: a stale ACP resume must never block fresh dispatches.
+    maxConcurrentJobs: 3,
+    timeoutMs: (job) => {
+      if (job.kind === "resume") return Math.min(defaultReviewTimeoutMs, 60_000);
+      const task = rowToTask(getTask(job.taskId) as Record<string, unknown> | null | undefined);
+      // Task timeout is the agent/thread-output timeout. The background worker
+      // also needs room for startup cooldown, ACP session initialization, and
+      // Discord thread binding before that timer begins.
+      return resolveTaskTimeoutMs(task || {}) + defaultAcpStartupCooldownMs + 60_000;
+    },
     runJob: async (job) => {
       switch (job.kind) {
         case "dispatch": {
@@ -1075,6 +1084,7 @@ export default function setup(api: PluginApi) {
         }
 
         const queued = backgroundJobs.enqueue({ kind: "dispatch", taskId });
+        backgroundJobs.drainOnce();
 
         sendJson(
           res,
@@ -1082,10 +1092,85 @@ export default function setup(api: PluginApi) {
             queued,
             id: taskId,
             status: rowToTask(getTask(taskId))?.status || "unknown",
+            queue: backgroundJobs.status(),
             ...(queued ? {} : { reason: "already_dispatching" }),
           },
           queued ? 202 : 200,
         );
+        return true;
+      } catch (e) {
+        sendError(res, 500, e instanceof Error ? e.message : String(e));
+        return true;
+      }
+    },
+  });
+
+  api.registerHttpRoute({
+    path: "/api/dispatch/queue",
+    auth: "plugin",
+    handler: async (req, res) => {
+      try {
+        if (!requireApiKey(req, res)) return true;
+        sendJson(res, backgroundJobs.status());
+        return true;
+      } catch (e) {
+        sendError(res, 500, e instanceof Error ? e.message : String(e));
+        return true;
+      }
+    },
+  });
+
+  api.registerHttpRoute({
+    path: "/api/dispatch/drain",
+    auth: "plugin",
+    handler: async (req, res) => {
+      try {
+        if (!requireApiKey(req, res)) return true;
+        const query = parseQuery(req.url || "");
+        const force = query.force === "true" || query.force === "1";
+        if (force) {
+          const result = backgroundJobs.forceDrain();
+          sendJson(res, { ok: true, force: true, ...result, queue: backgroundJobs.status() });
+        } else {
+          backgroundJobs.drainOnce();
+          sendJson(res, { ok: true, queue: backgroundJobs.status() });
+        }
+        return true;
+      } catch (e) {
+        sendError(res, 500, e instanceof Error ? e.message : String(e));
+        return true;
+      }
+    },
+  });
+
+  api.registerHttpRoute({
+    path: "/api/dispatch/cancel",
+    auth: "plugin",
+    handler: async (req, res) => {
+      try {
+        if (!requireApiKey(req, res)) return true;
+        const query = parseQuery(req.url || "");
+        const taskId = query.id;
+        if (!taskId) {
+          sendError(res, 400, "id required");
+          return true;
+        }
+        const kind = query.kind || undefined;
+        const cancelled = backgroundJobs.cancel(taskId, kind);
+        if (cancelled) {
+          // Reset the task back to ready so it can be re-dispatched
+          const row = getTask(taskId);
+          if (row && ["ready", "dispatched", "in_progress"].includes(row.status as string)) {
+            db.prepare(
+              "UPDATE tasks SET status = 'ready', error = 'Job cancelled via /api/dispatch/cancel', updated_at = @updated_at WHERE id = @id",
+            ).run({ id: taskId, updated_at: Date.now() });
+            recordTaskEvent(taskId, "dispatch.cancelled", { kind, via: "api" });
+            onTaskChanged(taskId);
+          }
+          sendJson(res, { ok: true, cancelled: true, taskId, queue: backgroundJobs.status() });
+        } else {
+          sendJson(res, { ok: true, cancelled: false, taskId, reason: "not_found_in_queue" });
+        }
         return true;
       } catch (e) {
         sendError(res, 500, e instanceof Error ? e.message : String(e));

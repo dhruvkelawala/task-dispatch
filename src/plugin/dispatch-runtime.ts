@@ -1,4 +1,5 @@
 import crypto from "node:crypto";
+import { createRequire } from "node:module";
 import { getAcpSessionManager } from "openclaw/plugin-sdk/acp-runtime";
 import { getSessionBindingService } from "openclaw/plugin-sdk/conversation-binding-runtime";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/config-runtime";
@@ -18,6 +19,36 @@ import type { DatabaseLike } from "./runtime-types";
 
 function getErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+const require = createRequire(import.meta.url);
+
+function getOpenClawSdkDiagnostics(): Record<string, unknown> {
+  try {
+    const pkgPath = require.resolve("openclaw/package.json");
+    const pkg = require(pkgPath) as { version?: string };
+    return { packagePath: pkgPath, version: pkg.version || null };
+  } catch (error) {
+    return { error: getErrorMessage(error) };
+  }
+}
+
+function summarizeUnknown(value: unknown, depth = 0): unknown {
+  if (value == null) return value;
+  if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+    return value;
+  }
+  if (Array.isArray(value)) return depth > 1 ? `[array:${value.length}]` : value.slice(0, 5).map((item) => summarizeUnknown(item, depth + 1));
+  if (typeof value === "object") {
+    if (depth > 1) return "[object]";
+    const out: Record<string, unknown> = {};
+    for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
+      if (/token|secret|key/i.test(key)) continue;
+      out[key] = summarizeUnknown(child, depth + 1);
+    }
+    return out;
+  }
+  return typeof value;
 }
 
 let acpStartupGateResolved = false;
@@ -52,6 +83,7 @@ export function sanitizeAcpThreadOutput(text: string): string {
       if (trimmed.startsWith("⚙️") && trimmed.includes("session active")) return false;
       if (trimmed.startsWith("🚀 **Task dispatched")) return false;
       if (trimmed.startsWith("✅ **Task completed**")) return false;
+      if (trimmed.startsWith("✅ **Agent turn completed**")) return false;
       if (trimmed.startsWith("🔄 **Resuming session**")) return false;
       if (trimmed.startsWith("✅ **Resume completed**")) return false;
       if (trimmed.startsWith("🔍 **QA in progress**")) return false;
@@ -73,39 +105,16 @@ export function buildAcpOutputFromThreadMessages(messages: string[]): string {
     .trim();
 }
 
-async function resolveBoundThreadIdForSession(sessionKey: string): Promise<string | null> {
-  try {
-    const fs = await import("node:fs");
-    const path = await import("node:path");
-    const home = process.env.HOME || process.env.USERPROFILE || "";
-    const bindingsPath = path.join(home, ".openclaw", "discord", "thread-bindings.json");
-    const raw = fs.readFileSync(bindingsPath, "utf-8");
-    const data = JSON.parse(raw) as {
-      bindings?: Record<string, { targetSessionKey?: string; threadId?: string }>;
-    };
-    for (const entry of Object.values(data.bindings ?? {})) {
-      if (entry.targetSessionKey === sessionKey && entry.threadId) {
-        return entry.threadId;
-      }
-    }
-  } catch {
-    // best-effort
-  }
-  return null;
-}
-
-async function waitForBoundThreadIdForSession(
-  sessionKey: string,
-  timeoutMs: number,
-): Promise<string | null> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() <= deadline) {
-    const threadId = await resolveBoundThreadIdForSession(sessionKey);
-    if (threadId) return threadId;
-    if (Date.now() >= deadline) break;
-    await sleep(250);
-  }
-  return null;
+function discordChannelTarget(channelId: string): {
+  conversationId: string;
+  parentConversationId: string;
+} {
+  const trimmed = channelId.trim();
+  const rawChannelId = trimmed.match(/^channel:(.+)$/i)?.[1]?.trim() || trimmed;
+  return {
+    conversationId: `channel:${rawChannelId}`,
+    parentConversationId: rawChannelId,
+  };
 }
 
 async function waitForAcpThreadOutput(params: {
@@ -116,11 +125,21 @@ async function waitForAcpThreadOutput(params: {
   limit?: number;
   validator?: (text: string) => boolean;
   pollIntervalMs?: number;
+  log?: (message: string) => void;
+  signal?: AbortSignal;
 }): Promise<string> {
   const deadline = Date.now() + params.timeoutMs;
   const interval = params.pollIntervalMs ?? 250;
+  const log = params.log ?? (() => {});
   let lastText = "";
+  let pollCount = 0;
+  let lastProgressLog = Date.now();
   while (Date.now() <= deadline) {
+    if (params.signal?.aborted) {
+      log(`[POLL] aborted after ${pollCount} polls, returning lastText (${lastText.length} chars)`);
+      return lastText;
+    }
+    pollCount += 1;
     try {
       const messages = await params.readThreadMessages(
         params.threadId,
@@ -131,15 +150,28 @@ async function waitForAcpThreadOutput(params: {
       if (text) {
         lastText = text;
         if (!params.validator || params.validator(text)) {
+          log(`[POLL] got valid output after ${pollCount} polls (${text.length} chars)`);
           return text;
         }
       }
-    } catch {
-      // Discord API may transiently fail; keep polling
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      log(`[POLL] readThreadMessages error on poll #${pollCount}: ${msg}`);
+    }
+    // Log progress every 30s
+    const now = Date.now();
+    if (now - lastProgressLog >= 30_000) {
+      const elapsed = Math.round((now - (deadline - params.timeoutMs)) / 1000);
+      const remaining = Math.round((deadline - now) / 1000);
+      log(
+        `[POLL] still polling after ${elapsed}s (${remaining}s remaining), ${pollCount} polls, lastText=${lastText.length} chars`,
+      );
+      lastProgressLog = now;
     }
     if (Date.now() >= deadline) break;
     await sleep(interval);
   }
+  log(`[POLL] timed out after ${pollCount} polls, returning lastText (${lastText.length} chars)`);
   return lastText;
 }
 
@@ -149,25 +181,53 @@ async function waitForNewAcpThreadOutput(params: {
   accountId: string;
   timeoutMs: number;
   baselineMessages: string[];
+  log?: (message: string) => void;
+  signal?: AbortSignal;
 }): Promise<string> {
   const baseline = new Set(
     (params.baselineMessages || [])
       .map((message) => sanitizeAcpThreadOutput(message))
       .filter((message) => message.length > 0),
   );
+  const log = params.log ?? (() => {});
   const deadline = Date.now() + params.timeoutMs;
+  let pollCount = 0;
+  let lastProgressLog = Date.now();
   while (Date.now() <= deadline) {
-    const messages = await params.readThreadMessages(params.threadId, params.accountId, 20);
-    const newMessages = (messages || []).filter((message) => {
-      const sanitized = sanitizeAcpThreadOutput(message);
-      if (!sanitized) return false;
-      return !baseline.has(sanitized);
-    });
-    const text = buildAcpOutputFromThreadMessages(newMessages);
-    if (text) return text;
+    if (params.signal?.aborted) {
+      log(`[POLL.NEW] aborted after ${pollCount} polls`);
+      return "";
+    }
+    pollCount += 1;
+    try {
+      const messages = await params.readThreadMessages(params.threadId, params.accountId, 20);
+      const newMessages = (messages || []).filter((message) => {
+        const sanitized = sanitizeAcpThreadOutput(message);
+        if (!sanitized) return false;
+        return !baseline.has(sanitized);
+      });
+      const text = buildAcpOutputFromThreadMessages(newMessages);
+      if (text) {
+        log(`[POLL.NEW] got new output after ${pollCount} polls (${text.length} chars)`);
+        return text;
+      }
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      log(`[POLL.NEW] readThreadMessages error on poll #${pollCount}: ${msg}`);
+    }
+    const now = Date.now();
+    if (now - lastProgressLog >= 30_000) {
+      const elapsed = Math.round((now - (deadline - params.timeoutMs)) / 1000);
+      const remaining = Math.round((deadline - now) / 1000);
+      log(
+        `[POLL.NEW] still polling after ${elapsed}s (${remaining}s remaining), ${pollCount} polls`,
+      );
+      lastProgressLog = now;
+    }
     if (Date.now() >= deadline) break;
     await sleep(250);
   }
+  log(`[POLL.NEW] timed out after ${pollCount} polls, no new output`);
   return "";
 }
 
@@ -225,6 +285,7 @@ type DispatchRuntimeDeps = {
       requestId: string;
     }) => Promise<void>;
   };
+  callGatewayAgent?: (params: Record<string, unknown>, timeoutMs?: number) => Promise<Record<string, unknown>>;
   getSessionBindingService?: () => {
     bind: (input: {
       targetSessionKey: string;
@@ -263,36 +324,95 @@ export function createDispatchRuntime(deps: DispatchRuntimeDeps) {
     return deps.getSessionBindingService?.() ?? getSessionBindingService();
   }
 
+  function acpPrompt() {
+    const runtime = deps.api.runtime as { acp?: { prompt: (params: {
+      sessionKey: string;
+      text: string;
+      channel?: string;
+      accountId?: string;
+      threadId?: string;
+    }) => Promise<{ runId: string }> } };
+    if (!runtime?.acp?.prompt) {
+      throw new Error("api.runtime.acp.prompt() not available — requires OpenClaw fork with ACP plugin runtime patch");
+    }
+    return runtime.acp.prompt;
+  }
+
   async function startAcpPromptTurn(params: {
     sessionKey: string;
     text: string;
+    channel?: string | null;
+    to?: string | null;
+    accountId?: string | null;
+    threadId?: string | null;
+    timeoutMs?: number;
   }): Promise<{ runId: string; completion: Promise<void> }> {
-    const runId = crypto.randomUUID();
-    const completion = acpManager().runTurn({
-      cfg: requireOpenClawConfig(),
-      sessionKey: params.sessionKey,
-      text: params.text,
-      mode: "prompt",
-      requestId: runId,
-    });
-    return { runId, completion };
+    const prompt = deps.callGatewayAgent
+      ? async () => {
+          const response = await deps.callGatewayAgent!({
+            message: params.text,
+            sessionKey: params.sessionKey,
+            idempotencyKey: crypto.randomUUID(),
+            deliver: true,
+            lane: "subagent",
+            acpTurnSource: "manual_spawn",
+            ...(params.channel ? { channel: params.channel } : {}),
+            ...(params.to ? { to: params.to } : {}),
+            ...(params.accountId ? { accountId: params.accountId } : {}),
+            ...(params.threadId ? { threadId: params.threadId } : {}),
+          }, 10_000);
+          return { runId: typeof response.runId === "string" ? response.runId : crypto.randomUUID() };
+        }
+      : async () => acpPrompt()({
+          sessionKey: params.sessionKey,
+          text: params.text,
+          ...(params.channel ? { channel: params.channel } : {}),
+          ...(params.accountId ? { accountId: params.accountId } : {}),
+          ...(params.threadId ? { threadId: params.threadId } : {}),
+        });
+    const { runId } = await prompt();
+    return { runId, completion: Promise.resolve() };
   }
+
+  const pollLog = (message: string) => deps.stderr.write(`${message}\n`);
 
   async function runAcpTurnWithThreadOutput(params: {
     sessionKey: string;
     text: string;
     threadId: string | null;
     accountId: string;
+    channel?: string | null;
+    to?: string | null;
     timeoutMs: number;
     limit?: number;
     validator?: (text: string) => boolean;
     pollIntervalMs?: number;
     baselineMessages?: string[];
+    signal?: AbortSignal;
   }): Promise<{ runId: string; text: string }> {
+    deps.stderr.write(
+      `[ACP.TURN] starting prompt session=${params.sessionKey} thread=${params.threadId} timeout=${params.timeoutMs}ms\n`,
+    );
     const { runId, completion } = await startAcpPromptTurn({
       sessionKey: params.sessionKey,
       text: params.text,
+      channel: params.channel,
+      to: params.to,
+      accountId: params.accountId,
+      threadId: params.threadId,
+      timeoutMs: params.timeoutMs,
     });
+    const trackedCompletion = completion.then(
+      () => {
+        deps.stderr.write(`[ACP.TURN] ACP completion resolved for run=${runId}\n`);
+        return { kind: "completion" as const, text: "" };
+      },
+      (error: unknown) => {
+        const msg = error instanceof Error ? error.message : String(error);
+        deps.stderr.write(`[ACP.TURN] ACP completion rejected for run=${runId}: ${msg}\n`);
+        return { kind: "completion-error" as const, error };
+      },
+    );
     const textPromise = params.threadId
       ? params.baselineMessages
         ? waitForNewAcpThreadOutput({
@@ -301,6 +421,8 @@ export function createDispatchRuntime(deps: DispatchRuntimeDeps) {
             accountId: params.accountId,
             timeoutMs: params.timeoutMs,
             baselineMessages: params.baselineMessages,
+            log: pollLog,
+            signal: params.signal,
           })
         : waitForAcpThreadOutput({
             readThreadMessages: deps.readThreadMessages,
@@ -310,10 +432,35 @@ export function createDispatchRuntime(deps: DispatchRuntimeDeps) {
             limit: params.limit,
             validator: params.validator,
             pollIntervalMs: params.pollIntervalMs,
+            log: pollLog,
+            signal: params.signal,
           })
       : Promise.resolve("");
-    const [text] = await Promise.all([textPromise, completion]);
-    return { runId, text: sanitizeAcpThreadOutput(text) };
+    const pollResult = textPromise
+      .then((text) => ({ kind: "thread" as const, text }))
+      .catch((error: unknown) => {
+        const msg = error instanceof Error ? error.message : String(error);
+        deps.stderr.write(`[ACP.TURN] Discord thread poll failed for run=${runId}: ${msg}\n`);
+        return { kind: "thread" as const, text: "" };
+      });
+    const first = await Promise.race([pollResult, trackedCompletion]);
+
+    const sanitized = first.kind === "thread" ? sanitizeAcpThreadOutput(first.text) : "";
+    if (sanitized) return { runId, text: sanitized };
+
+    if (first.kind === "completion-error") {
+      throw first.error;
+    }
+
+    if (first.kind === "completion") {
+      const finalPoll = await pollResult;
+      const finalSanitized = sanitizeAcpThreadOutput(finalPoll.text);
+      if (finalSanitized) return { runId, text: finalSanitized };
+    }
+
+    throw new Error(
+      `Discord thread produced no agent output for ACP run ${runId}; refusing to use session-file fallback`,
+    );
   }
 
   async function runMaatOneShotReview(task: Task) {
@@ -331,10 +478,10 @@ export function createDispatchRuntime(deps: DispatchRuntimeDeps) {
 
     const maatSessionKey = `agent:nemesis:subagent:review:${crypto.randomUUID()}`;
     const reviewPrompt = buildQAReviewPrompt(task, deps.resolveCwd);
-    const qaModel = deps.config.agents?.nemesis?.model || "kimi-code";
+    const qaModel = deps.config.agents?.nemesis?.model;
     deps.recordTaskEvent(task.id, "qa.started", {
       reviewer: "nemesis",
-      model: qaModel,
+      model: qaModel || "agent-default",
       threadId: task.threadId || null,
     });
 
@@ -343,7 +490,7 @@ export function createDispatchRuntime(deps: DispatchRuntimeDeps) {
       message: reviewPrompt,
       idempotencyKey: crypto.randomUUID(),
       lane: "subagent",
-      model: qaModel,
+      ...(qaModel ? { model: qaModel } : {}),
     });
     const reviewRunId = typeof run?.runId === "string" ? run.runId.trim() : "";
     if (!reviewRunId) throw new Error("QA review run did not return runId");
@@ -612,8 +759,9 @@ export function createDispatchRuntime(deps: DispatchRuntimeDeps) {
         limit: 20,
         validator: (candidate) => {
           const cleaned = sanitizeAcpThreadOutput(candidate);
-          return cleaned.length > 0 && cleaned !== sanitizeAcpThreadOutput(
-            baselineThreadMessages.join("\n"),
+          return (
+            cleaned.length > 0 &&
+            cleaned !== sanitizeAcpThreadOutput(baselineThreadMessages.join("\n"))
           );
         },
         pollIntervalMs: Math.min(5_000, Math.floor(resumeTimeoutMs / 4)),
@@ -621,9 +769,7 @@ export function createDispatchRuntime(deps: DispatchRuntimeDeps) {
       });
 
       deps.db
-        .prepare(
-          "UPDATE tasks SET run_id = @runId, updated_at = @updated_at WHERE id = @id",
-        )
+        .prepare("UPDATE tasks SET run_id = @runId, updated_at = @updated_at WHERE id = @id")
         .run({
           id: task.id,
           runId: childRunId,
@@ -641,14 +787,6 @@ export function createDispatchRuntime(deps: DispatchRuntimeDeps) {
         )
         .run({ id: task.id, output: text.slice(0, 10000), updated_at: Date.now() });
 
-      if (task.threadId) {
-        const summary = text.slice(0, 1500);
-        await deps.postToThread(
-          task.threadId,
-          `✅ **Resume completed**\n\n${summary}${text.length > 1500 ? "..." : ""}`,
-          deps.resolveAccountId(task.agent),
-        );
-      }
       deps.onTaskChanged(task.id);
       const freshTask = deps.getTask(task.id);
       if (deps.resolveQaRequired(freshTask || task)) await runMaatReviewLoop(task.id);
@@ -744,12 +882,18 @@ export function createDispatchRuntime(deps: DispatchRuntimeDeps) {
   }
 
   async function dispatchAcp(task: Task, sessionKey: string, cwd: string | null): Promise<void> {
+    const log = (msg: string) => deps.stderr.write(`[DISPATCH.ACP] ${msg}\n`);
     const isReviewTask = task.chainId?.startsWith("review:") || false;
+    const t0 = Date.now();
 
     // After a gateway restart, Discord's full child-thread binding adapter can
     // take a while to register. A single startup cooldown is less noisy than
     // speculative retries that create stray ACP sessions.
+    log(
+      `task=${task.id} agent=${task.agent} waiting for startup gate (cooldown=${deps.acpStartupCooldownMs}ms)`,
+    );
     await waitForAcpStartupGate(deps.acpStartupCooldownMs);
+    log(`task=${task.id} startup gate resolved in ${Date.now() - t0}ms`);
 
     const resolvedCwd = cwd || deps.defaultCwd;
     const prompt = formatTaskPrompt(task);
@@ -768,7 +912,12 @@ export function createDispatchRuntime(deps: DispatchRuntimeDeps) {
     let childSessionKey = sessionKey;
     const harness = deps.resolveHarness(task);
     const cfg = requireOpenClawConfig();
-    await acpManager().initializeSession({
+    log(`task=${task.id} initializing ACP session harness=${harness} cwd=${resolvedCwd}`);
+    deps.stderr.write(
+      `[TD-DIAG] sdk=${JSON.stringify(getOpenClawSdkDiagnostics())} task=${task.id}\n`,
+    );
+    const initStart = Date.now();
+    const initializedSession = await acpManager().initializeSession({
       cfg,
       sessionKey: childSessionKey,
       agent: harness,
@@ -776,6 +925,10 @@ export function createDispatchRuntime(deps: DispatchRuntimeDeps) {
       cwd: resolvedCwd,
       backendId: cfg.acp?.backend,
     });
+    deps.stderr.write(
+      `[TD-DIAG] acp.initialized task=${task.id} ${JSON.stringify(summarizeUnknown(initializedSession))}\n`,
+    );
+    log(`task=${task.id} ACP session initialized in ${Date.now() - initStart}ms`);
 
     deps.db
       .prepare(
@@ -788,24 +941,59 @@ export function createDispatchRuntime(deps: DispatchRuntimeDeps) {
         updated_at: Date.now(),
       });
 
-    const binding = await bindingService().bind({
-      targetSessionKey: childSessionKey,
-      targetKind: "session",
-      conversation: {
-        channel: "discord",
-        accountId,
-        conversationId: existingThreadId || channelId || "",
-      },
-      placement: existingThreadId ? "current" : "child",
-      metadata: {
-        agentId: harness,
-        label: task.title,
-        boundBy: "task-dispatch",
-      },
-    });
-    const dispatchThreadId = binding.conversation.conversationId?.trim() || null;
+    let bindingError: string | null = null;
+    let binding: { conversation: { conversationId: string } } | null = null;
+    const childChannelTarget = channelId ? discordChannelTarget(channelId) : null;
+    const bindingConversation = existingThreadId
+      ? {
+          channel: "discord" as const,
+          accountId,
+          conversationId: existingThreadId,
+        }
+      : {
+          channel: "discord" as const,
+          accountId,
+          conversationId: childChannelTarget?.conversationId || "",
+          ...(childChannelTarget
+            ? { parentConversationId: childChannelTarget.parentConversationId }
+            : {}),
+        };
+    try {
+      log(
+        `task=${task.id} binding Discord thread channel=${channelId} accountId=${accountId} placement=${existingThreadId ? "current" : "child"}`,
+      );
+      const bindStart = Date.now();
+      binding = await bindingService().bind({
+        targetSessionKey: childSessionKey,
+        targetKind: "session",
+        conversation: bindingConversation,
+        placement: existingThreadId ? "current" : "child",
+        metadata: {
+          agentId: harness,
+          label: task.title,
+          boundBy: "task-dispatch",
+        },
+      });
+      log(
+        `task=${task.id} Discord binding resolved in ${Date.now() - bindStart}ms, threadId=${binding?.conversation?.conversationId}`,
+      );
+      deps.stderr.write(
+        `[TD-DIAG] binding.result task=${task.id} ${JSON.stringify(summarizeUnknown(binding))}\n`,
+      );
+    } catch (bindErr) {
+      bindingError = getErrorMessage(bindErr);
+      log(`task=${task.id} Discord binding FAILED: ${bindingError}`);
+    }
+    const dispatchThreadId = binding?.conversation?.conversationId?.trim() || null;
     if (!dispatchThreadId) {
-      throw new Error("ACP session initialized but Discord thread binding did not return a thread id");
+      const reason = bindingError || "binding returned empty thread id";
+      deps.recordTaskEvent(task.id, "thread.failed", {
+        reason,
+        channelId,
+        accountId,
+        sessionKey: childSessionKey,
+      });
+      throw new Error(`Discord thread binding failed: ${reason}`);
     }
 
     deps.db
@@ -842,16 +1030,43 @@ export function createDispatchRuntime(deps: DispatchRuntimeDeps) {
     const validator = isReviewTask
       ? (candidate: string) => parseReviewSummary(candidate) !== null
       : (candidate: string) => candidate.length > 0;
+    if (task.threadId) {
+      const messagesAfterBind = await deps
+        .readThreadMessages(task.threadId, accountId, 10)
+        .catch((error) => [`<read-error: ${getErrorMessage(error)}>`]);
+      deps.stderr.write(
+        `[TD-DIAG] thread.after_bind task=${task.id} thread=${task.threadId} count=${messagesAfterBind.length} messages=${JSON.stringify(messagesAfterBind.slice(0, 3))}\n`,
+      );
+    }
+    deps.db
+      .prepare("UPDATE tasks SET status = 'in_progress', updated_at = @updated_at WHERE id = @id")
+      .run({ id: task.id, updated_at: Date.now() });
+    deps.recordTaskEvent(task.id, "task.in_progress", {
+      sessionKey: childSessionKey,
+      threadId: task.threadId || null,
+      bindingError: bindingError || null,
+    });
+    deps.onTaskChanged(task.id);
+
+    log(
+      `task=${task.id} starting ACP turn pollTimeout=${pollTimeoutMs}ms threadId=${task.threadId}`,
+    );
+    const turnStart = Date.now();
     const { runId: childRunId, text } = await runAcpTurnWithThreadOutput({
       sessionKey: childSessionKey,
       text: prompt,
       threadId: task.threadId,
       accountId,
+      channel: "discord",
+      to: channelId ? `channel:${channelId}` : null,
       timeoutMs: pollTimeoutMs,
       limit: pollLimit,
       validator,
       pollIntervalMs: Math.min(5_000, Math.floor(pollTimeoutMs / 4)),
     });
+    log(
+      `task=${task.id} ACP turn completed in ${Date.now() - turnStart}ms, runId=${childRunId}, text=${text?.length ?? 0} chars`,
+    );
     deps.db
       .prepare("UPDATE tasks SET run_id = @runId, updated_at = @updated_at WHERE id = @id")
       .run({
@@ -860,7 +1075,9 @@ export function createDispatchRuntime(deps: DispatchRuntimeDeps) {
         updated_at: Date.now(),
       });
     if (text) {
-      deps.stderr.write(`[DISPATCH.ACP] Recovered ${text.length} chars from Discord thread for ${task.id}\n`);
+      deps.stderr.write(
+        `[DISPATCH.ACP] Recovered ${text.length} chars from Discord thread for ${task.id}\n`,
+      );
     }
 
     if (isReviewTask && (!text || !parseReviewSummary(text))) {

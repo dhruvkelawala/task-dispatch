@@ -93,6 +93,20 @@ function makeDeps(overrides: Record<string, unknown> = {}) {
         initializeSession: async () => undefined,
         runTurn: async () => undefined,
       }),
+      callGatewayAgent: async (params: Record<string, unknown>) => {
+        await (
+          overrides.getAcpSessionManager as
+            | (() => { runTurn?: (input: Record<string, unknown>) => Promise<void> })
+            | undefined
+        )?.().runTurn?.({
+          cfg: { acp: { backend: "acpx" } },
+          sessionKey: params.sessionKey,
+          text: params.message,
+          mode: "prompt",
+          requestId: params.idempotencyKey,
+        });
+        return { runId: params.idempotencyKey as string };
+      },
       getSessionBindingService: () => ({
         bind: async () => ({ conversation: { conversationId: "thread-created" } }),
       }),
@@ -119,7 +133,7 @@ describe("dispatch-runtime", () => {
   test("buildAcpOutputFromThreadMessages rebuilds chronological multi-message output", () => {
     const rebuilt = buildAcpOutputFromThreadMessages([
       // newest first, matching Discord API order
-      '  ]\n}\n```',
+      "  ]\n}\n```",
       '```json\n{\n  "schemaVersion": 1,\n  "reviewOutcome": "success",\n  "findingsCount": 0,\n  "findings": [',
       "Review summary line",
       "Background task done: ACP background task (run abc123).",
@@ -174,6 +188,132 @@ describe("dispatch-runtime", () => {
     expect(calls.backgroundEnqueue).toHaveLength(0);
   });
 
+  test("dispatchTask passes parent channel when creating a Discord child thread", async () => {
+    const task = makeTask({ status: "ready", agent: "zeus", qaRequired: false });
+    const bindInputs: Array<{
+      conversation?: { conversationId?: string; parentConversationId?: string };
+      placement?: string;
+    }> = [];
+    const { deps } = makeDeps({
+      getTask: () => task,
+      resolveRuntime: () => "acp",
+      resolveHarness: () => "opencode",
+      resolveChannel: () => "123456789012345678",
+      resolveAccountId: () => "zeus",
+      readThreadMessages: async () => ["DISPATCH_OK"],
+      getAcpSessionManager: () => ({
+        initializeSession: async () => undefined,
+        runTurn: async () => {
+          await new Promise((resolve) => setTimeout(resolve, 20));
+        },
+      }),
+      getSessionBindingService: () => ({
+        bind: async (input: {
+          conversation: { conversationId?: string; parentConversationId?: string };
+          placement?: string;
+        }) => {
+          bindInputs.push(input);
+          return { conversation: { conversationId: "thread-created" } };
+        },
+      }),
+    });
+    const runtime = createDispatchRuntime(
+      deps as unknown as Parameters<typeof createDispatchRuntime>[0],
+    );
+
+    await runtime.dispatchTask(task);
+
+    expect(bindInputs[0]?.placement).toBe("child");
+    expect(bindInputs[0]?.conversation?.conversationId).toBe("channel:123456789012345678");
+    expect(bindInputs[0]?.conversation?.parentConversationId).toBe("123456789012345678");
+  });
+
+  test("dispatchTask marks task error when Discord thread binding returns empty", async () => {
+    const task = makeTask({ status: "ready", agent: "zeus", timeoutMs: 50 });
+    const updates: Array<Record<string, unknown>> = [];
+    let runTurnCalled = false;
+    const { calls, deps } = makeDeps({
+      getTask: () => task,
+      resolveRuntime: () => "acp",
+      resolveHarness: () => "opencode",
+      getAcpSessionManager: () => ({
+        initializeSession: async () => undefined,
+        runTurn: async () => {
+          runTurnCalled = true;
+        },
+      }),
+      getSessionBindingService: () => ({
+        bind: async () => ({ conversation: { conversationId: "" } }),
+      }),
+      db: {
+        prepare: (sql: string) => ({
+          run: (params: Record<string, unknown>) => {
+            if (sql.includes("UPDATE tasks SET status = 'error'")) {
+              updates.push(params);
+            }
+          },
+          get: () => null,
+          all: () => [],
+        }),
+        transaction: (fn: () => void) => fn,
+      },
+    });
+    const runtime = createDispatchRuntime(
+      deps as unknown as Parameters<typeof createDispatchRuntime>[0],
+    );
+
+    await runtime.dispatchTask(task);
+
+    expect(runTurnCalled).toBeFalse();
+    expect(updates).toHaveLength(1);
+    expect(String(updates[0]?.error || "")).toContain("Discord thread binding failed");
+    expect(calls.recordTaskEvent?.some((args) => args[1] === "dispatch.failed")).toBeTrue();
+  });
+
+
+  test("dispatchTask marks task error when ACP thread produces no Discord output", async () => {
+    const task = makeTask({ status: "ready", agent: "zeus", qaRequired: false, timeoutMs: 30 });
+    const updates: Array<Record<string, unknown>> = [];
+    const { calls, deps } = makeDeps({
+      getTask: () => task,
+      resolveRuntime: () => "acp",
+      resolveHarness: () => "opencode",
+      resolveChannel: () => "123456789012345678",
+      resolveAccountId: () => "zeus",
+      resolveTaskTimeoutMs: () => 30,
+      readThreadMessages: async () => [],
+      getAcpSessionManager: () => ({
+        initializeSession: async () => undefined,
+        runTurn: async () => undefined,
+      }),
+      getSessionBindingService: () => ({
+        bind: async () => ({ conversation: { conversationId: "thread-created" } }),
+      }),
+      db: {
+        prepare: (sql: string) => ({
+          run: (params: Record<string, unknown>) => {
+            if (sql.includes("UPDATE tasks SET status = 'error'")) {
+              updates.push(params);
+            }
+          },
+          get: () => null,
+          all: () => [],
+        }),
+        transaction: (fn: () => void) => fn,
+      },
+    });
+    const runtime = createDispatchRuntime(
+      deps as unknown as Parameters<typeof createDispatchRuntime>[0],
+    );
+
+    await runtime.dispatchTask(task);
+
+    expect(updates).toHaveLength(1);
+    expect(String(updates[0]?.error || "")).toContain("Discord thread produced no agent output");
+    expect(calls.recordTaskEvent?.some((args) => args[1] === "dispatch.failed")).toBeTrue();
+    expect(calls.postToThread ?? []).toHaveLength(0);
+  });
+
   test("dispatchTask marks task error when ACP spawn fails", async () => {
     const task = makeTask({ status: "ready", agent: "nemesis" });
     const updates: Array<Record<string, unknown>> = [];
@@ -220,12 +360,12 @@ describe("dispatch-runtime", () => {
       threadId: "thread-1",
     });
     const updates: Array<{ sql: string; params: Record<string, unknown> }> = [];
-    const { calls, deps } = makeDeps({
+    const { deps } = makeDeps({
       getTask: () => task,
       resolveRuntime: () => "acp",
       resolveHarness: () => "claude",
       readThreadMessages: async () => [
-        "```json\n{\n  \"schemaVersion\": 1,\n  \"reviewOutcome\": \"success\",\n",
+        '```json\n{\n  "schemaVersion": 1,\n  "reviewOutcome": "success",\n',
         "Reviewed range. 1 finding.",
       ],
       resolveTaskTimeoutMs: () => 500,
@@ -260,7 +400,10 @@ describe("dispatch-runtime", () => {
     let promptPayload: { sessionKey?: string; text?: string } | null = null;
     const { calls, deps } = makeDeps({
       getTask: () => task,
-      readThreadMessages: async () => ["RESUMED_OK"],
+      readThreadMessages: async () => {
+        if (!promptPayload) return [];
+        return ["RESUMED_OK"];
+      },
       resolveTaskTimeoutMs: () => 500,
       getAcpSessionManager: () => ({
         initializeSession: async () => undefined,
@@ -303,9 +446,13 @@ describe("dispatch-runtime", () => {
       threadId: "thread-resume-2",
     });
     const updates: string[] = [];
+    let readCount = 0;
     const { calls, deps } = makeDeps({
       getTask: () => task,
-      readThreadMessages: async () => ["IN_PROGRESS_RESUMED_OK"],
+      readThreadMessages: async () => {
+        readCount += 1;
+        return readCount <= 1 ? [] : ["IN_PROGRESS_RESUMED_OK"];
+      },
       resolveTaskTimeoutMs: () => 500,
       db: {
         prepare: (sql: string) => ({

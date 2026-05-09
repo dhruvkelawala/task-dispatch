@@ -24,5 +24,14 @@
   "dependencies": {
     "better-sqlite3": "^12.0.0"
   },
-  "main": "build/plugin.mjs"
+  "main": "build/plugin.mjs",
+  "openclaw": {
+    "extensions": [
+      "./index.mjs"
+    ],
+    "compat": {
+      "pluginApi": ">=2026.4.10",
+      "minGatewayVersion": "2026.4.10"
+    }
+  }
 }
