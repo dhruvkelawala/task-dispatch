@@ -353,11 +353,7 @@ export function registerProjectRoutes(
             const model = typeof body.model === "string" ? body.model.trim() : "";
 
             if (!summary || !Number.isFinite(rawProgressPct) || blockers === null || !model) {
-              sendError(
-                res,
-                400,
-                "summary, progress_pct, blockers, and model are required",
-              );
+              sendError(res, 400, "summary, progress_pct, blockers, and model are required");
               return true;
             }
 

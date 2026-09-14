@@ -11,7 +11,6 @@ import {
   parseMaatVerdict,
   truncateForPrompt,
 } from "./qa";
-import { parseReviewSummary } from "./review";
 
 import { buildExistingThreadDispatchMessage } from "./thread-messages";
 import type { PluginApi, PluginConfig, Task } from "./types";
@@ -38,7 +37,10 @@ function summarizeUnknown(value: unknown, depth = 0): unknown {
   if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
     return value;
   }
-  if (Array.isArray(value)) return depth > 1 ? `[array:${value.length}]` : value.slice(0, 5).map((item) => summarizeUnknown(item, depth + 1));
+  if (Array.isArray(value))
+    return depth > 1
+      ? `[array:${value.length}]`
+      : value.slice(0, 5).map((item) => summarizeUnknown(item, depth + 1));
   if (typeof value === "object") {
     if (depth > 1) return "[object]";
     const out: Record<string, unknown> = {};
@@ -238,8 +240,6 @@ type DispatchRuntimeDeps = {
   defaultCwd: string;
   acpStartupCooldownMs: number;
   defaultReviewTimeoutMs: number;
-  reviewThreadPollTimeoutMs: number;
-  reviewThreadPollLimit: number;
   maxConcurrentSessions: number;
   maxReviewCycles: number;
   defaultDiscordAccountId: string;
@@ -285,7 +285,10 @@ type DispatchRuntimeDeps = {
       requestId: string;
     }) => Promise<void>;
   };
-  callGatewayAgent?: (params: Record<string, unknown>, timeoutMs?: number) => Promise<Record<string, unknown>>;
+  callGatewayAgent?: (
+    params: Record<string, unknown>,
+    timeoutMs?: number,
+  ) => Promise<Record<string, unknown>>;
   getSessionBindingService?: () => {
     bind: (input: {
       targetSessionKey: string;
@@ -325,15 +328,21 @@ export function createDispatchRuntime(deps: DispatchRuntimeDeps) {
   }
 
   function acpPrompt() {
-    const runtime = deps.api.runtime as { acp?: { prompt: (params: {
-      sessionKey: string;
-      text: string;
-      channel?: string;
-      accountId?: string;
-      threadId?: string;
-    }) => Promise<{ runId: string }> } };
+    const runtime = deps.api.runtime as {
+      acp?: {
+        prompt: (params: {
+          sessionKey: string;
+          text: string;
+          channel?: string;
+          accountId?: string;
+          threadId?: string;
+        }) => Promise<{ runId: string }>;
+      };
+    };
     if (!runtime?.acp?.prompt) {
-      throw new Error("api.runtime.acp.prompt() not available — requires OpenClaw fork with ACP plugin runtime patch");
+      throw new Error(
+        "api.runtime.acp.prompt() not available — requires OpenClaw fork with ACP plugin runtime patch",
+      );
     }
     return runtime.acp.prompt;
   }
@@ -349,27 +358,33 @@ export function createDispatchRuntime(deps: DispatchRuntimeDeps) {
   }): Promise<{ runId: string; completion: Promise<void> }> {
     const prompt = deps.callGatewayAgent
       ? async () => {
-          const response = await deps.callGatewayAgent!({
-            message: params.text,
+          const response = await deps.callGatewayAgent!(
+            {
+              message: params.text,
+              sessionKey: params.sessionKey,
+              idempotencyKey: crypto.randomUUID(),
+              deliver: true,
+              lane: "subagent",
+              acpTurnSource: "manual_spawn",
+              ...(params.channel ? { channel: params.channel } : {}),
+              ...(params.to ? { to: params.to } : {}),
+              ...(params.accountId ? { accountId: params.accountId } : {}),
+              ...(params.threadId ? { threadId: params.threadId } : {}),
+            },
+            10_000,
+          );
+          return {
+            runId: typeof response.runId === "string" ? response.runId : crypto.randomUUID(),
+          };
+        }
+      : async () =>
+          acpPrompt()({
             sessionKey: params.sessionKey,
-            idempotencyKey: crypto.randomUUID(),
-            deliver: true,
-            lane: "subagent",
-            acpTurnSource: "manual_spawn",
+            text: params.text,
             ...(params.channel ? { channel: params.channel } : {}),
-            ...(params.to ? { to: params.to } : {}),
             ...(params.accountId ? { accountId: params.accountId } : {}),
             ...(params.threadId ? { threadId: params.threadId } : {}),
-          }, 10_000);
-          return { runId: typeof response.runId === "string" ? response.runId : crypto.randomUUID() };
-        }
-      : async () => acpPrompt()({
-          sessionKey: params.sessionKey,
-          text: params.text,
-          ...(params.channel ? { channel: params.channel } : {}),
-          ...(params.accountId ? { accountId: params.accountId } : {}),
-          ...(params.threadId ? { threadId: params.threadId } : {}),
-        });
+          });
     const { runId } = await prompt();
     return { runId, completion: Promise.resolve() };
   }
@@ -883,7 +898,6 @@ export function createDispatchRuntime(deps: DispatchRuntimeDeps) {
 
   async function dispatchAcp(task: Task, sessionKey: string, cwd: string | null): Promise<void> {
     const log = (msg: string) => deps.stderr.write(`[DISPATCH.ACP] ${msg}\n`);
-    const isReviewTask = task.chainId?.startsWith("review:") || false;
     const t0 = Date.now();
 
     // After a gateway restart, Discord's full child-thread binding adapter can
@@ -1026,10 +1040,6 @@ export function createDispatchRuntime(deps: DispatchRuntimeDeps) {
     }
 
     const pollTimeoutMs = deps.resolveTaskTimeoutMs(task);
-    const pollLimit = isReviewTask ? deps.reviewThreadPollLimit : 20;
-    const validator = isReviewTask
-      ? (candidate: string) => parseReviewSummary(candidate) !== null
-      : (candidate: string) => candidate.length > 0;
     if (task.threadId) {
       const messagesAfterBind = await deps
         .readThreadMessages(task.threadId, accountId, 10)
@@ -1060,8 +1070,8 @@ export function createDispatchRuntime(deps: DispatchRuntimeDeps) {
       channel: "discord",
       to: channelId ? `channel:${channelId}` : null,
       timeoutMs: pollTimeoutMs,
-      limit: pollLimit,
-      validator,
+      limit: 20,
+      validator: (candidate: string) => candidate.length > 0,
       pollIntervalMs: Math.min(5_000, Math.floor(pollTimeoutMs / 4)),
     });
     log(
@@ -1078,29 +1088,6 @@ export function createDispatchRuntime(deps: DispatchRuntimeDeps) {
       deps.stderr.write(
         `[DISPATCH.ACP] Recovered ${text.length} chars from Discord thread for ${task.id}\n`,
       );
-    }
-
-    if (isReviewTask && (!text || !parseReviewSummary(text))) {
-      const error = text
-        ? "Review summary missing or incomplete JSON block"
-        : "Review produced no recoverable output";
-      deps.db
-        .prepare(
-          "UPDATE tasks SET status = 'error', output = @output, error = @error, retries = retries + 1, updated_at = @updated_at WHERE id = @id",
-        )
-        .run({
-          id: task.id,
-          output: text.slice(0, 10000),
-          error,
-          updated_at: Date.now(),
-        });
-      deps.recordTaskEvent(task.id, "review.output_invalid", {
-        reason: error,
-        hasOutput: Boolean(text),
-      });
-      deps.onTaskChanged(task.id);
-      await deps.notifyMainSession({ ...task, output: text, error }, "error");
-      return;
     }
 
     deps.db

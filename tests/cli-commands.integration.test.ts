@@ -16,9 +16,7 @@ afterEach(() => {
 });
 
 describe("cli command integration", () => {
-  test(
-    "non-interactive CLI commands work against API contract",
-    async () => {
+  test("non-interactive CLI commands work against API contract", async () => {
     const home = mkdtempSync(join(tmpdir(), "dispatch-cli-integration-home-"));
     cleanupPaths.push(home);
 
@@ -386,10 +384,34 @@ describe("cli command integration", () => {
       ["resume", doneId],
       ["qa", doneId],
       ["retry", doneId, "--reuse-thread", "--no-qa"],
-      ["create", "-t", "Smoke Create", "-p", "task-dispatch", "-a", "zeus", "--no-qa", "-d", "smoke"],
+      [
+        "create",
+        "-t",
+        "Smoke Create",
+        "-p",
+        "task-dispatch",
+        "-a",
+        "zeus",
+        "--no-qa",
+        "-d",
+        "smoke",
+      ],
       ["stats"],
       ["delete", deleteId],
-      ["heartbeat", "log", "--agent", "zeus", "--name", "Zeus", "--status", "working", "--action", "SMOKE", "--detail", "ok"],
+      [
+        "heartbeat",
+        "log",
+        "--agent",
+        "zeus",
+        "--name",
+        "Zeus",
+        "--status",
+        "working",
+        "--action",
+        "SMOKE",
+        "--detail",
+        "ok",
+      ],
       ["heartbeat", "list", "--limit", "5"],
       ["heartbeat", "health"],
     ];
@@ -407,8 +429,6 @@ describe("cli command integration", () => {
       server.stop(true);
     }
 
-      expect(true).toBeTrue();
-    },
-    120_000,
-  );
+    expect(true).toBeTrue();
+  }, 120_000);
 });

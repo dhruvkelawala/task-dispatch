@@ -75,10 +75,7 @@ export interface PluginConfig {
     taskTimeoutMs?: number;
     reviewTimeoutMs?: number;
     maxReviewCycles?: number;
-    reviewDebounceMs?: number;
     acpStartupCooldownMs?: number;
-    reviewThreadPollTimeoutMs?: number;
-    reviewThreadPollLimit?: number;
   };
   notifications?: {
     operatorLabel?: string;
@@ -111,7 +108,6 @@ export interface PluginConfig {
       channel?: string;
       cwd?: string;
       defaultAgent?: string;
-      reviewAgent?: string;
     }
   >;
   channels?: {
@@ -185,13 +181,13 @@ export interface AcpRuntime {
       agentGroupId?: string;
     },
   ) => Promise<{
-      status?: string;
-      error?: string;
-      childSessionKey?: string;
-      runId?: string;
-      mode?: "run" | "session";
-      streamLogPath?: string;
-    }>;
+    status?: string;
+    error?: string;
+    childSessionKey?: string;
+    runId?: string;
+    mode?: "run" | "session";
+    streamLogPath?: string;
+  }>;
 }
 
 export interface PluginApi {

@@ -24,11 +24,10 @@ describe("extractOutputFromMessages", () => {
     const result = extractOutputFromMessages([
       {
         role: "assistant",
-        content:
-          'text\nPost-merge review complete.\n{"v":1,"id":"msg_abc123","phase":"final_answer"}',
+        content: 'text\nTask complete.\n{"v":1,"id":"msg_abc123","phase":"final_answer"}',
       },
     ]);
-    expect(result).toBe("Post-merge review complete.");
+    expect(result).toBe("Task complete.");
   });
 
   test("preserves clean output without framing", () => {

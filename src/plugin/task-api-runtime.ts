@@ -35,7 +35,6 @@ type TaskApiRuntimeDeps = {
   sseClients: Set<SseClientLike>;
   backgroundEnqueue: (kind: "dispatch" | "resume" | "qa", taskId: string) => boolean;
   defaultTaskTimeoutMs: number;
-  handleCreateReview: (req: PluginHttpRequest, res: PluginHttpResponse) => Promise<void>;
   promptTaskSession: (task: Task, text: string) => Promise<{ runId: string }>;
   stderr: Pick<typeof process.stderr, "write">;
   stmts: {
@@ -273,25 +272,6 @@ export function createTaskApiRuntime(deps: TaskApiRuntimeDeps) {
           deps.sseClients.delete(res as unknown as SseClientLike);
         });
         return false;
-      },
-    });
-
-    deps.api.registerHttpRoute({
-      path: "/api/tasks/review",
-      auth: "plugin",
-      handler: async (req, res) => {
-        const method = req.method?.toUpperCase() || "GET";
-        if (method !== "POST") {
-          sendError(res, 405, `Method ${method} not allowed on /api/tasks/review`);
-          return true;
-        }
-        if (!requireApiKey(req, res)) return true;
-        try {
-          await deps.handleCreateReview(req, res);
-        } catch (error) {
-          sendError(res, 500, getErrorMessage(error));
-        }
-        return true;
       },
     });
 

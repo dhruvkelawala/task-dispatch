@@ -4,7 +4,6 @@ import {
   createDispatchRuntime,
   sanitizeAcpThreadOutput,
 } from "../src/plugin/dispatch-runtime";
-import { parseReviewSummary } from "../src/plugin/review";
 import type { Task } from "../src/plugin/types";
 
 function makeTask(overrides: Partial<Task> = {}): Task {
@@ -117,6 +116,66 @@ function makeDeps(overrides: Record<string, unknown> = {}) {
 }
 
 describe("dispatch-runtime", () => {
+  test.each(["APPROVE", "REQUEST_CHANGES"])(
+    "Nemesis QA handles %s with task review attempts",
+    async (verdict) => {
+      const task = makeTask({
+        status: "review",
+        sessionKey: "session-1",
+        qaRequired: true,
+        reviewAttempts: 2,
+      });
+      const runs: Record<string, unknown>[] = [];
+      const updates: Array<{ sql: string; params: Record<string, unknown> }> = [];
+      const { calls, deps } = makeDeps({
+        getTask: () => task,
+        config: { agents: { nemesis: { model: "qa-model" } } },
+        api: {
+          runtime: {
+            subagent: {
+              run: async (args: Record<string, unknown>) => {
+                runs.push(args);
+                return { runId: "qa-run" };
+              },
+              waitForRun: async () => ({ status: "ok" }),
+              getSessionMessages: async () => ({
+                messages: [
+                  {
+                    role: "assistant",
+                    content: `VERDICT: ${verdict}\nSUMMARY: Checked task output.`,
+                  },
+                ],
+              }),
+            },
+          },
+        },
+        db: {
+          prepare: (sql: string) => ({
+            run: (params: Record<string, unknown>) => updates.push({ sql, params }),
+          }),
+        },
+      });
+      const runtime = createDispatchRuntime(
+        deps as unknown as Parameters<typeof createDispatchRuntime>[0],
+      );
+      await runtime.runQueuedQaReview(task.id);
+      expect(runs).toHaveLength(1);
+      expect(runs[0]).toMatchObject({ model: "qa-model", lane: "subagent" });
+      expect(runs[0]?.sessionKey).toMatch(/^agent:nemesis:subagent:review:/);
+      expect(calls.recordTaskEvent).toContainEqual([
+        task.id,
+        verdict === "APPROVE" ? "qa.approve" : "qa.request_changes",
+        { summary: "Checked task output.", attempts: 2 },
+      ]);
+      expect(updates).toHaveLength(1);
+      expect(updates[0]?.sql).toContain(
+        verdict === "APPROVE" ? "status = 'done'" : "status = 'blocked'",
+      );
+      if (verdict === "REQUEST_CHANGES") expect(updates[0]?.params.attempts).toBe(3);
+      expect(calls.notifyMainSession?.[0]?.[1]).toBe(verdict === "APPROVE" ? "done" : "blocked");
+    },
+  );
+
   test("sanitizeAcpThreadOutput removes ACP boilerplate lines", () => {
     expect(
       sanitizeAcpThreadOutput(
@@ -134,16 +193,17 @@ describe("dispatch-runtime", () => {
     const rebuilt = buildAcpOutputFromThreadMessages([
       // newest first, matching Discord API order
       "  ]\n}\n```",
-      '```json\n{\n  "schemaVersion": 1,\n  "reviewOutcome": "success",\n  "findingsCount": 0,\n  "findings": [',
-      "Review summary line",
+      '```json\n{\n  "version": 1,\n  "result": "success",\n  "findingsCount": 0,\n  "findings": [',
+      "Task summary line",
       "Background task done: ACP background task (run abc123).",
       "⚙️ codex session active (idle auto-unfocus after 24h inactivity). Messages here go directly to this session.\ncwd: /tmp/test",
     ]);
 
-    expect(rebuilt).toContain("Review summary line");
-    expect(parseReviewSummary(rebuilt)).toEqual({
-      schemaVersion: 1,
-      reviewOutcome: "success",
+    expect(rebuilt).toStartWith("Task summary line");
+    const json = rebuilt.match(/```json\s*([\s\S]*?)```/)?.[1];
+    expect(JSON.parse(json || "")).toEqual({
+      version: 1,
+      result: "success",
       findingsCount: 0,
       findings: [],
     });
@@ -270,7 +330,6 @@ describe("dispatch-runtime", () => {
     expect(calls.recordTaskEvent?.some((args) => args[1] === "dispatch.failed")).toBeTrue();
   });
 
-
   test("dispatchTask marks task error when ACP thread produces no Discord output", async () => {
     const task = makeTask({ status: "ready", agent: "zeus", qaRequired: false, timeoutMs: 30 });
     const updates: Array<Record<string, unknown>> = [];
@@ -350,43 +409,6 @@ describe("dispatch-runtime", () => {
     expect(updates[0]?.error).toBe("spawn failed");
     expect(calls.recordTaskEvent?.some((args) => args[1] === "dispatch.failed")).toBeTrue();
     expect(calls.notifyMainSession).toHaveLength(1);
-  });
-
-  test("dispatchTask marks review task error when ACP output has incomplete JSON", async () => {
-    const task = makeTask({
-      status: "ready",
-      agent: "nemesis",
-      chainId: "review:org/web-app",
-      threadId: "thread-1",
-    });
-    const updates: Array<{ sql: string; params: Record<string, unknown> }> = [];
-    const { deps } = makeDeps({
-      getTask: () => task,
-      resolveRuntime: () => "acp",
-      resolveHarness: () => "claude",
-      readThreadMessages: async () => [
-        '```json\n{\n  "schemaVersion": 1,\n  "reviewOutcome": "success",\n',
-        "Reviewed range. 1 finding.",
-      ],
-      resolveTaskTimeoutMs: () => 500,
-      db: {
-        prepare: (sql: string) => ({
-          run: (params: Record<string, unknown>) => {
-            updates.push({ sql, params });
-          },
-          get: () => null,
-          all: () => [],
-        }),
-        transaction: (fn: () => void) => fn,
-      },
-    });
-    const runtime = createDispatchRuntime(
-      deps as unknown as Parameters<typeof createDispatchRuntime>[0],
-    );
-
-    await runtime.dispatchTask(task);
-
-    expect(updates.some((entry) => entry.sql.includes("status = 'error'"))).toBeTrue();
   });
 
   test("resumeTask accepts dispatched ACP tasks and resumes the prior session", async () => {

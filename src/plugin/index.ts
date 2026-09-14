@@ -1,28 +1,17 @@
-import { createRequire } from "node:module";
 import crypto from "node:crypto";
 import { createBackgroundJobQueue } from "./background-jobs";
 import { createDispatchRuntime } from "./dispatch-runtime";
 import { createDiscordRuntime } from "./discord-runtime";
 import { createHeartbeatRuntime } from "./heartbeat-runtime";
 import { createLifecycleRuntime } from "./lifecycle-runtime";
-import { createReviewRuntime } from "./review-runtime";
 import { createScheduleRuntime } from "./schedule-runtime";
 import { createTaskApiRuntime } from "./task-api-runtime";
 import { loadConfig, normalizeTimeoutMs } from "./config";
 import { initDb, rowToTask, seedProjectsIfEmpty } from "./db";
-import {
-  buildReviewTaskDescription,
-  buildReviewTaskTitle,
-  planReviewRequest,
-  resolveProjectIdForRepo,
-  resolveReviewRange,
-  REVIEW_DEBOUNCE_WINDOW_MS,
-  setReviewDebounceMs,
-} from "./review";
 // thread-messages helpers are used by extracted runtime modules
 import { getNextRunAt, parseNlExpressionToCron } from "./scheduler";
 import { runProjectSummaryTick as runProjectSummaryTickCore } from "./summarize";
-import { parseBody, parseQuery, sendError, sendJson } from "./routes/tasks";
+import { parseQuery, sendError, sendJson } from "./routes/tasks";
 import { registerProjectRoutes } from "./routes/projects";
 import type {
   PluginApi,
@@ -41,57 +30,12 @@ type TaskRow = Record<string, unknown> & {
   updated_at?: number;
 };
 
-const require = createRequire(import.meta.url);
-
-function loadLocalEnvOverrides(): Record<string, string> {
-  try {
-    const { readFileSync, existsSync } = require("node:fs") as typeof import("node:fs");
-    const home = process.env.HOME || "";
-    const envPath = [`${home}/.openclaw/extensions/task-dispatch/.env`].find((candidate) =>
-      existsSync(candidate),
-    );
-    if (!envPath) return {};
-    const content = readFileSync(envPath, "utf8");
-    return Object.fromEntries(
-      content
-        .split(/\r?\n/)
-        .map((line) => line.trim())
-        .filter((line) => line && !line.startsWith("#") && line.includes("="))
-        .map((line) => {
-          const idx = line.indexOf("=");
-          const key = line.slice(0, idx).trim();
-          const rawValue = line.slice(idx + 1).trim();
-          const value =
-            rawValue.startsWith('"') && rawValue.endsWith('"')
-              ? rawValue.slice(1, -1)
-              : rawValue.startsWith("'") && rawValue.endsWith("'")
-                ? rawValue.slice(1, -1)
-                : rawValue;
-          return [key, value];
-        }),
-    );
-  } catch {
-    return {};
-  }
-}
-
 function titleFromProjectId(projectId: string): string {
   return String(projectId || "project")
     .split(/[-_]/g)
     .filter(Boolean)
     .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
     .join(" ");
-}
-
-function resolveReviewAgentId(
-  config: PluginConfig,
-  projectId: string,
-  fallbackAgent: string,
-): string {
-  const projectAgent = config.projects?.[projectId]?.reviewAgent;
-  if (projectAgent) return projectAgent;
-  if (config.agents?.nemesis) return "nemesis";
-  return fallbackAgent;
 }
 
 function formatDiscordThreadUrl(threadId: string | null | undefined): string | null {
@@ -150,17 +94,10 @@ const defaultCwd = DEFAULTS.defaultCwd || `${HOME}/.openclaw/workspace`;
 const defaultTaskTimeoutMs = normalizeTimeoutMs(DEFAULTS.taskTimeoutMs, 10 * 60_000);
 const defaultReviewTimeoutMs = normalizeTimeoutMs(DEFAULTS.reviewTimeoutMs, 3 * 60_000);
 const defaultAcpStartupCooldownMs = normalizeTimeoutMs(DEFAULTS.acpStartupCooldownMs, 60 * 1000);
-const defaultReviewThreadPollTimeoutMs = normalizeTimeoutMs(DEFAULTS.reviewThreadPollTimeoutMs, 20_000);
-const defaultReviewThreadPollLimit = Number.isFinite(DEFAULTS.reviewThreadPollLimit)
-  ? Math.max(5, Math.floor(DEFAULTS.reviewThreadPollLimit ?? 50))
-  : 50;
 const maxReviewCycles = Number.isFinite(DEFAULTS.maxReviewCycles)
   ? Math.max(1, Math.floor(DEFAULTS.maxReviewCycles ?? 3))
   : 3;
 
-if (DEFAULTS.reviewDebounceMs && Number.isFinite(DEFAULTS.reviewDebounceMs)) {
-  setReviewDebounceMs(Math.max(1000, Math.floor(DEFAULTS.reviewDebounceMs)));
-}
 // qaRequired is per-task (default true). Check via resolveQaRequired(task)
 function resolveQaRequired(task: Partial<Task>): boolean {
   if (typeof task.qaRequired === "boolean") return task.qaRequired;
@@ -265,7 +202,6 @@ export default function setup(api: PluginApi) {
   // ---- Session Pool (inside setup for closure access) ----
   const sessionPool = new Map();
   const sseClients = new Set<SseClientLike>();
-  const reviewTimers = new Map();
 
   function getActiveSessionCount(): number {
     return sessionPool.size;
@@ -411,8 +347,6 @@ export default function setup(api: PluginApi) {
     db,
     defaultCwd,
     acpStartupCooldownMs: defaultAcpStartupCooldownMs,
-    reviewThreadPollTimeoutMs: defaultReviewThreadPollTimeoutMs,
-    reviewThreadPollLimit: defaultReviewThreadPollLimit,
     defaultReviewTimeoutMs,
     maxConcurrentSessions,
     maxReviewCycles,
@@ -496,73 +430,6 @@ export default function setup(api: PluginApi) {
     insertComment: db.prepare(
       "INSERT INTO comments (id, task_id, author, body, created_at) VALUES (@id, @task_id, @author, @body, @created_at)",
     ),
-    getReviewStateByRepo: db.prepare("SELECT * FROM review_state WHERE repo = ?"),
-    getReviewStateByActiveTaskId: db.prepare("SELECT * FROM review_state WHERE active_task_id = ?"),
-    upsertReviewState: db.prepare(`
-      INSERT INTO review_state (
-        repo,
-        last_reviewed_sha,
-        last_review_at,
-        pending_from_sha,
-        pending_to_sha,
-        pending_task_id,
-        pending_updated_at,
-        active_from_sha,
-        active_to_sha,
-        active_task_id
-      ) VALUES (
-        @repo,
-        @last_reviewed_sha,
-        @last_review_at,
-        @pending_from_sha,
-        @pending_to_sha,
-        @pending_task_id,
-        @pending_updated_at,
-        @active_from_sha,
-        @active_to_sha,
-        @active_task_id
-      )
-      ON CONFLICT(repo) DO UPDATE SET
-        last_reviewed_sha = excluded.last_reviewed_sha,
-        last_review_at = excluded.last_review_at,
-        pending_from_sha = excluded.pending_from_sha,
-        pending_to_sha = excluded.pending_to_sha,
-        pending_task_id = excluded.pending_task_id,
-        pending_updated_at = excluded.pending_updated_at,
-        active_from_sha = excluded.active_from_sha,
-        active_to_sha = excluded.active_to_sha,
-        active_task_id = excluded.active_task_id
-    `),
-    getReviewDeliveryByKey: db.prepare("SELECT * FROM review_deliveries WHERE delivery_key = ?"),
-    getReviewDeliveryByRepoSha: db.prepare(
-      "SELECT * FROM review_deliveries WHERE repo = ? AND sha = ? ORDER BY accepted_at DESC LIMIT 1",
-    ),
-    upsertReviewDelivery: db.prepare(`
-      INSERT INTO review_deliveries (
-        delivery_key,
-        repo,
-        sha,
-        task_id,
-        status,
-        accepted_at,
-        installation_id
-      ) VALUES (
-        @delivery_key,
-        @repo,
-        @sha,
-        @task_id,
-        @status,
-        @accepted_at,
-        @installation_id
-      )
-      ON CONFLICT(delivery_key) DO UPDATE SET
-        repo = excluded.repo,
-        sha = excluded.sha,
-        task_id = excluded.task_id,
-        status = excluded.status,
-        accepted_at = excluded.accepted_at,
-        installation_id = COALESCE(excluded.installation_id, review_deliveries.installation_id)
-    `),
   };
 
   // ---- Core functions ----
@@ -591,137 +458,6 @@ export default function setup(api: PluginApi) {
     }
   }
 
-  function createTaskRecord(
-    body: Record<string, unknown>,
-    options: {
-      id?: string;
-      forceStatus?: TaskStatus;
-      autoDispatchReady?: boolean;
-      eventPayload?: Record<string, unknown>;
-    } = {},
-  ): Task {
-    const now = Date.now();
-    const id = options.id || crypto.randomUUID();
-    const dependsOn = (Array.isArray(body.dependsOn) ? body.dependsOn : []).filter(
-      (value: unknown) => typeof value === "string" && value.trim().length > 0,
-    ) as string[];
-
-    let status = options.forceStatus || "pending";
-    if (!options.forceStatus) {
-      if (dependsOn.length === 0) {
-        status = "ready";
-      } else {
-        const placeholders = dependsOn.map(() => "?").join(",");
-        const doneCount = db
-          .prepare(
-            `SELECT COUNT(*) as c FROM tasks WHERE id IN (${placeholders}) AND status = 'done'`,
-          )
-          .get(...dependsOn);
-        if (doneCount && (doneCount as { c: number }).c === dependsOn.length) {
-          status = "ready";
-        }
-      }
-    }
-
-    const row = {
-      id,
-      title: body.title,
-      description: body.description || null,
-      agent: body.agent,
-      runtime: body.runtime || null,
-      project_id: body.projectId || null,
-      channel_id: body.channelId || null,
-      cwd: body.cwd || null,
-      model: body.model || null,
-      thinking: body.thinking || null,
-      depends_on: JSON.stringify(dependsOn),
-      chain_id: body.chainId || null,
-      status,
-      manual_complete: body.manualComplete ? 1 : 0,
-      timeout_ms: normalizeTimeoutMs(body.timeoutMs, defaultTaskTimeoutMs),
-      thread_id:
-        typeof body.threadId === "string" && body.threadId.trim() ? body.threadId.trim() : null,
-      review_attempts: 0,
-      qa_required: body.qaRequired === false ? 0 : 1,
-      created_at: now,
-      updated_at: now,
-    };
-
-    stmts.insert.run(row);
-    const created = rowToTask(getTask(id));
-    if (!created) {
-      throw new Error(`Failed to load task after insert: ${id}`);
-    }
-    recordTaskEvent(id, "task.created", {
-      status,
-      projectId: row.project_id,
-      agent: row.agent,
-      cwd: row.cwd,
-      qaRequired: row.qa_required !== 0,
-      threadId: row.thread_id,
-      ...options.eventPayload,
-    });
-    broadcastTaskEvent(created);
-
-    if (options.autoDispatchReady !== false && status === "ready") {
-      triggerDispatch(created.id);
-    }
-
-    return created;
-  }
-
-  // GitHub App config for issue writing (loaded from process env first, then
-  // local plugin .env for dev installs)
-  const localEnv = loadLocalEnvOverrides();
-  const githubAppId = process.env.GITHUB_APP_ID || localEnv.GITHUB_APP_ID || "";
-  const githubAppPrivateKeyPath =
-    process.env.GITHUB_APP_PRIVATE_KEY_PATH || localEnv.GITHUB_APP_PRIVATE_KEY_PATH || "";
-  const githubAppConfig =
-    githubAppId && githubAppPrivateKeyPath
-      ? { appId: githubAppId, privateKeyPath: githubAppPrivateKeyPath }
-      : undefined;
-
-  // Installation ID lookup — stored in review_deliveries from webhook payloads
-  function getInstallationIdForRepo(repo: string): number | null {
-    const row = db
-      .prepare<{ installation_id?: number }>(
-        "SELECT installation_id FROM review_deliveries WHERE repo = ? AND installation_id IS NOT NULL ORDER BY accepted_at DESC LIMIT 1",
-      )
-      .get(repo);
-    return row?.installation_id ?? null;
-  }
-
-  const reviewRuntime = createReviewRuntime({
-    config: CONFIG,
-    defaultAgent: DEFAULT_AGENT,
-    defaultCwd,
-    reviewTimers,
-    githubApp: githubAppConfig,
-    getInstallationIdForRepo,
-    db: db as unknown as Parameters<typeof createReviewRuntime>[0]["db"],
-    stmts: stmts as unknown as Parameters<typeof createReviewRuntime>[0]["stmts"],
-    loadTask: (id) => rowToTask(getTask(id)),
-    createTaskRecord,
-    recordTaskEvent,
-    onTaskChanged,
-    resolveReviewAgentId,
-    resolveAccountId,
-    postToThread,
-    stderr: process.stderr,
-  });
-  const {
-    getReviewState,
-    getReviewDelivery,
-    getReviewDeliveryForRepoSha,
-    saveReviewState,
-    saveReviewDelivery,
-    extractReviewRangeFromTask,
-    updateReviewTaskWindow,
-    createPendingReviewTask,
-    armReviewTimer,
-    finalizeReviewTask,
-  } = reviewRuntime;
-
   function onTaskChanged(taskId: string) {
     const task = getTask(taskId);
     let normalized = null;
@@ -736,10 +472,6 @@ export default function setup(api: PluginApi) {
         threadId: normalized?.threadId || null,
         updatedAt: normalized?.updatedAt || task.updated_at || Date.now(),
       });
-    }
-
-    if (normalized && ["done", "error", "cancelled"].includes(normalized.status)) {
-      if (normalized.status !== "cancelled") void finalizeReviewTask(normalized);
     }
 
     // When a task becomes done, check for newly ready tasks
@@ -850,7 +582,9 @@ export default function setup(api: PluginApi) {
     }
 
     if (candidates.length === 0) {
-      process.stderr.write("[STARTUP] No ACP tasks eligible for auto-resume after gateway restart\n");
+      process.stderr.write(
+        "[STARTUP] No ACP tasks eligible for auto-resume after gateway restart\n",
+      );
       return;
     }
 
@@ -875,15 +609,6 @@ export default function setup(api: PluginApi) {
 
   queueGatewayRestartResumes();
 
-  for (const row of db
-    .prepare<{ repo: string }>(
-      "SELECT repo FROM review_state WHERE pending_task_id IS NOT NULL AND pending_updated_at IS NOT NULL",
-    )
-    .all()) {
-    if (row?.repo) {
-      armReviewTimer(String(row.repo));
-    }
-  }
   setInterval(
     () => {
       runProjectSummaryTick().catch((error: unknown) => {
@@ -897,165 +622,6 @@ export default function setup(api: PluginApi) {
   // ---- Route handlers ----
 
   // handleCreate is now in task-api-runtime.ts
-
-  async function handleCreateReview(req: PluginHttpRequest, res: PluginHttpResponse) {
-    const body = await parseBody(req);
-    const repo = typeof body.repo === "string" ? body.repo.trim() : "";
-    const sha = typeof body.sha === "string" ? body.sha.trim() : "";
-    const deliveryKey = typeof body.deliveryKey === "string" ? body.deliveryKey.trim() : "";
-    if (!repo || !sha || !deliveryKey) {
-      sendError(res, 400, "repo, sha, and deliveryKey are required");
-      return;
-    }
-
-    const projectId = resolveProjectIdForRepo(CONFIG, repo);
-    if (!projectId) {
-      sendError(res, 400, `No configured project mapping for repo '${repo}'`);
-      return;
-    }
-    const project = CONFIG.projects?.[projectId] || {};
-    if (!project.cwd) {
-      sendError(res, 400, `Project '${projectId}' is missing cwd in task-dispatch config`);
-      return;
-    }
-
-    const existingDelivery = getReviewDelivery(deliveryKey);
-    const existingRepoShaDelivery = getReviewDeliveryForRepoSha(repo, sha);
-    const reviewState = getReviewState(repo);
-    const reviewRequest = body as typeof body & {
-      repo: string;
-      sha: string;
-      deliveryKey: string;
-      beforeSha?: string;
-      branch?: string;
-      pusher?: string;
-      compareUrl?: string;
-      installationId?: number;
-    };
-    const { fromSha, toSha } = resolveReviewRange(reviewState, reviewRequest);
-    const requestPlan = planReviewRequest({
-      state: reviewState,
-      fromSha,
-      toSha,
-      duplicateDelivery: Boolean(existingDelivery || existingRepoShaDelivery),
-    });
-    if (requestPlan.status === "duplicate") {
-      const duplicateDelivery = existingDelivery || existingRepoShaDelivery;
-      const existingRange = extractReviewRangeFromTask(duplicateDelivery?.task_id ?? null);
-      sendJson(res, {
-        taskId: duplicateDelivery?.task_id || null,
-        status: requestPlan.status,
-        debounceWindowMs: REVIEW_DEBOUNCE_WINDOW_MS,
-        reviewRange: `${existingRange?.fromSha || requestPlan.pendingFromSha}..${existingRange?.toSha || requestPlan.pendingToSha}`,
-      });
-      return;
-    }
-    const now = Date.now();
-    let taskId = reviewState.pending_task_id;
-    let responseStatus = requestPlan.status;
-    const reviewAgent = resolveReviewAgentId(
-      CONFIG,
-      projectId,
-      project.defaultAgent || DEFAULT_AGENT,
-    );
-
-    if (requestPlan.status === "queued_after_active_review") {
-      const pendingFromSha = requestPlan.pendingFromSha;
-      if (!taskId) {
-        const created = createPendingReviewTask(reviewRequest, projectId, pendingFromSha, toSha);
-        taskId = created.id;
-      } else {
-        updateReviewTaskWindow(taskId!, {
-          title: buildReviewTaskTitle(repo, toSha),
-          description: buildReviewTaskDescription({
-            repo,
-            projectId,
-            fromSha: pendingFromSha,
-            toSha,
-            branch: reviewRequest.branch,
-            pusher: reviewRequest.pusher,
-            compareUrl: reviewRequest.compareUrl,
-          }),
-          projectId,
-          cwd: project.cwd,
-          agent: reviewAgent,
-        });
-      }
-      saveReviewState({
-        ...reviewState,
-        repo,
-        pending_from_sha: pendingFromSha,
-        pending_to_sha: requestPlan.pendingToSha,
-        pending_task_id: taskId,
-        pending_updated_at: now,
-      });
-    } else if (requestPlan.status === "debounced") {
-      const pendingFromSha = requestPlan.pendingFromSha;
-      updateReviewTaskWindow(taskId!, {
-        title: buildReviewTaskTitle(repo, toSha),
-        description: buildReviewTaskDescription({
-          repo,
-          projectId,
-          fromSha: pendingFromSha,
-          toSha,
-          branch: reviewRequest.branch,
-          pusher: reviewRequest.pusher,
-          compareUrl: reviewRequest.compareUrl,
-        }),
-        projectId,
-        cwd: project.cwd,
-        agent: reviewAgent,
-      });
-      saveReviewState({
-        ...reviewState,
-        repo,
-        pending_from_sha: pendingFromSha,
-        pending_to_sha: requestPlan.pendingToSha,
-        pending_task_id: taskId,
-        pending_updated_at: now,
-      });
-    } else {
-      const created = createPendingReviewTask(reviewRequest, projectId, fromSha, toSha);
-      taskId = created.id;
-      saveReviewState({
-        ...reviewState,
-        repo,
-        pending_from_sha: fromSha,
-        pending_to_sha: toSha,
-        pending_task_id: taskId,
-        pending_updated_at: now,
-      });
-    }
-
-    const installationId =
-      typeof reviewRequest.installationId === "number" ? reviewRequest.installationId : null;
-    saveReviewDelivery({
-      delivery_key: deliveryKey,
-      repo,
-      sha,
-      task_id: taskId,
-      status: responseStatus,
-      accepted_at: now,
-      installation_id: installationId,
-    });
-    if (taskId) {
-      recordTaskEvent(taskId, "review.request.accepted", {
-        repo,
-        deliveryKey,
-        status: responseStatus,
-        reviewRange: `${getReviewState(repo).pending_from_sha || getReviewState(repo).active_from_sha || fromSha}..${getReviewState(repo).pending_to_sha || getReviewState(repo).active_to_sha || toSha}`,
-      });
-    }
-    armReviewTimer(repo);
-
-    const nextState = getReviewState(repo);
-    sendJson(res, {
-      taskId,
-      status: responseStatus,
-      debounceWindowMs: REVIEW_DEBOUNCE_WINDOW_MS,
-      reviewRange: `${nextState.pending_from_sha || nextState.active_from_sha || requestPlan.pendingFromSha}..${nextState.pending_to_sha || nextState.active_to_sha || requestPlan.pendingToSha}`,
-    });
-  }
 
   // Task API handlers are now in task-api-runtime.ts
 
@@ -1283,7 +849,6 @@ export default function setup(api: PluginApi) {
     sseClients,
     backgroundEnqueue: (kind, taskId) => backgroundJobs.enqueue({ kind, taskId }),
     defaultTaskTimeoutMs,
-    handleCreateReview,
     promptTaskSession,
     stderr: process.stderr,
     stmts: {
