@@ -21,6 +21,8 @@ describe("db", () => {
     expect(names.has("schedules")).toBeTrue();
     expect(names.has("comments")).toBeTrue();
     expect(names.has("task_events")).toBeTrue();
+    expect(names.has("review_state")).toBeFalse();
+    expect(names.has("review_deliveries")).toBeFalse();
   });
 
   test("rowToTask() maps snake_case to camelCase", () => {

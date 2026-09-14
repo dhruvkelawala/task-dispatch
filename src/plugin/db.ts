@@ -58,8 +58,6 @@ function createInMemoryDb(): DatabaseLike {
     projects: DbRowObject[];
     project_commits: DbRowObject[];
     project_snapshots: DbRowObject[];
-    review_state: DbRowObject[];
-    review_deliveries: DbRowObject[];
   } = {
     tasks: [],
     schedules: [],
@@ -69,8 +67,6 @@ function createInMemoryDb(): DatabaseLike {
     projects: [],
     project_commits: [],
     project_snapshots: [],
-    review_state: [],
-    review_deliveries: [],
   };
 
   function selectById(
@@ -144,38 +140,6 @@ function createInMemoryDb(): DatabaseLike {
             tables.schedules.push(toRowObject(args[0]));
             return;
           }
-          if (sql.startsWith("INSERT INTO review_state")) {
-            const row = toRowObject(args[0]);
-            tables.review_state = tables.review_state.filter((entry) => entry.repo !== row.repo);
-            tables.review_state.push(row);
-            return;
-          }
-          if (sql.startsWith("INSERT INTO review_deliveries")) {
-            const row = toRowObject(args[0]);
-            tables.review_deliveries = tables.review_deliveries.filter(
-              (entry) => entry.delivery_key !== row.delivery_key,
-            );
-            tables.review_deliveries.push(row);
-            return;
-          }
-          if (sql.startsWith("UPDATE review_state SET")) {
-            const params = toRowObject(args[0]);
-            const row = tables.review_state.find((entry) => entry.repo === String(params.repo));
-            if (row) {
-              Object.assign(row, params);
-            }
-            return;
-          }
-          if (sql.startsWith("UPDATE review_deliveries SET")) {
-            const params = toRowObject(args[0]);
-            const row = tables.review_deliveries.find(
-              (entry) => entry.delivery_key === String(params.delivery_key),
-            );
-            if (row) {
-              Object.assign(row, params);
-            }
-            return;
-          }
           if (sql.startsWith("DELETE FROM task_events WHERE task_id = ?")) {
             const id = String(args[0]);
             tables.task_events = tables.task_events.filter((row) => row.task_id !== id);
@@ -195,23 +159,9 @@ function createInMemoryDb(): DatabaseLike {
           if (sql.startsWith("SELECT * FROM tasks WHERE id = ?")) {
             return selectById("tasks", String(args[0]));
           }
-          if (sql.startsWith("SELECT * FROM review_state WHERE repo = ?")) {
-            return tables.review_state.find((row) => row.repo === String(args[0]));
-          }
           if (sql.startsWith("SELECT value FROM plugin_state WHERE key = ?")) {
             const row = tables.plugin_state.find((entry) => entry.key === String(args[0]));
             return row ? { value: row.value } : undefined;
-          }
-          if (sql.startsWith("SELECT * FROM review_state WHERE active_task_id = ?")) {
-            return tables.review_state.find((row) => row.active_task_id === String(args[0]));
-          }
-          if (sql.startsWith("SELECT * FROM review_deliveries WHERE delivery_key = ?")) {
-            return tables.review_deliveries.find((row) => row.delivery_key === String(args[0]));
-          }
-          if (sql.startsWith("SELECT * FROM review_deliveries WHERE repo = ? AND sha = ?")) {
-            return tables.review_deliveries.find(
-              (row) => row.repo === String(args[0]) && row.sha === String(args[1]),
-            );
           }
           if (sql.includes("SELECT COUNT(*) as c FROM tasks WHERE id IN")) {
             const ids = args.map(String);
@@ -244,8 +194,6 @@ function createInMemoryDb(): DatabaseLike {
               { name: "projects" },
               { name: "project_commits" },
               { name: "project_snapshots" },
-              { name: "review_state" },
-              { name: "review_deliveries" },
             ];
           }
           if (sql.startsWith("SELECT * FROM tasks")) {
@@ -408,36 +356,7 @@ export function initDb(dbPath: string): DatabaseLike {
       generated_at TEXT DEFAULT (datetime('now')),
       model TEXT
     );
-
-    CREATE TABLE IF NOT EXISTS review_state (
-      repo TEXT PRIMARY KEY,
-      last_reviewed_sha TEXT,
-      last_review_at INTEGER,
-      pending_from_sha TEXT,
-      pending_to_sha TEXT,
-      pending_task_id TEXT,
-      pending_updated_at INTEGER,
-      active_from_sha TEXT,
-      active_to_sha TEXT,
-      active_task_id TEXT
-    );
-
-    CREATE TABLE IF NOT EXISTS review_deliveries (
-      delivery_key TEXT PRIMARY KEY,
-      repo TEXT NOT NULL,
-      sha TEXT NOT NULL,
-      task_id TEXT,
-      status TEXT NOT NULL,
-      accepted_at INTEGER NOT NULL,
-      installation_id INTEGER
-    );
   `);
-
-  try {
-    db.exec("ALTER TABLE review_deliveries ADD COLUMN installation_id INTEGER");
-  } catch {
-    // Column already exists
-  }
 
   try {
     db.exec("ALTER TABLE tasks ADD COLUMN run_id TEXT");
